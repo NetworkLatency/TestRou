@@ -1,0 +1,11 @@
+*.zip
+*.tar.gz
+.vscode
+.ssh
+.DS_Store
+*.pyc
+
+data/lcbv5/
+data/lcbv6/
+nohup*.out
+server/vllm_logs
