@@ -17,6 +17,17 @@ if os.path.exists(config_path):
         config = json.load(f)
 
 
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in {"true", "1", "yes", "y"}:
+        return True
+    if value in {"false", "0", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value!r}")
+
+
 def get_dataset(dataset_name):
     # Map dataset name to loader and option tag.
     options = None
@@ -95,8 +106,12 @@ def main(args):
 
     answers = {}
     generation_time = []
+    max_problems = args.max_problems if args.max_problems is not None and args.max_problems > 0 else None
+    total_problems = min(len(dataset), max_problems) if max_problems is not None else len(dataset)
     # Generate answers and record timing per problem.
-    for problem_id, problem in tqdm(enumerate(dataset), total=len(dataset), position=0, leave=True, desc="Generation"):
+    for problem_id, problem in tqdm(enumerate(dataset), total=total_problems, position=0, leave=True, desc="Generation"):
+        if max_problems is not None and problem_id >= max_problems:
+            break
         answer_repeat = []
         time_repeat = []
         for repeat_id in range(args.repeat_num):
@@ -115,6 +130,10 @@ def main(args):
                 first_n_steps_base_model=first_n_steps_base_model,
                 model_size=args.model_size,
                 small_model_size=args.small_model_size,
+                routing_mode=args.routing_mode,
+                format_tokens_path=args.format_tokens_path,
+                max_format_skip=args.max_format_skip,
+                top_logprobs=args.top_logprobs,
             )
             e_time = time.time()
 
@@ -136,6 +155,16 @@ def main(args):
             json.dump(item, f, ensure_ascii=False, indent=4)
     
     print(f"Total Time: {sum(generation_time)}; Avg Time: {sum(generation_time)/len(generation_time)}")
+
+    if args.generate_dashboard:
+        try:
+            from fa_dashboard import generate_dashboard
+
+            dashboard_path = args.dashboard_path or os.path.join(args.output_dir, "fa_dashboard.png")
+            generate_dashboard(args.output_dir, dashboard_path)
+            print(f"FA dashboard written to: {dashboard_path}")
+        except Exception as ex:
+            print(f"Dashboard generation failed: {ex}")
     
 
 if __name__ == "__main__":
@@ -165,6 +194,27 @@ if __name__ == "__main__":
     parser.add_argument("--score_threshold", type=float, 
                         default=config.get("score_threshold", 0.0),
                         help="Acceptance threshold")
+    parser.add_argument("--routing_mode", type=str, choices=["vanilla", "fa_skip", "fa_strip"],
+                        default=config.get("routing_mode", "vanilla"),
+                        help="Routing variant: vanilla, FA-skip, or FA-strip")
+    parser.add_argument("--format_tokens_path", type=str,
+                        default=config.get("format_tokens_path", "format_tokens.json"),
+                        help="Path to the inspected Qwen3 format token whitelist JSON")
+    parser.add_argument("--max_format_skip", type=int,
+                        default=config.get("max_format_skip", 3),
+                        help="Maximum consecutive format tokens to skip in fa_skip mode")
+    parser.add_argument("--top_logprobs", type=int,
+                        default=config.get("top_logprobs", 50),
+                        help="Top-k logprobs used to approximate entropy")
+    parser.add_argument("--generate_dashboard", type=str2bool,
+                        default=config.get("generate_dashboard", False),
+                        help="Whether to generate a quick FA dashboard after the run")
+    parser.add_argument("--dashboard_path", type=str,
+                        default=config.get("dashboard_path", None),
+                        help="Output path for the FA dashboard image")
+    parser.add_argument("--max_problems", type=int,
+                        default=config.get("max_problems", None),
+                        help="Optional pilot limit; e.g. 5 before running a full dataset")
 
     args = parser.parse_args()
     main(args)

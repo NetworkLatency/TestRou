@@ -47,6 +47,27 @@ bash run.sh
 
 The script writes `config.json` and launches `main.py` in the background, logging to `./logs/`.
 
+### FA-Routing Experiments
+
+Before running `fa_skip` or `fa_strip`, build and manually inspect the Qwen3 format-token whitelist:
+
+```shell
+cd src
+python build_format_tokens.py --tokenizer Qwen/Qwen3-4B --output format_tokens.json
+```
+
+Then run with one of the routing modes:
+
+```shell
+python main.py --routing_mode fa_skip --format_tokens_path format_tokens.json --max_format_skip 3 --top_logprobs 50 --max_problems 5
+```
+
+Supported modes are `vanilla`, `fa_skip`, and `fa_strip`. Each problem writes the legacy JSON plus `*.steps.jsonl` and `*.problem.json`; the dashboard can be regenerated with:
+
+```shell
+python fa_dashboard.py ./your_output_dir --save_to ./your_output_dir/fa_dashboard.png
+```
+
 ### Running the vLLM Server
 
 If you serve models locally with vLLM, fill in placeholders in `server/serve.sh` and run:

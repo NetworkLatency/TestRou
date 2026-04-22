@@ -1,7 +1,10 @@
 vllm
+openai
 datasets
 math-verify==0.8.0
 nltk==3.9.1
 uv==0.8.17
 transformers
 sentence_transformers
+matplotlib
+scipy
