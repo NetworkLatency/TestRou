@@ -13,7 +13,7 @@ import re
 
 ROUTING_MODES = ("vanilla", "fa_skip", "fa_strip")
 MAX_FORMAT_SKIP = 3
-DEFAULT_TOP_LOGPROBS = 50
+DEFAULT_TOP_LOGPROBS = 20
 KEEP_SLM = "KEEP_SLM"
 HANDOFF = "HANDOFF"
 
@@ -34,8 +34,8 @@ def get_model(model_size):
 
 # %%
 model_names = {
-    "32b": "YOUR_MODEL_NAME_FOR_32B",  # NOTE: change to the name of your 32b large model, e.g. "org/model-32b"
-    "4b": "YOUR_MODEL_NAME_FOR_4B",  # NOTE: change to the name of your 4b small model
+    "32b": "Qwen3-14B",  # NOTE: change to the name of your 32b large model, e.g. "org/model-32b"
+    "4b": "Qwen3-4b",  # NOTE: change to the name of your 4b small model
 }
 
 ports = {
@@ -45,11 +45,21 @@ ports = {
 
 clients = {}
 for size, full_name in model_names.items():
-    # OpenAI-compatible client; replace placeholders with your local endpoint.
-    clients[size] = OpenAI(
-        api_key="YOUR_API_KEY",  # NOTE: change to the api key of your model
-        base_url="YOUR_BASE_URL",  # NOTE: change to the base url of your model, e.g. f"http://localhost:{ports[size]}/v1"
-    )
+    for size, full_name in model_names.items():
+        if size == "4b":
+            # 本地 vLLM
+            clients[size] = OpenAI(
+                api_key="EMPTY",  # vLLM 不校验
+                base_url="http://localhost:8000/v1"
+                # base_url="http://10.90.235.174:8000/v1"
+            )
+        elif size == "32b":
+            clients[size] = OpenAI(
+                api_key="EMPTY",  # vLLM 不校验
+                # base_url="http://10.90.235.174:8000/v1"
+                # base_url="http://localhost:8000/v1"
+                base_url="http://192.168.3.13:8080/v1",
+            )
 
 
 def get_first_user_msg(problem, options=None):

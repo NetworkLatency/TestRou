@@ -14,7 +14,7 @@ FORMAT_STRINGS = [
     "1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.", "10.",
     "(1)", "(2)", "(3)",
     "\n", "\n\n", "\t",
-    " ",
+    " ","(",'[', '|',"(-",'√','"'
 ]
 
 MULTI_TOKEN_SAFE_STRIPPED = {"*", "**", "***", "-", "—", "#", "##", "###", "####", "\"", "'", "`", "```", ""}
@@ -57,8 +57,8 @@ def build_format_tokens(tokenizer_name_or_path):
 
 def main():
     parser = argparse.ArgumentParser(description="Build a Qwen3 format-token whitelist for FA-Routing.")
-    parser.add_argument("--tokenizer", default="Qwen/Qwen3-4B", help="Tokenizer name or local path")
-    parser.add_argument("--output", default="format_tokens.json", help="Where to write the whitelist JSON")
+    parser.add_argument("--tokenizer", default="/home/zhaoyang/Documents/code/models/Qwen3-4b/", help="Tokenizer name or local path")
+    parser.add_argument("--output", default="data/format_tokens.json", help="Where to write the whitelist JSON")
     args = parser.parse_args()
 
     data = build_format_tokens(args.tokenizer)

@@ -35,7 +35,11 @@ def get_dataset(dataset_name):
         dataset = load_dataset("HuggingFaceH4/aime_2024")["train"]
         options = "aime"
     elif dataset_name == "aime25":
-        dataset = load_dataset("math-ai/aime25")["test"]
+        dataset = load_dataset(
+            "parquet",
+            data_files="data/aime25.parquet",
+            split="train"
+        )
         options = "aime"
     elif dataset_name == "math500":
         dataset = load_dataset("HuggingFaceH4/MATH-500")["test"]
@@ -171,7 +175,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run GlimpRouter experiment")
 
     parser.add_argument("--dataset_name", type=str, choices=["aime24", "math500", "gpqa", "aime25", "lcbv5", "lcbv6"], 
-                        default=config.get("dataset_name", "aime24"),
+                        default=config.get("dataset_name", "aime25"),
                         help="Dataset name")
     parser.add_argument("--token_budget", type=int, 
                         default=config.get("token_budget", 8192),
@@ -183,7 +187,7 @@ if __name__ == "__main__":
                         default=config.get("score_method", "first_token_entropy"),
                         help="Scoring method")
     parser.add_argument("--output_dir", type=str, 
-                        default=config.get("output_dir", "./main_results"),
+                        default=config.get("output_dir", "router_result/"),
                         help="Where result pickle files will be written to")
     parser.add_argument("--model_size", type=str, 
                         default=config.get("model_size", "32b"),
@@ -195,7 +199,7 @@ if __name__ == "__main__":
                         default=config.get("score_threshold", 0.0),
                         help="Acceptance threshold")
     parser.add_argument("--routing_mode", type=str, choices=["vanilla", "fa_skip", "fa_strip"],
-                        default=config.get("routing_mode", "vanilla"),
+                        default=config.get("routing_mode", "fa_skip"),
                         help="Routing variant: vanilla, FA-skip, or FA-strip")
     parser.add_argument("--format_tokens_path", type=str,
                         default=config.get("format_tokens_path", "format_tokens.json"),
@@ -204,7 +208,7 @@ if __name__ == "__main__":
                         default=config.get("max_format_skip", 3),
                         help="Maximum consecutive format tokens to skip in fa_skip mode")
     parser.add_argument("--top_logprobs", type=int,
-                        default=config.get("top_logprobs", 50),
+                        default=config.get("top_logprobs", 20),
                         help="Top-k logprobs used to approximate entropy")
     parser.add_argument("--generate_dashboard", type=str2bool,
                         default=config.get("generate_dashboard", False),
