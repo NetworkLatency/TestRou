@@ -4,6 +4,7 @@
 .ssh
 .DS_Store
 *.pyc
+__pycache__/
 
 data/lcbv5/
 data/lcbv6/
