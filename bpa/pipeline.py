@@ -218,9 +218,14 @@ def llm_generate_final_with_rep_guard(state: GenerationState, llm, config: BPACo
     return accumulated_text, "max_tokens"
 
 
+def _normalized_step_for_duplicate(step_text: str) -> str:
+    return step_text.rstrip()
+
+
 def bpa_solve(problem_text: str, slm, llm, config: BPAConfig) -> BPAResult:
     state = GenerationState(problem_text=problem_text)
     rep = RepetitionState()
+    previous_final_step: str | None = None
     start_time = time.time()
     step_logs: list[dict] = []
 
@@ -230,7 +235,9 @@ def bpa_solve(problem_text: str, slm, llm, config: BPAConfig) -> BPAResult:
             state.stop_reason = "budget"
             break
 
-        if state.phase == Phase.FINAL_ANSWER:
+        phase_before_step = state.phase
+
+        if state.phase == Phase.FINAL_ANSWER and config.final_answer_mode == "llm_chunked":
             final_text, final_stop_reason = llm_generate_final_with_rep_guard(state, llm, config)
             state.assistant_prefix_text += final_text
             state.phase = Phase.DONE
@@ -247,6 +254,25 @@ def bpa_solve(problem_text: str, slm, llm, config: BPAConfig) -> BPAResult:
         state.step_count += 1
 
         check_and_transition_phase(state, step_text_normalized)
+
+        if phase_before_step == Phase.FINAL_ANSWER:
+            if finish == "eos":
+                state.phase = Phase.DONE
+                state.stop_reason = "final_eos"
+            else:
+                normalized_final_step = _normalized_step_for_duplicate(step_text_normalized)
+                if previous_final_step is not None and normalized_final_step == previous_final_step:
+                    state.phase = Phase.DONE
+                    state.stop_reason = "final_duplicate_step"
+                    state.trace.append(
+                        TraceEvent(
+                            state.step_count,
+                            "final_answer_duplicate_step",
+                            {"step_text": normalized_final_step[:200]},
+                        )
+                    )
+                else:
+                    previous_final_step = normalized_final_step
 
         step_logs.append(
             {
@@ -278,7 +304,7 @@ def bpa_solve(problem_text: str, slm, llm, config: BPAConfig) -> BPAResult:
                 )
                 rep = RepetitionState()
 
-        if finish == "eos":
+        if finish == "eos" and phase_before_step != Phase.FINAL_ANSWER:
             state.phase = Phase.DONE
             state.stop_reason = "eos"
 

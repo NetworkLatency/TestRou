@@ -13,9 +13,11 @@ from bpa.cascade.l1 import build_branch
 from bpa.cascade.l2 import char_ngram_jaccard, l2_compute
 from bpa.eval.datasets import load_eval_dataset, load_local_rows
 from bpa.eval.benchmark_eval import benchmark_eval_match, normalize_math_expr
+from bpa.eval.main_benchmark import build_summary_metrics
 from bpa.phase_machine import check_and_transition_phase, detect_close_think
+from bpa.pipeline import bpa_solve
 from bpa.render import render_for_continuation
-from bpa.safety import ensure_step_terminator, update_repetition
+from bpa.safety import clean_latex_answer, ensure_step_terminator, extract_answer, update_repetition
 from bpa.state import BranchCandidate, GenerationState, RepetitionState
 
 
@@ -68,6 +70,64 @@ class FakeEngine:
         prompt_ids = prompts
         plp = [{tid: Obj(logprob=-0.1)} for tid in prompt_ids]
         return [Obj(prompt_logprobs=plp, outputs=[Obj(text="x", token_ids=[120], finish_reason="length")])]
+
+
+class SequencedEngine:
+    def __init__(self, outputs=None, fail_on_generate=False):
+        self.tokenizer = FakeTokenizer()
+        self.outputs = list(outputs or [])
+        self.fail_on_generate = fail_on_generate
+        self.generate_calls = 0
+
+    def ensure_tokenizer(self):
+        return self.tokenizer
+
+    def encode(self, text):
+        return self.tokenizer.encode(text, add_special_tokens=False)
+
+    def decode(self, token_ids):
+        return self.tokenizer.decode(token_ids)
+
+    def sampling_params(self, **kwargs):
+        return kwargs
+
+    def tokens_prompt(self, prompt_token_ids):
+        return prompt_token_ids
+
+    def generate(self, prompts, sampling_params):
+        self.generate_calls += 1
+        if self.fail_on_generate:
+            raise AssertionError("generate should not have been called")
+        if sampling_params.get("max_tokens") == 1 and sampling_params.get("logprobs") is not None:
+            return [
+                Obj(
+                    prompt_logprobs=[],
+                    outputs=[
+                        Obj(
+                            text="A",
+                            token_ids=[ord("A")],
+                            finish_reason="length",
+                            logprobs=[{ord("A"): Obj(logprob=0.0)}],
+                        )
+                    ],
+                )
+            ]
+        if not self.outputs:
+            raise AssertionError("no queued generation output")
+        text, finish = self.outputs.pop(0)
+        return [
+            Obj(
+                prompt_logprobs=[],
+                outputs=[
+                    Obj(
+                        text=text,
+                        token_ids=list(range(len(text))),
+                        finish_reason=finish,
+                        logprobs=[{} for _ in text],
+                    )
+                ],
+            )
+        ]
 
 
 class EmptyAssistantRejectingTokenizer(FakeTokenizer):
@@ -142,6 +202,33 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(benchmark_eval_match(r"final \boxed{42}", "42", "aime25"))
         self.assertTrue(benchmark_eval_match(r"final \boxed{B}", "B", "gpqa"))
 
+    def test_latex_answer_cleanup_is_minimal(self):
+        self.assertEqual(clean_latex_answer(r"$\dfrac{14}{3}$"), r"\frac{14}{3}")
+        self.assertEqual(clean_latex_answer(r"11\sqrt2"), r"11\sqrt{2}")
+        self.assertTrue(benchmark_eval_match(r"\dfrac{14}{3}", r"\frac{14}{3}", "math500"))
+        self.assertTrue(benchmark_eval_match(r"11\sqrt2", r"11\sqrt{2}", "math500"))
+        self.assertFalse(benchmark_eval_match("5", "x=5", "math500"))
+        self.assertFalse(benchmark_eval_match("52", "52_8", "math500"))
+
+    def test_extract_answer_cleans_latex_only(self):
+        self.assertEqual(extract_answer(r"done \boxed{\dfrac{3}{56}}"), r"\frac{3}{56}")
+        self.assertEqual(extract_answer(r"reasoning</think> $11\sqrt2$"), r"11\sqrt{2}")
+
+    def test_summary_metrics(self):
+        rows = [
+            {"correct": True, "total_wall_time": 1.0, "problem_wall_time": 2.0},
+            {"correct": False, "total_wall_time": 3.0, "problem_wall_time": 4.0},
+            {"correct": None, "total_wall_time": 5.0, "problem_wall_time": 6.0},
+        ]
+        metrics = build_summary_metrics("math500", "slm_only", rows, dataset_wall_time=12.0)
+        self.assertEqual(metrics["num_problems"], 3)
+        self.assertEqual(metrics["num_evaluated"], 2)
+        self.assertEqual(metrics["num_correct"], 1)
+        self.assertEqual(metrics["accuracy"], 0.5)
+        self.assertEqual(metrics["avg_total_wall_time"], 3.0)
+        self.assertEqual(metrics["avg_problem_wall_time"], 4.0)
+        self.assertEqual(metrics["dataset_wall_time"], 12.0)
+
     def test_local_dataset_loader_jsonl(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "math500.jsonl"
@@ -161,6 +248,50 @@ class CoreTests(unittest.TestCase):
             config = BPAConfig(dataset_paths={"aime24": str(path)})
             problems = load_eval_dataset("aime24", config)
             self.assertEqual(problems[0].gold_answer, "y")
+
+    def test_routed_final_continues_router_after_close_think(self):
+        slm = SequencedEngine([("</think>\n\n", "stop"), ("The answer is 42.", "eos")])
+        llm = SequencedEngine(fail_on_generate=True)
+        result = bpa_solve("p", slm, llm, BPAConfig(final_answer_mode="routed", max_total_tokens=200))
+        self.assertEqual(result.state.stop_reason, "final_eos")
+        self.assertEqual(llm.generate_calls, 0)
+        self.assertIn("The answer is 42.", result.state.assistant_prefix_text)
+
+    def test_routed_final_does_not_use_ngram_repetition_guard(self):
+        repeated_phrase = "alpha alpha alpha alpha alpha alpha alpha alpha.\n\n"
+        slm = SequencedEngine(
+            [
+                ("</think>\n\n", "stop"),
+                (repeated_phrase, "stop"),
+                ("Different final step.", "eos"),
+            ]
+        )
+        llm = SequencedEngine(fail_on_generate=True)
+        result = bpa_solve("p", slm, llm, BPAConfig(final_answer_mode="routed", max_total_tokens=300))
+        self.assertEqual(result.state.stop_reason, "final_eos")
+        self.assertIn("Different final step.", result.state.assistant_prefix_text)
+        self.assertFalse(any(event.event == "final_answer_stopped_by_repetition" for event in result.state.trace))
+
+    def test_routed_final_stops_on_duplicate_final_step(self):
+        slm = SequencedEngine(
+            [
+                ("</think>\n\n", "stop"),
+                ("Same final step.\n\n", "stop"),
+                ("Same final step.", "stop"),
+            ]
+        )
+        llm = SequencedEngine(fail_on_generate=True)
+        result = bpa_solve("p", slm, llm, BPAConfig(final_answer_mode="routed", max_total_tokens=300))
+        self.assertEqual(result.state.stop_reason, "final_duplicate_step")
+        self.assertTrue(any(event.event == "final_answer_duplicate_step" for event in result.state.trace))
+
+    def test_llm_chunked_final_mode_keeps_legacy_final_generator(self):
+        slm = SequencedEngine([("</think>\n\n", "stop")])
+        llm = SequencedEngine([("LLM final.", "eos")])
+        result = bpa_solve("p", slm, llm, BPAConfig(final_answer_mode="llm_chunked", max_total_tokens=200))
+        self.assertEqual(result.state.stop_reason, "final_eos")
+        self.assertEqual(llm.generate_calls, 1)
+        self.assertIn("LLM final.", result.state.assistant_prefix_text)
 
 
 if __name__ == "__main__":

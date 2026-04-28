@@ -101,10 +101,33 @@ def extract_choice_letter(text: Optional[str]) -> Optional[str]:
     return None
 
 
+def clean_latex_answer(answer: Optional[str]) -> Optional[str]:
+    if answer is None:
+        return None
+    s = str(answer).strip()
+    if not s:
+        return None
+
+    while True:
+        if len(s) >= 4 and s.startswith("$$") and s.endswith("$$"):
+            s = s[2:-2].strip()
+            continue
+        if len(s) >= 2 and s.startswith("$") and s.endswith("$"):
+            s = s[1:-1].strip()
+            continue
+        break
+
+    s = s.replace(r"\dfrac", r"\frac").replace(r"\tfrac", r"\frac")
+    s = s.replace(r"\left", "").replace(r"\right", "")
+    s = re.sub(r"\\sqrt\s*([A-Za-z0-9])(?![A-Za-z0-9])", r"\\sqrt{\1}", s)
+    s = s.strip()
+    return s or None
+
+
 def extract_answer(assistant_text: str) -> str | None:
     boxed = extract_last_boxed(assistant_text)
     if boxed is not None:
-        return boxed
+        return clean_latex_answer(boxed)
     if CLOSE_THINK_TAG in assistant_text:
-        return assistant_text.split(CLOSE_THINK_TAG, 1)[1].strip() or None
-    return assistant_text.strip() or None
+        return clean_latex_answer(assistant_text.split(CLOSE_THINK_TAG, 1)[1])
+    return clean_latex_answer(assistant_text)

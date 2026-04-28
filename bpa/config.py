@@ -43,6 +43,7 @@ class BPAConfig:
     max_llm_interventions: int = 8
     final_answer_max_tokens: int = 1024
     final_answer_chunk_tokens: int = 128
+    final_answer_mode: str = "routed"  # "routed" | "llm_chunked"
     repetition_ngram_size: int = 8
     repetition_ngram_threshold: int = 4
     slm_to_llm_flop_ratio: float = 0.05
@@ -53,6 +54,10 @@ class BPAConfig:
     apply_arbitration: bool = True
     collect_branch_logs: bool = True
     reset_prefix_cache_after_problem: bool = True
+
+    def __post_init__(self) -> None:
+        if self.final_answer_mode not in {"routed", "llm_chunked"}:
+            raise ValueError("final_answer_mode must be one of: 'routed', 'llm_chunked'")
 
     @classmethod
     def from_json(cls, path: str | Path) -> "BPAConfig":

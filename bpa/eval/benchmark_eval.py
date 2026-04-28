@@ -4,7 +4,7 @@ import re
 from fractions import Fraction
 from typing import Optional
 
-from bpa.safety import extract_choice_letter, extract_last_boxed
+from bpa.safety import clean_latex_answer, extract_choice_letter, extract_last_boxed
 
 
 def strip_outer_wrappers(s: str) -> str:
@@ -36,7 +36,7 @@ def strip_outer_wrappers(s: str) -> str:
 def normalize_math_expr(expr: Optional[str]) -> Optional[str]:
     if expr is None:
         return None
-    s = str(expr).strip()
+    s = clean_latex_answer(expr)
     if not s:
         return None
     s = s.replace("$", "").replace(",", "").replace(" ", "")
