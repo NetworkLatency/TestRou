@@ -35,6 +35,7 @@ class BPAConfig:
     l2_text_jaccard_thresh: float = 0.4
     prompt_logprobs_topk: int = 20
     prompt_logprobs_sweep: list[int] = field(default_factory=lambda: [1, 5, 20])
+    llm_scoring_context_window: int = 0  # 0 means exact full-prefix scoring.
     score_missing_ratio_thresh: float = 0.2
     invalid_fallback: str = "skip"
     max_step_tokens: int = 1024
@@ -51,6 +52,7 @@ class BPAConfig:
     cascade_mode: str = "bpa"  # "bpa" | "hinit"
     apply_arbitration: bool = True
     collect_branch_logs: bool = True
+    reset_prefix_cache_after_problem: bool = True
 
     @classmethod
     def from_json(cls, path: str | Path) -> "BPAConfig":

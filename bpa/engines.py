@@ -15,6 +15,7 @@ def _cuda_device_scope(devices: str | None):
     if devices is None:
         yield
         return
+    devices = devices.removeprefix("cuda:")
     prev = os.environ.get("CUDA_VISIBLE_DEVICES")
     os.environ["CUDA_VISIBLE_DEVICES"] = devices
     try:
@@ -99,6 +100,38 @@ class ModelEngine:
     def generate(self, prompts: Any, sampling_params: Any) -> Any:
         self.load()
         return self.llm.generate(prompts, sampling_params)
+
+    def reset_prefix_cache(self) -> bool:
+        if self.llm is None:
+            return True
+        reset = getattr(self.llm, "reset_prefix_cache", None)
+        if reset is None:
+            return False
+        for args in ((), (False,), (False, False)):
+            try:
+                return bool(reset(*args))
+            except TypeError:
+                continue
+            except Exception:
+                return False
+        return False
+
+    def clear_runtime_cache(self) -> bool:
+        ok = self.reset_prefix_cache()
+        try:
+            import gc
+
+            gc.collect()
+        except Exception:
+            pass
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        return ok
 
 
 def _engine_kwargs(config: BPAConfig, specific: dict[str, Any]) -> dict[str, Any]:

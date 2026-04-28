@@ -13,13 +13,13 @@
     "humaneval": "data/HumanEval.jsonl"
   },
   "slm_engine_kwargs": {
-    "gpu_memory_utilization": 0.9
+    "gpu_memory_utilization": 0.65
   },
   "llm_engine_kwargs": {
-    "gpu_memory_utilization": 0.9
+    "gpu_memory_utilization": 0.65
   },
-  "slm_device": "cuda:0",
-  "llm_device": "cuda:1",
+  "slm_device": "0",
+  "llm_device": "1",
   "trust_remote_code": true,
   "max_model_len": 16384,
   "enable_prefix_caching": true,
@@ -31,6 +31,7 @@
   "l2_text_jaccard_thresh": 0.4,
   "prompt_logprobs_topk": 20,
   "prompt_logprobs_sweep": [1, 5, 20],
+  "llm_scoring_context_window": 0,
   "score_missing_ratio_thresh": 0.2,
   "invalid_fallback": "skip",
   "max_step_tokens": 1024,
@@ -44,5 +45,6 @@
   "arbitration_tie_margin": 0.05,
   "cascade_mode": "bpa",
   "apply_arbitration": true,
-  "collect_branch_logs": true
+  "collect_branch_logs": true,
+  "reset_prefix_cache_after_problem": true
 }

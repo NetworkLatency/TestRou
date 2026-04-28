@@ -90,6 +90,17 @@ python -m bpa.eval.exp_d5_prompt_logprobs_smoke \
   --max-problems 5
 ```
 
+For a lighter backend-stability check, cap scored trigger positions:
+
+```bash
+python -m bpa.eval.exp_d5_prompt_logprobs_smoke \
+  --config configs/bpa_default.json \
+  --dataset math500 \
+  --max-problems 1 \
+  --max-steps 12 \
+  --max-triggers-per-problem 3
+```
+
 By default D5 sweeps `prompt_logprobs_sweep = [1, 5, 20]`. Many vLLM builds cap `prompt_logprobs` at 20 unless the engine is started with a larger `max_logprobs`, so `50` is not enabled by default. To test `50`, set both:
 
 ```json
@@ -136,6 +147,8 @@ Free memory on device cuda:0 (...) is less than desired GPU memory utilization (
 ```
 
 it means vLLM is trying to reserve more memory than is currently free. In BPA offline runs this often happens during D5 when the SLM has already been loaded and the LLM starts afterward.
+
+If D5 writes `EngineDeadError` into records, those rows are not valid branch-scoring results. The current runner now treats `EngineDeadError` as fatal, writes partial valid records plus `bpa_results/diagnostics/d5_prompt_logprobs_smoke/aborted.json`, and exits non-zero.
 
 Fixes, in order:
 

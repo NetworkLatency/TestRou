@@ -8,6 +8,24 @@ from .render import render_for_continuation
 from .state import ArbitrationResult, BranchCandidate, BranchScore, GenerationState, SpanLocateResult
 
 
+def _apply_scoring_context_window(locate: SpanLocateResult, window: int) -> SpanLocateResult:
+    if window <= 0 or locate.branch_start_token <= window:
+        return locate
+    trim = locate.branch_start_token - window
+    token_ids = locate.token_ids[trim:]
+    return SpanLocateResult(
+        token_ids=token_ids,
+        branch_start_token=locate.branch_start_token - trim,
+        branch_end_token=locate.branch_end_token - trim,
+        span_method=locate.span_method,
+        has_boundary_crossing_token=locate.has_boundary_crossing_token,
+        char_start=locate.char_start,
+        char_end=locate.char_end,
+        is_invalid=locate.is_invalid,
+        invalid_reason=locate.invalid_reason,
+    )
+
+
 def _longest_common_prefix_len(a: str, b: str) -> int:
     n = min(len(a), len(b))
     for i in range(n):
@@ -115,6 +133,7 @@ def score_branch(state: GenerationState, llm, branch_text: str, config: BPAConfi
             invalid_reason=locate.invalid_reason,
             prefill_tokens=0,
         )
+    locate = _apply_scoring_context_window(locate, config.llm_scoring_context_window)
 
     sampling = llm.sampling_params(max_tokens=1, temperature=0.0, prompt_logprobs=config.prompt_logprobs_topk)
     out = llm.generate(llm.tokens_prompt(locate.token_ids), sampling)[0]
@@ -167,6 +186,25 @@ def score_branch(state: GenerationState, llm, branch_text: str, config: BPAConfi
         prefill_tokens=len(locate.token_ids),
         missing_count=missing_count,
         missing_ratio=missing_ratio,
+    )
+
+
+def _apply_scoring_context_window(locate: SpanLocateResult, context_window: int) -> SpanLocateResult:
+    if context_window <= 0:
+        return locate
+    if locate.branch_start_token <= context_window:
+        return locate
+    crop_start = locate.branch_start_token - context_window
+    return SpanLocateResult(
+        token_ids=locate.token_ids[crop_start:],
+        branch_start_token=locate.branch_start_token - crop_start,
+        branch_end_token=locate.branch_end_token - crop_start,
+        span_method=f"{locate.span_method}_context_window_{context_window}",
+        has_boundary_crossing_token=locate.has_boundary_crossing_token,
+        char_start=locate.char_start,
+        char_end=locate.char_end,
+        is_invalid=locate.is_invalid,
+        invalid_reason=locate.invalid_reason,
     )
 
 

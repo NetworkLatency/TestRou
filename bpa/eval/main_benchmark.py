@@ -70,6 +70,9 @@ def main() -> None:
         )
         rows.append(summary)
         write_problem_outputs(output_root, args.dataset, args.variant, problem, result, config)
+        if config.reset_prefix_cache_after_problem:
+            slm.clear_runtime_cache()
+            llm.clear_runtime_cache()
 
     summary_path = output_root / args.dataset / args.variant / "summary.csv"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
