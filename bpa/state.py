@@ -93,6 +93,8 @@ class BranchCandidate:
     sum_logprob_raw: float
     sum_logprob_step: float
     cutoff_tok_count: int | None = None
+    ended_by_eos: bool = False
+    finish_reason: str = "length"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -106,6 +108,9 @@ class BranchCandidate:
             "first_token_logprob": self.first_token_logprob,
             "sum_logprob_raw": self.sum_logprob_raw,
             "sum_logprob_step": self.sum_logprob_step,
+            "cutoff_tok_count": self.cutoff_tok_count,
+            "ended_by_eos": self.ended_by_eos,
+            "finish_reason": self.finish_reason,
         }
 
 

@@ -13,12 +13,17 @@ from bpa.cascade.l1 import build_branch
 from bpa.cascade.l2 import char_ngram_jaccard, l2_compute
 from bpa.eval.datasets import load_eval_dataset, load_local_rows
 from bpa.eval.benchmark_eval import benchmark_eval_match, normalize_math_expr
-from bpa.eval.main_benchmark import build_summary_metrics
+from bpa.eval.main_benchmark import (
+    _existing_row_from_problem_output,
+    has_complete_problem_outputs,
+    build_summary_metrics,
+    write_summary_files,
+)
 from bpa.phase_machine import check_and_transition_phase, detect_close_think
-from bpa.pipeline import bpa_solve
+from bpa.pipeline import bpa_solve, generate_one_step
 from bpa.render import render_for_continuation
 from bpa.safety import clean_latex_answer, ensure_step_terminator, extract_answer, update_repetition
-from bpa.state import BranchCandidate, GenerationState, RepetitionState
+from bpa.state import BranchCandidate, CascadeResult, Decision, GenerationState, L0Result, RepetitionState
 
 
 class Obj:
@@ -29,8 +34,9 @@ class Obj:
 class FakeTokenizer:
     is_fast = True
 
-    def __init__(self, table=None):
+    def __init__(self, table=None, eos_token_id=None):
         self.table = table or {}
+        self.eos_token_id = eos_token_id
 
     def apply_chat_template(self, messages, tokenize=False, continue_final_message=True, add_generation_prompt=False):
         if add_generation_prompt:
@@ -44,7 +50,12 @@ class FakeTokenizer:
         return [ord(ch) for ch in text]
 
     def decode(self, ids, skip_special_tokens=False, clean_up_tokenization_spaces=False):
-        return "".join(self.table.get(i, chr(i)) for i in ids)
+        pieces = []
+        for i in ids:
+            if skip_special_tokens and self.eos_token_id is not None and i == self.eos_token_id:
+                continue
+            pieces.append(self.table.get(i, chr(i)))
+        return "".join(pieces)
 
     def __call__(self, text, add_special_tokens=False, return_offsets_mapping=True):
         return {
@@ -177,6 +188,31 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(branch.step_branch_was_truncated)
         self.assertAlmostEqual(branch.sum_logprob_step, -0.3)
 
+    def test_l1_branch_cuts_eos_before_visible_text(self):
+        tok = FakeTokenizer(
+            {1: "A", 2: "B", 151643: "<｜end▁of▁sentence｜>", 3: "C"},
+            eos_token_id=151643,
+        )
+        out = Obj(
+            outputs=[
+                Obj(
+                    token_ids=[2, 151643, 3],
+                    finish_reason="length",
+                    logprobs=[
+                        {2: Obj(logprob=-0.2)},
+                        {151643: Obj(logprob=-0.3)},
+                        {3: Obj(logprob=-0.4)},
+                    ],
+                )
+            ]
+        )
+        branch = build_branch(1, -0.1, out, tok)
+        self.assertIn("<｜end▁of▁sentence｜>", branch.raw_rollout_text)
+        self.assertEqual(branch.step_branch_text, "AB")
+        self.assertFalse(branch.step_branch_was_truncated)
+        self.assertTrue(branch.ended_by_eos)
+        self.assertEqual(branch.finish_reason, "branch_eos")
+
     def test_l2_statistics(self):
         b1 = BranchCandidate(1, "A", "alpha path", [1, 2], "alpha", False, [-0.2], -0.1, -0.3, -0.3)
         b2 = BranchCandidate(3, "B", "beta path", [3, 4], "beta", False, [-0.2], -0.1, -0.3, -0.3)
@@ -196,6 +232,29 @@ class CoreTests(unittest.TestCase):
         self.assertFalse(score.is_invalid)
         self.assertEqual(score.branch_token_count, 3)
         self.assertEqual(score.missing_count, 0)
+
+    def test_llm_arbitrated_eos_branch_does_not_continue_slm(self):
+        winner = BranchCandidate(
+            1,
+            "A",
+            "Answer",
+            [1],
+            "Answer",
+            False,
+            [],
+            -0.1,
+            -0.1,
+            -0.1,
+            ended_by_eos=True,
+            finish_reason="branch_eos",
+        )
+        l0 = L0Result(False, 0.0, 0.0, {}, [], "other")
+        cascade = CascadeResult(decision=Decision.LLM_ARBITRATE, l0=l0, winner_branch=winner)
+        slm = SequencedEngine(fail_on_generate=True)
+        text, finish = generate_one_step(GenerationState(problem_text="p"), slm, slm, BPAConfig(), cascade)
+        self.assertEqual(text, "Answer")
+        self.assertEqual(finish, "branch_eos")
+        self.assertEqual(slm.generate_calls, 0)
 
     def test_answer_eval(self):
         self.assertEqual(normalize_math_expr(r"\frac{4}{2}"), "2")
@@ -228,6 +287,45 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(metrics["avg_total_wall_time"], 3.0)
         self.assertEqual(metrics["avg_problem_wall_time"], 4.0)
         self.assertEqual(metrics["dataset_wall_time"], 12.0)
+
+    def test_resume_helpers_reconstruct_existing_problem_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            problem = Obj(problem_id=7, question_id="", gold_answer=r"\frac{14}{3}")
+            problem_root = root / "math500" / "bpa_arbitration" / "7"
+            problem_root.mkdir(parents=True)
+            saved = {
+                "answer": r"\dfrac{14}{3}",
+                "correct": False,
+                "total_wall_time": 1.5,
+                "slm_decode_tokens": 1,
+                "slm_prefill_tokens": 2,
+                "llm_decode_tokens": 3,
+                "llm_prefill_tokens": 4,
+                "llm_scoring_calls": 5,
+                "llm_full_calls": 6,
+                "equivalent_llm_tokens": 7.5,
+                "stop_reason": "final_eos",
+            }
+            (problem_root / "7.problem.json").write_text(json.dumps(saved), encoding="utf-8")
+            (problem_root / "7.steps.jsonl").write_text("", encoding="utf-8")
+            (problem_root / "7.branches.jsonl").write_text("", encoding="utf-8")
+            (problem_root / "7.trace.json").write_text("[]", encoding="utf-8")
+
+            self.assertTrue(has_complete_problem_outputs(root, "math500", "bpa_arbitration", 7))
+            row = _existing_row_from_problem_output(root, "math500", "bpa_arbitration", problem, BPAConfig())
+            self.assertTrue(row["correct"])
+            self.assertEqual(row["problem_wall_time"], 1.5)
+            self.assertEqual(row["problem_id"], 7)
+
+    def test_write_summary_files_writes_csv_and_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            summary_path = Path(tmp) / "math500" / "slm_only" / "summary.csv"
+            rows = [{"problem_id": 1, "correct": True, "total_wall_time": 1.0, "problem_wall_time": 1.2}]
+            metrics = build_summary_metrics("math500", "slm_only", rows, dataset_wall_time=1.3)
+            write_summary_files(summary_path, rows, metrics)
+            self.assertTrue(summary_path.exists())
+            self.assertTrue((summary_path.parent / "summary_metrics.json").exists())
 
     def test_local_dataset_loader_jsonl(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -283,7 +381,48 @@ class CoreTests(unittest.TestCase):
         llm = SequencedEngine(fail_on_generate=True)
         result = bpa_solve("p", slm, llm, BPAConfig(final_answer_mode="routed", max_total_tokens=300))
         self.assertEqual(result.state.stop_reason, "final_duplicate_step")
-        self.assertTrue(any(event.event == "final_answer_duplicate_step" for event in result.state.trace))
+        self.assertTrue(any(event.event == "final_duplicate_step" for event in result.state.trace))
+
+    def test_routed_final_stops_on_stable_answer_candidate(self):
+        slm = SequencedEngine(
+            [
+                ("</think>\n\n", "stop"),
+                (r"**Final Answer:** \(\boxed{225}\)" + "\n\n", "stop"),
+                (r"\boxed{225}" + "\n\n", "stop"),
+            ]
+        )
+        llm = SequencedEngine(fail_on_generate=True)
+        result = bpa_solve("p", slm, llm, BPAConfig(final_answer_mode="routed", max_total_tokens=300))
+        self.assertEqual(result.state.stop_reason, "final_answer_stable")
+        self.assertEqual(result.answer, "225")
+
+    def test_routed_final_does_not_stop_on_repeated_intermediate_box_without_marker(self):
+        slm = SequencedEngine(
+            [
+                ("</think>\n\n", "stop"),
+                (r"We compute \boxed{1} as an intermediate value." + "\n\n", "stop"),
+                (r"Again \boxed{1} appears while checking." + "\n\n", "stop"),
+                (r"**Final Answer:** \(\boxed{2}\)", "eos"),
+            ]
+        )
+        llm = SequencedEngine(fail_on_generate=True)
+        result = bpa_solve("p", slm, llm, BPAConfig(final_answer_mode="routed", max_total_tokens=400))
+        self.assertEqual(result.state.stop_reason, "final_eos")
+        self.assertEqual(result.answer, "2")
+
+    def test_routed_final_stops_and_discards_restart_after_marked_answer(self):
+        slm = SequencedEngine(
+            [
+                ("</think>\n\n", "stop"),
+                (r"**Final Answer:** \(\boxed{225}\)" + "\n\n", "stop"),
+                (r"Step-by-step explanation: First compute \boxed{1}." + "\n\n", "stop"),
+            ]
+        )
+        llm = SequencedEngine(fail_on_generate=True)
+        result = bpa_solve("p", slm, llm, BPAConfig(final_answer_mode="routed", max_total_tokens=400))
+        self.assertEqual(result.state.stop_reason, "final_restarted_after_answer")
+        self.assertEqual(result.answer, "225")
+        self.assertNotIn("Step-by-step explanation", result.state.assistant_prefix_text)
 
     def test_llm_chunked_final_mode_keeps_legacy_final_generator(self):
         slm = SequencedEngine([("</think>\n\n", "stop")])

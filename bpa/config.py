@@ -44,6 +44,9 @@ class BPAConfig:
     final_answer_max_tokens: int = 1024
     final_answer_chunk_tokens: int = 128
     final_answer_mode: str = "routed"  # "routed" | "llm_chunked"
+    max_final_steps: int = 64
+    max_final_tokens: int = 2048
+    final_answer_stability_repeats: int = 2
     repetition_ngram_size: int = 8
     repetition_ngram_threshold: int = 4
     slm_to_llm_flop_ratio: float = 0.05
@@ -58,6 +61,12 @@ class BPAConfig:
     def __post_init__(self) -> None:
         if self.final_answer_mode not in {"routed", "llm_chunked"}:
             raise ValueError("final_answer_mode must be one of: 'routed', 'llm_chunked'")
+        if self.max_final_steps < 1:
+            raise ValueError("max_final_steps must be >= 1")
+        if self.max_final_tokens < 1:
+            raise ValueError("max_final_tokens must be >= 1")
+        if self.final_answer_stability_repeats < 1:
+            raise ValueError("final_answer_stability_repeats must be >= 1")
 
     @classmethod
     def from_json(cls, path: str | Path) -> "BPAConfig":
