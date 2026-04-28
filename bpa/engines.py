@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -8,12 +10,29 @@ from transformers import AutoTokenizer
 from .config import BPAConfig
 
 
+@contextmanager
+def _cuda_device_scope(devices: str | None):
+    if devices is None:
+        yield
+        return
+    prev = os.environ.get("CUDA_VISIBLE_DEVICES")
+    os.environ["CUDA_VISIBLE_DEVICES"] = devices
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = prev
+
+
 @dataclass
 class ModelEngine:
     name: str
     model_path: str
     tokenizer_path: str | None = None
     engine_kwargs: dict[str, Any] = field(default_factory=dict)
+    cuda_visible_devices: str | None = None
     llm: Any | None = None
     tokenizer: Any | None = None
 
@@ -32,7 +51,8 @@ class ModelEngine:
                     "vLLM is required for runtime generation. Install it on the GPU experiment host."
                 ) from exc
             try:
-                self.llm = LLM(model=self.model_path, tokenizer=self.tokenizer_path or self.model_path, **self.engine_kwargs)
+                with _cuda_device_scope(self.cuda_visible_devices):
+                    self.llm = LLM(model=self.model_path, tokenizer=self.tokenizer_path or self.model_path, **self.engine_kwargs)
             except Exception as exc:
                 raise RuntimeError(
                     f"Failed to initialize vLLM engine {self.name!r} for model {self.model_path!r}. "
@@ -81,14 +101,12 @@ class ModelEngine:
         return self.llm.generate(prompts, sampling_params)
 
 
-def _engine_kwargs(config: BPAConfig, specific: dict[str, Any], device: str | None = None) -> dict[str, Any]:
+def _engine_kwargs(config: BPAConfig, specific: dict[str, Any]) -> dict[str, Any]:
     kwargs = {
         "trust_remote_code": config.trust_remote_code,
         "max_model_len": config.max_model_len,
         "enable_prefix_caching": config.enable_prefix_caching,
     }
-    if device is not None:
-        kwargs["device"] = device
     kwargs.update(specific)
     return kwargs
 
@@ -98,13 +116,15 @@ def init_engines(config: BPAConfig) -> tuple[ModelEngine, ModelEngine]:
         name="slm",
         model_path=config.slm_model_path,
         tokenizer_path=config.slm_tokenizer_path,
-        engine_kwargs=_engine_kwargs(config, config.slm_engine_kwargs, config.slm_device),
+        engine_kwargs=_engine_kwargs(config, config.slm_engine_kwargs),
+        cuda_visible_devices=config.slm_device,
     )
     llm = ModelEngine(
         name="llm",
         model_path=config.llm_model_path,
         tokenizer_path=config.llm_tokenizer_path,
-        engine_kwargs=_engine_kwargs(config, config.llm_engine_kwargs, config.llm_device),
+        engine_kwargs=_engine_kwargs(config, config.llm_engine_kwargs),
+        cuda_visible_devices=config.llm_device,
     )
     return slm, llm
 
