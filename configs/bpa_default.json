@@ -5,8 +5,11 @@
   "llm_tokenizer_path": null,
   "output_dir": "bpa_results",
   "dataset_paths": {
+    "math500": "data/math500.jsonl",
+    "aime24": "data/aime24.jsonl",
     "aime25": "data/aime25.parquet",
     "gpqa": "data/gpqa_diamond.jsonl",
+    "gpqa_diamond": "data/gpqa_diamond.jsonl",
     "humaneval": "data/HumanEval.jsonl"
   },
   "slm_engine_kwargs": {},

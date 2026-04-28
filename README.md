@@ -17,9 +17,41 @@ Edit `configs/bpa_default.json` before a real run:
 
 - `slm_model_path`: local path or HF id for `DeepSeek-R1-Distill-Qwen-1.5B`
 - `llm_model_path`: local path or HF id for `Qwen-32B`
+- `dataset_paths.math500`: local MATH500 file
+- `dataset_paths.aime24`: local AIME24 file
 - `dataset_paths.aime25`: local `aime25.parquet`
 - `dataset_paths.gpqa`: local GPQA-Diamond json/jsonl
 - `slm_engine_kwargs` / `llm_engine_kwargs`: vLLM engine settings such as tensor parallel size
+
+## Local Dataset Files
+
+Dataset loading is fully local. The experiment runner does not call HuggingFace Hub or `datasets.load_dataset`.
+
+Supported local formats:
+
+- `.jsonl`: one JSON object per line
+- `.json`: either a list of objects or an object containing `data`, `train`, `test`, `examples`, or `rows`
+- `.csv` / `.tsv`: header row required
+- `.parquet`: requires `pandas` and `pyarrow`
+
+Expected columns:
+
+- MATH500 / AIME24 / AIME25: `problem` plus one of `answer`, `solution`, or `target`
+- GPQA-Diamond: `problem`/`question` plus either `A`-`D` choices and `answer`, or original GPQA-style `Correct Answer`, `Incorrect Answer 1`, `Incorrect Answer 2`, `Incorrect Answer 3`
+- HumanEval: `prompt`; execution evaluation is intentionally not implemented in the first BPA pass
+
+Example config fragment:
+
+```json
+"dataset_paths": {
+  "math500": "/data/benchmarks/math500.jsonl",
+  "aime24": "/data/benchmarks/aime24.jsonl",
+  "aime25": "/data/benchmarks/aime25.parquet",
+  "gpqa": "/data/benchmarks/gpqa_diamond.jsonl",
+  "gpqa_diamond": "/data/benchmarks/gpqa_diamond.jsonl",
+  "humaneval": "/data/benchmarks/HumanEval.jsonl"
+}
+```
 
 ## BPA v2.1 Offline Runs
 

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import math
+import json
+import tempfile
+from pathlib import Path
 import unittest
 
 from bpa.arbitration import locate_branch_token_span, score_branch
+from bpa.config import BPAConfig
 from bpa.cascade.l0 import entropy_and_margin
 from bpa.cascade.l1 import build_branch
 from bpa.cascade.l2 import char_ngram_jaccard, l2_compute
-from bpa.config import BPAConfig
+from bpa.eval.datasets import load_eval_dataset, load_local_rows
 from bpa.eval.benchmark_eval import benchmark_eval_match, normalize_math_expr
 from bpa.phase_machine import check_and_transition_phase, detect_close_think
 from bpa.safety import ensure_step_terminator, update_repetition
@@ -118,6 +122,26 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(normalize_math_expr(r"\frac{4}{2}"), "2")
         self.assertTrue(benchmark_eval_match(r"final \boxed{42}", "42", "aime25"))
         self.assertTrue(benchmark_eval_match(r"final \boxed{B}", "B", "gpqa"))
+
+    def test_local_dataset_loader_jsonl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "math500.jsonl"
+            path.write_text(json.dumps({"id": 7, "problem": "1+1?", "answer": "2"}) + "\n", encoding="utf-8")
+            config = BPAConfig(dataset_paths={"math500": str(path)})
+            rows = load_local_rows(path)
+            problems = load_eval_dataset("math500", config)
+            self.assertEqual(rows[0]["problem"], "1+1?")
+            self.assertEqual(problems[0].problem_id, 7)
+            self.assertEqual(problems[0].gold_answer, "2")
+            self.assertIn("Problem: 1+1?", problems[0].problem_text)
+
+    def test_local_dataset_loader_json_wrapped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "aime24.json"
+            path.write_text(json.dumps({"data": [{"problem": "x", "target": "y"}]}), encoding="utf-8")
+            config = BPAConfig(dataset_paths={"aime24": str(path)})
+            problems = load_eval_dataset("aime24", config)
+            self.assertEqual(problems[0].gold_answer, "y")
 
 
 if __name__ == "__main__":
