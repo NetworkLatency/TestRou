@@ -92,6 +92,7 @@ class BranchCandidate:
     first_token_logprob: float
     sum_logprob_raw: float
     sum_logprob_step: float
+    cutoff_tok_count: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {

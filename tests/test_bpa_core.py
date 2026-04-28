@@ -14,6 +14,7 @@ from bpa.cascade.l2 import char_ngram_jaccard, l2_compute
 from bpa.eval.datasets import load_eval_dataset, load_local_rows
 from bpa.eval.benchmark_eval import benchmark_eval_match, normalize_math_expr
 from bpa.phase_machine import check_and_transition_phase, detect_close_think
+from bpa.render import render_for_continuation
 from bpa.safety import ensure_step_terminator, update_repetition
 from bpa.state import BranchCandidate, GenerationState, RepetitionState
 
@@ -30,6 +31,9 @@ class FakeTokenizer:
         self.table = table or {}
 
     def apply_chat_template(self, messages, tokenize=False, continue_final_message=True, add_generation_prompt=False):
+        if add_generation_prompt:
+            assert continue_final_message is False
+            return f"USER:{messages[0]['content']}\nASSISTANT:"
         assert continue_final_message is True
         assert add_generation_prompt is False
         return f"USER:{messages[0]['content']}\nASSISTANT:{messages[1]['content']}"
@@ -66,6 +70,16 @@ class FakeEngine:
         return [Obj(prompt_logprobs=plp, outputs=[Obj(text="x", token_ids=[120], finish_reason="length")])]
 
 
+class EmptyAssistantRejectingTokenizer(FakeTokenizer):
+    def apply_chat_template(self, messages, tokenize=False, continue_final_message=True, add_generation_prompt=False):
+        if continue_final_message and messages[-1]["role"] == "assistant":
+            if messages[-1]["content"] == "" or messages[-1]["content"] == "bad":
+                raise ValueError(
+                    "continue_final_message is set but the final message does not appear in the chat after applying the chat template!"
+                )
+        return super().apply_chat_template(messages, tokenize, continue_final_message, add_generation_prompt)
+
+
 class CoreTests(unittest.TestCase):
     def test_detect_close_think_cross_boundary(self):
         found, rel = detect_close_think("abc</thi", "nk>tail")
@@ -76,6 +90,11 @@ class CoreTests(unittest.TestCase):
         check_and_transition_phase(state, "nk>tail")
         self.assertEqual(state.assistant_prefix_text, "abc</think>")
         self.assertTrue(state.has_seen_close_think)
+
+    def test_render_empty_prefix_uses_generation_prompt(self):
+        tok = EmptyAssistantRejectingTokenizer()
+        self.assertEqual(render_for_continuation("p", "", tok), "USER:p\nASSISTANT:")
+        self.assertEqual(render_for_continuation("p", "bad", tok), "USER:p\nASSISTANT:bad")
 
     def test_step_terminator_and_repetition(self):
         self.assertEqual(ensure_step_terminator("abc", "stop"), "abc\n\n")

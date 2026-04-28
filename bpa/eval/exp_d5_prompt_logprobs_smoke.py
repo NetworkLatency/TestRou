@@ -22,17 +22,35 @@ from .datasets import load_eval_dataset
 def run_smoke(config: BPAConfig, dataset: str, max_problems: int) -> list[dict]:
     slm, llm = init_engines(config)
     rows = []
+    sweep = sorted(set(int(k) for k in config.prompt_logprobs_sweep))
     for problem in tqdm(load_eval_dataset(dataset, config, max_problems=max_problems), desc="D5 smoke"):
         state = GenerationState(problem_text=problem.problem_text)
         for _ in range(20):
             l0 = l0_filter(state, slm, config)
             if l0.passed and len(l0.top_logprobs) >= 2:
                 b1, b2 = l1_shadow_rollout(state, slm, config, l0)
-                for k in [1, 5, 20, 50]:
+                for k in sweep:
                     k_config = config.with_updates(prompt_logprobs_topk=k)
                     for branch_idx, branch in [(1, b1), (2, b2)]:
                         before_prefill = state.llm_prefill_tokens
-                        score = score_branch(state, llm, branch.step_branch_text, k_config)
+                        try:
+                            score = score_branch(state, llm, branch.step_branch_text, k_config)
+                        except Exception as exc:
+                            rows.append(
+                                {
+                                    "problem_id": problem.problem_id,
+                                    "step_idx": state.step_count,
+                                    "branch_idx": branch_idx,
+                                    "prompt_logprobs_topk": k,
+                                    "branch_token_count": 0,
+                                    "missing_count": 0,
+                                    "missing_ratio": 1.0,
+                                    "is_invalid": True,
+                                    "invalid_reason": f"score_exception:{type(exc).__name__}:{exc}",
+                                    "prefill_tokens": state.llm_prefill_tokens - before_prefill,
+                                }
+                            )
+                            continue
                         rows.append(
                             {
                                 "problem_id": problem.problem_id,
@@ -79,7 +97,7 @@ def main() -> None:
             ],
         )
         writer.writeheader()
-        for k in [1, 5, 20, 50]:
+        for k in sorted(set(int(k) for k in config.prompt_logprobs_sweep)):
             subset = [row for row in rows if row["prompt_logprobs_topk"] == k]
             total_tokens = sum(row["branch_token_count"] for row in subset)
             missing = sum(row["missing_count"] for row in subset)

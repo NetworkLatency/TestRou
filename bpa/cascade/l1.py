@@ -57,6 +57,7 @@ def build_branch(first_tok_id: int, first_tok_lp: float, vllm_out, tokenizer) ->
     else:
         step_branch_text = raw_rollout_text
         step_branch_was_truncated = False
+        cutoff_tok_count = None
         sum_logprob_step = first_tok_lp + sum(rollout_logprobs)
 
     return BranchCandidate(
@@ -74,6 +75,7 @@ def build_branch(first_tok_id: int, first_tok_lp: float, vllm_out, tokenizer) ->
         first_token_logprob=first_tok_lp,
         sum_logprob_raw=first_tok_lp + sum(rollout_logprobs),
         sum_logprob_step=sum_logprob_step,
+        cutoff_tok_count=cutoff_tok_count,
     )
 
 

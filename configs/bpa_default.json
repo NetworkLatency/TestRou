@@ -12,8 +12,14 @@
     "gpqa_diamond": "data/gpqa_diamond.jsonl",
     "humaneval": "data/HumanEval.jsonl"
   },
-  "slm_engine_kwargs": {},
-  "llm_engine_kwargs": {},
+  "slm_engine_kwargs": {
+    "gpu_memory_utilization": 0.9
+  },
+  "llm_engine_kwargs": {
+    "gpu_memory_utilization": 0.9
+  },
+  "slm_device": "cuda:0",
+  "llm_device": "cuda:1",
   "trust_remote_code": true,
   "max_model_len": 16384,
   "enable_prefix_caching": true,
@@ -24,6 +30,7 @@
   "l2_divergence_thresh": 0.15,
   "l2_text_jaccard_thresh": 0.4,
   "prompt_logprobs_topk": 20,
+  "prompt_logprobs_sweep": [1, 5, 20],
   "score_missing_ratio_thresh": 0.2,
   "invalid_fallback": "skip",
   "max_step_tokens": 1024,

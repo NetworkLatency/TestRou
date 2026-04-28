@@ -23,6 +23,26 @@ Edit `configs/bpa_default.json` before a real run:
 - `dataset_paths.gpqa`: local GPQA-Diamond json/jsonl
 - `slm_engine_kwargs` / `llm_engine_kwargs`: vLLM engine settings such as tensor parallel size
 
+Default offline BPA runs load the SLM and LLM as two vLLM engines in the same Python process. Do not leave both engines at vLLM's default `gpu_memory_utilization=0.9`, because the first engine can reserve almost all available GPU memory before the second engine starts. The default config uses:
+
+```json
+"slm_engine_kwargs": {
+  "gpu_memory_utilization": 0.2
+},
+"llm_engine_kwargs": {
+  "gpu_memory_utilization": 0.7
+}
+```
+
+For larger LLMs, also set tensor parallelism, for example:
+
+```json
+"llm_engine_kwargs": {
+  "gpu_memory_utilization": 0.75,
+  "tensor_parallel_size": 2
+}
+```
+
 ## Local Dataset Files
 
 Dataset loading is fully local. The experiment runner does not call HuggingFace Hub or `datasets.load_dataset`.
@@ -70,6 +90,16 @@ python -m bpa.eval.exp_d5_prompt_logprobs_smoke \
   --max-problems 5
 ```
 
+By default D5 sweeps `prompt_logprobs_sweep = [1, 5, 20]`. Many vLLM builds cap `prompt_logprobs` at 20 unless the engine is started with a larger `max_logprobs`, so `50` is not enabled by default. To test `50`, set both:
+
+```json
+"prompt_logprobs_sweep": [1, 5, 20, 50],
+"llm_engine_kwargs": {
+  "gpu_memory_utilization": 0.7,
+  "max_logprobs": 50
+}
+```
+
 Run the first-week baselines on a small MATH500 slice:
 
 ```bash
@@ -96,6 +126,41 @@ Outputs are written under `bpa_results/` by default:
 - `*.branches.jsonl`
 - `summary.csv`
 - diagnostic files under `bpa_results/diagnostics/`
+
+## GPU Memory Troubleshooting
+
+If you see an error like:
+
+```text
+Free memory on device cuda:0 (...) is less than desired GPU memory utilization (0.9, ...)
+```
+
+it means vLLM is trying to reserve more memory than is currently free. In BPA offline runs this often happens during D5 when the SLM has already been loaded and the LLM starts afterward.
+
+Fixes, in order:
+
+1. Check for unrelated GPU users:
+
+```bash
+nvidia-smi
+```
+
+2. Lower per-engine reservations in `configs/bpa_default.json`:
+
+```json
+"slm_engine_kwargs": {
+  "gpu_memory_utilization": 0.15,
+  "max_model_len": 8192
+},
+"llm_engine_kwargs": {
+  "gpu_memory_utilization": 0.75,
+  "max_model_len": 8192
+}
+```
+
+3. If the LLM is a 32B FP16/BF16 model, a single 24 GiB GPU is not enough. Use a quantized checkpoint, reduce the LLM size, or set `tensor_parallel_size` across enough GPUs.
+
+4. Reduce `max_model_len` if you do not need a 16k+ context for the smoke test.
 
 ## vLLM Server Script Review
 

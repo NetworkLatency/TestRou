@@ -20,6 +20,8 @@ class BPAConfig:
     # vLLM engine kwargs. These are passed directly to vllm.LLM.
     slm_engine_kwargs: dict[str, Any] = field(default_factory=dict)
     llm_engine_kwargs: dict[str, Any] = field(default_factory=dict)
+    slm_device: str | None = None  # e.g. "cuda:0"
+    llm_device: str | None = None  # e.g. "cuda:1"
     trust_remote_code: bool = True
     max_model_len: int = 16384
     enable_prefix_caching: bool = True
@@ -32,6 +34,7 @@ class BPAConfig:
     l2_divergence_thresh: float = 0.15
     l2_text_jaccard_thresh: float = 0.4
     prompt_logprobs_topk: int = 20
+    prompt_logprobs_sweep: list[int] = field(default_factory=lambda: [1, 5, 20])
     score_missing_ratio_thresh: float = 0.2
     invalid_fallback: str = "skip"
     max_step_tokens: int = 1024

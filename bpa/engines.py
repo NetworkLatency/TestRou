@@ -31,7 +31,16 @@ class ModelEngine:
                 raise RuntimeError(
                     "vLLM is required for runtime generation. Install it on the GPU experiment host."
                 ) from exc
-            self.llm = LLM(model=self.model_path, tokenizer=self.tokenizer_path or self.model_path, **self.engine_kwargs)
+            try:
+                self.llm = LLM(model=self.model_path, tokenizer=self.tokenizer_path or self.model_path, **self.engine_kwargs)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to initialize vLLM engine {self.name!r} for model {self.model_path!r}. "
+                    "If another BPA engine is already loaded in the same process, vLLM's default "
+                    "gpu_memory_utilization=0.9 can reserve almost all GPU memory. Set "
+                    "slm_engine_kwargs/llm_engine_kwargs.gpu_memory_utilization in the config, "
+                    "reduce max_model_len, free other GPU processes, or use tensor parallelism / a smaller model."
+                ) from exc
         return self
 
     def ensure_tokenizer(self) -> Any:
@@ -72,12 +81,14 @@ class ModelEngine:
         return self.llm.generate(prompts, sampling_params)
 
 
-def _engine_kwargs(config: BPAConfig, specific: dict[str, Any]) -> dict[str, Any]:
+def _engine_kwargs(config: BPAConfig, specific: dict[str, Any], device: str | None = None) -> dict[str, Any]:
     kwargs = {
         "trust_remote_code": config.trust_remote_code,
         "max_model_len": config.max_model_len,
         "enable_prefix_caching": config.enable_prefix_caching,
     }
+    if device is not None:
+        kwargs["device"] = device
     kwargs.update(specific)
     return kwargs
 
@@ -87,13 +98,13 @@ def init_engines(config: BPAConfig) -> tuple[ModelEngine, ModelEngine]:
         name="slm",
         model_path=config.slm_model_path,
         tokenizer_path=config.slm_tokenizer_path,
-        engine_kwargs=_engine_kwargs(config, config.slm_engine_kwargs),
+        engine_kwargs=_engine_kwargs(config, config.slm_engine_kwargs, config.slm_device),
     )
     llm = ModelEngine(
         name="llm",
         model_path=config.llm_model_path,
         tokenizer_path=config.llm_tokenizer_path,
-        engine_kwargs=_engine_kwargs(config, config.llm_engine_kwargs),
+        engine_kwargs=_engine_kwargs(config, config.llm_engine_kwargs, config.llm_device),
     )
     return slm, llm
 

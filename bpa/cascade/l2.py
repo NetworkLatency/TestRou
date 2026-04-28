@@ -29,7 +29,11 @@ def _first_diverge_pos(a: list[int], b: list[int]) -> int:
 def count_step_tokens(branch: BranchCandidate) -> int:
     if not branch.step_branch_was_truncated:
         return max(len(branch.raw_rollout_token_ids), 1)
-    return max(1, min(len(branch.raw_rollout_token_ids), len(branch.rollout_logprobs) + 1))
+    # Use cutoff_tok_count when available (set by l1 to the actual truncation position),
+    # otherwise fall back to logprobs length.
+    if branch.cutoff_tok_count is not None:
+        return max(branch.cutoff_tok_count, 1)
+    return max(len(branch.rollout_logprobs), 1)
 
 
 def l2_compute(b1: BranchCandidate, b2: BranchCandidate, config: BPAConfig) -> L2Result:

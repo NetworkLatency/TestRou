@@ -7,7 +7,7 @@ CLOSE_THINK_TAG = "</think>"
 
 def detect_close_think(prev_assistant_prefix: str, newly_added_text: str) -> tuple[bool, int]:
     combined = prev_assistant_prefix + newly_added_text
-    start = max(0, len(prev_assistant_prefix) - len(CLOSE_THINK_TAG) + 1)
+    start = max(0, len(prev_assistant_prefix) - len(CLOSE_THINK_TAG))
     idx = combined.find(CLOSE_THINK_TAG, start)
     if idx < 0:
         return False, -1
