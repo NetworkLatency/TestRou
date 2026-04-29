@@ -42,6 +42,10 @@ class BPAResult:
     def llm_full_calls(self) -> int:
         return self.state.llm_full_calls
 
+    @property
+    def slm_generate_calls(self) -> int:
+        return self.state.slm_generate_calls
+
     def equivalent_llm_tokens(self, slm_to_llm_flop_ratio: float) -> float:
         slm_total = self.slm_decode_tokens + self.slm_prefill_tokens
         llm_total = self.llm_decode_tokens + self.llm_prefill_tokens
@@ -80,16 +84,37 @@ def write_jsonl(path: str | Path, rows: list[Any]) -> None:
 
 
 def result_summary(result: BPAResult, slm_to_llm_flop_ratio: float) -> dict[str, Any]:
+    slm_total_tokens = result.slm_decode_tokens + result.slm_prefill_tokens
+    llm_total_tokens = result.llm_decode_tokens + result.llm_prefill_tokens
+    total_model_tokens = slm_total_tokens + llm_total_tokens
+    total_decode_tokens = result.slm_decode_tokens + result.llm_decode_tokens
+    llm_wall_time = result.state.llm_generation_wall_time + result.state.llm_scoring_wall_time
+    model_wall_time = result.state.slm_wall_time + llm_wall_time
     return {
         "answer": result.answer,
         "correct": result.correct,
+        "generation_protocol": result.state.generation_protocol,
+        "step_count": result.state.step_count,
         "total_wall_time": result.total_wall_time,
         "slm_decode_tokens": result.slm_decode_tokens,
         "slm_prefill_tokens": result.slm_prefill_tokens,
         "llm_decode_tokens": result.llm_decode_tokens,
         "llm_prefill_tokens": result.llm_prefill_tokens,
+        "slm_total_tokens": slm_total_tokens,
+        "llm_total_tokens": llm_total_tokens,
+        "total_model_tokens": total_model_tokens,
+        "llm_token_share": (llm_total_tokens / total_model_tokens) if total_model_tokens else 0.0,
+        "llm_decode_share": (result.llm_decode_tokens / total_decode_tokens) if total_decode_tokens else 0.0,
+        "slm_generate_calls": result.slm_generate_calls,
+        "llm_generate_calls": result.llm_full_calls,
         "llm_scoring_calls": result.llm_scoring_calls,
         "llm_full_calls": result.llm_full_calls,
+        "slm_wall_time": result.state.slm_wall_time,
+        "llm_generation_wall_time": result.state.llm_generation_wall_time,
+        "llm_scoring_wall_time": result.state.llm_scoring_wall_time,
+        "llm_wall_time": llm_wall_time,
+        "model_wall_time": model_wall_time,
+        "llm_wall_time_share": (llm_wall_time / model_wall_time) if model_wall_time else 0.0,
         "equivalent_llm_tokens": result.equivalent_llm_tokens(slm_to_llm_flop_ratio),
         "stop_reason": result.state.stop_reason,
     }

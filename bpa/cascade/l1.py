@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from bpa.config import BPAConfig
 from bpa.engines import completion_logprobs, finish_reason, generated_token_ids, logprob_value
 from bpa.render import render_for_continuation
@@ -173,7 +175,10 @@ def l1_shadow_rollout(state: GenerationState, slm, config: BPAConfig, l0: L0Resu
         slm.tokens_prompt(rendered_ids + [tok1]),
         slm.tokens_prompt(rendered_ids + [tok2]),
     ]
+    generate_start = time.time()
     outs = slm.generate(prompts, sampling)
+    state.slm_wall_time += time.time() - generate_start
+    state.slm_generate_calls += 1
 
     state.slm_decode_tokens += sum(len(generated_token_ids(out)) for out in outs)
     state.slm_prefill_tokens += len(rendered_ids) + 1

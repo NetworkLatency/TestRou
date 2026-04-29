@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 
 import numpy as np
 
@@ -57,7 +58,10 @@ def _top_logprobs_from_output(output) -> dict[int, float]:
 def l0_filter(state: GenerationState, slm, config: BPAConfig) -> L0Result:
     rendered = render_for_continuation(state.problem_text, state.assistant_prefix_text, slm.ensure_tokenizer())
     sampling = slm.sampling_params(max_tokens=1, temperature=0.0, logprobs=config.l0_topk)
+    generate_start = time.time()
     out = slm.generate(rendered, sampling)[0]
+    state.slm_wall_time += time.time() - generate_start
+    state.slm_generate_calls += 1
     token_ids = generated_token_ids(out)
     state.slm_decode_tokens += len(token_ids) or 1
     state.slm_prefill_tokens += len(slm.encode(rendered))

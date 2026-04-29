@@ -20,15 +20,15 @@ from .trace import BPAResult
 EOS_FINISH_REASONS = {"eos", "branch_eos"}
 
 
-def run_cascade(state: GenerationState, slm, llm, config: BPAConfig, disabled: bool = False) -> CascadeResult:
+def run_cascade(state: GenerationState, slm, llm, config: BPAConfig) -> CascadeResult:
     l0 = l0_filter(state, slm, config)
     state.trace.append(TraceEvent(state.step_count, "l0", l0.to_dict()))
 
     if config.cascade_mode == "hinit":
-        decision = Decision.LLM_FULL if (not disabled and l0.passed) else Decision.SLM_DIRECT
+        decision = Decision.LLM_FULL if l0.passed else Decision.SLM_DIRECT
         return CascadeResult(decision=decision, l0=l0)
 
-    if disabled or not l0.passed:
+    if not l0.passed:
         return CascadeResult(decision=Decision.SLM_DIRECT, l0=l0)
 
     try:
@@ -129,12 +129,17 @@ def _generate_step_with_engine(state: GenerationState, engine, config: BPAConfig
         include_stop_str_in_output=True,
         logprobs=1,
     )
+    generate_start = time.time()
     out = engine.generate(rendered, sampling)[0]
+    generate_wall_time = time.time() - generate_start
     token_count = len(generated_token_ids(out))
     if account == "slm":
+        state.slm_generate_calls += 1
+        state.slm_wall_time += generate_wall_time
         state.slm_decode_tokens += token_count
         state.slm_prefill_tokens += len(engine.encode(rendered))
     else:
+        state.llm_generation_wall_time += generate_wall_time
         state.llm_decode_tokens += token_count
         state.llm_prefill_tokens += len(engine.encode(rendered))
         state.llm_full_calls += 1
@@ -199,7 +204,9 @@ def llm_generate_final_with_rep_guard(state: GenerationState, llm, config: BPACo
             stop=chunk_stops,
             include_stop_str_in_output=True,
         )
+        generate_start = time.time()
         out = llm.generate(rendered, sampling)[0]
+        state.llm_generation_wall_time += time.time() - generate_start
         chunk_text = generated_text(out)
         chunk_tokens = len(generated_token_ids(out))
         chunk_finish = finish_reason(out)
@@ -394,8 +401,7 @@ def bpa_solve(problem_text: str, slm, llm, config: BPAConfig) -> BPAResult:
                 state.trace.append(TraceEvent(state.step_count, "final_answer_stopped_by_repetition", {}))
             break
 
-        intervention_disabled = state.llm_scoring_calls >= config.max_llm_interventions * 2
-        cascade = run_cascade(state, slm, llm, config, disabled=intervention_disabled)
+        cascade = run_cascade(state, slm, llm, config)
         decode_tokens_before = state.slm_decode_tokens + state.llm_decode_tokens
         step_text, finish = generate_one_step(state, slm, llm, config, cascade)
         step_text_normalized = ensure_step_terminator(step_text, finish)
@@ -472,17 +478,22 @@ def bpa_solve(problem_text: str, slm, llm, config: BPAConfig) -> BPAResult:
 
 
 def solve_engine_only(problem_text: str, engine, config: BPAConfig, account: str) -> BPAResult:
-    state = GenerationState(problem_text=problem_text)
+    state = GenerationState(problem_text=problem_text, generation_protocol="oneshot")
     start_time = time.time()
     rendered = render_for_continuation(problem_text, "", engine.ensure_tokenizer())
     sampling = engine.sampling_params(max_tokens=config.max_total_tokens, temperature=0.0)
+    generate_start = time.time()
     out = engine.generate(rendered, sampling)[0]
+    generate_wall_time = time.time() - generate_start
     text = generated_text(out)
     token_count = len(generated_token_ids(out))
     if account == "slm":
+        state.slm_generate_calls += 1
+        state.slm_wall_time += generate_wall_time
         state.slm_decode_tokens += token_count
         state.slm_prefill_tokens += len(engine.encode(rendered))
     else:
+        state.llm_generation_wall_time += generate_wall_time
         state.llm_decode_tokens += token_count
         state.llm_prefill_tokens += len(engine.encode(rendered))
         state.llm_full_calls += 1

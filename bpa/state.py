@@ -37,6 +37,7 @@ class RejectedBranch:
 class GenerationState:
     problem_text: str
     assistant_prefix_text: str = ""
+    generation_protocol: str = "routed_stepwise"
     phase: Phase = Phase.THINKING
     has_seen_close_think: bool = False
     step_count: int = 0
@@ -44,8 +45,12 @@ class GenerationState:
     slm_prefill_tokens: int = 0
     llm_decode_tokens: int = 0
     llm_prefill_tokens: int = 0
+    slm_generate_calls: int = 0
     llm_scoring_calls: int = 0
     llm_full_calls: int = 0
+    slm_wall_time: float = 0.0
+    llm_generation_wall_time: float = 0.0
+    llm_scoring_wall_time: float = 0.0
     trace: list[TraceEvent] = field(default_factory=list)
     rejected_branches_log: list[RejectedBranch] = field(default_factory=list)
     branch_logs: list[dict[str, Any]] = field(default_factory=list)

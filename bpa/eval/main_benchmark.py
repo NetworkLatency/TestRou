@@ -36,6 +36,13 @@ def _average(rows, key: str) -> float | None:
     return sum(values) / len(values)
 
 
+def _sum_values(rows, key: str) -> float | None:
+    values = [float(row[key]) for row in rows if row.get(key) not in (None, "")]
+    if not values:
+        return None
+    return sum(values)
+
+
 def build_summary_metrics(dataset: str, variant: str, rows: list[dict], dataset_wall_time: float) -> dict:
     evaluated = [row for row in rows if _is_evaluated(row.get("correct"))]
     num_correct = sum(1 for row in evaluated if _is_correct(row.get("correct")))
@@ -49,6 +56,23 @@ def build_summary_metrics(dataset: str, variant: str, rows: list[dict], dataset_
         "avg_total_wall_time": _average(rows, "total_wall_time"),
         "avg_problem_wall_time": _average(rows, "problem_wall_time"),
         "dataset_wall_time": dataset_wall_time,
+        "avg_step_count": _average(rows, "step_count"),
+        "avg_slm_generate_calls": _average(rows, "slm_generate_calls"),
+        "avg_llm_generate_calls": _average(rows, "llm_generate_calls"),
+        "avg_llm_scoring_calls": _average(rows, "llm_scoring_calls"),
+        "avg_llm_token_share": _average(rows, "llm_token_share"),
+        "avg_llm_decode_share": _average(rows, "llm_decode_share"),
+        "avg_llm_wall_time_share": _average(rows, "llm_wall_time_share"),
+        "avg_slm_wall_time": _average(rows, "slm_wall_time"),
+        "avg_llm_generation_wall_time": _average(rows, "llm_generation_wall_time"),
+        "avg_llm_scoring_wall_time": _average(rows, "llm_scoring_wall_time"),
+        "total_slm_wall_time": _sum_values(rows, "slm_wall_time"),
+        "total_llm_generation_wall_time": _sum_values(rows, "llm_generation_wall_time"),
+        "total_llm_scoring_wall_time": _sum_values(rows, "llm_scoring_wall_time"),
+        "total_slm_decode_tokens": _sum_values(rows, "slm_decode_tokens"),
+        "total_slm_prefill_tokens": _sum_values(rows, "slm_prefill_tokens"),
+        "total_llm_decode_tokens": _sum_values(rows, "llm_decode_tokens"),
+        "total_llm_prefill_tokens": _sum_values(rows, "llm_prefill_tokens"),
     }
 
 
@@ -132,20 +156,67 @@ def _existing_row_from_problem_output(
         for key in [
             "answer",
             "correct",
+            "generation_protocol",
+            "step_count",
             "total_wall_time",
             "slm_decode_tokens",
             "slm_prefill_tokens",
             "llm_decode_tokens",
             "llm_prefill_tokens",
+            "slm_total_tokens",
+            "llm_total_tokens",
+            "total_model_tokens",
+            "llm_token_share",
+            "llm_decode_share",
+            "slm_generate_calls",
+            "llm_generate_calls",
             "llm_scoring_calls",
             "llm_full_calls",
+            "slm_wall_time",
+            "llm_generation_wall_time",
+            "llm_scoring_wall_time",
+            "llm_wall_time",
+            "model_wall_time",
+            "llm_wall_time_share",
             "equivalent_llm_tokens",
             "stop_reason",
         ]
     }
+
+    def numeric(key: str) -> float:
+        value = row.get(key)
+        if value in (None, ""):
+            return 0.0
+        return float(value)
+
+    slm_total = numeric("slm_decode_tokens") + numeric("slm_prefill_tokens")
+    llm_total = numeric("llm_decode_tokens") + numeric("llm_prefill_tokens")
+    total_model_tokens = slm_total + llm_total
+    total_decode_tokens = numeric("slm_decode_tokens") + numeric("llm_decode_tokens")
+    llm_wall_time = numeric("llm_generation_wall_time") + numeric("llm_scoring_wall_time")
+    model_wall_time = numeric("slm_wall_time") + llm_wall_time
+
+    if row.get("generation_protocol") is None:
+        row["generation_protocol"] = "oneshot" if variant in {"slm_only", "llm_only"} else "routed_stepwise"
+    if row.get("slm_total_tokens") is None:
+        row["slm_total_tokens"] = slm_total
+    if row.get("llm_total_tokens") is None:
+        row["llm_total_tokens"] = llm_total
+    if row.get("total_model_tokens") is None:
+        row["total_model_tokens"] = total_model_tokens
+    if row.get("llm_token_share") is None:
+        row["llm_token_share"] = (llm_total / total_model_tokens) if total_model_tokens else 0.0
+    if row.get("llm_decode_share") is None:
+        row["llm_decode_share"] = (numeric("llm_decode_tokens") / total_decode_tokens) if total_decode_tokens else 0.0
+    if row.get("llm_generate_calls") is None:
+        row["llm_generate_calls"] = row.get("llm_full_calls")
+    if row.get("llm_wall_time") is None:
+        row["llm_wall_time"] = llm_wall_time
+    if row.get("model_wall_time") is None:
+        row["model_wall_time"] = model_wall_time
+    if row.get("llm_wall_time_share") is None:
+        row["llm_wall_time_share"] = (llm_wall_time / model_wall_time) if model_wall_time else 0.0
     if row.get("equivalent_llm_tokens") is None:
-        slm_total = (row.get("slm_decode_tokens") or 0) + (row.get("slm_prefill_tokens") or 0)
-        llm_total = (row.get("llm_decode_tokens") or 0) + (row.get("llm_prefill_tokens") or 0)
         row["equivalent_llm_tokens"] = slm_total * config.slm_to_llm_flop_ratio + llm_total
     if problem.gold_answer is not None:
         predicted = row.get("answer")

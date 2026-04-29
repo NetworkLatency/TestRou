@@ -40,7 +40,6 @@ class BPAConfig:
     invalid_fallback: str = "skip"
     max_step_tokens: int = 1024
     max_total_tokens: int = 16384
-    max_llm_interventions: int = 8
     final_answer_max_tokens: int = 1024
     final_answer_chunk_tokens: int = 128
     final_answer_mode: str = "routed"  # "routed" | "llm_chunked"

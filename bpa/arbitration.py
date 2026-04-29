@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from difflib import SequenceMatcher
 
 from .config import BPAConfig
@@ -136,7 +137,9 @@ def score_branch(state: GenerationState, llm, branch_text: str, config: BPAConfi
     locate = _apply_scoring_context_window(locate, config.llm_scoring_context_window)
 
     sampling = llm.sampling_params(max_tokens=1, temperature=0.0, prompt_logprobs=config.prompt_logprobs_topk)
+    generate_start = time.time()
     out = llm.generate(llm.tokens_prompt(locate.token_ids), sampling)[0]
+    state.llm_scoring_wall_time += time.time() - generate_start
     state.llm_prefill_tokens += len(locate.token_ids)
     state.llm_decode_tokens += 1
     state.llm_scoring_calls += 1
