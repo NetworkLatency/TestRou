@@ -182,9 +182,5 @@ def completion_logprobs(output: Any) -> list[Any]:
     return list(getattr(completion(output), "logprobs", []) or [])
 
 
-def prompt_logprobs(output: Any) -> list[Any]:
-    return list(getattr(output, "prompt_logprobs", []) or [])
-
-
 def logprob_value(record: Any) -> float:
     return float(getattr(record, "logprob", record))

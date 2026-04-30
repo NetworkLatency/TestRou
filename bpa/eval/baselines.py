@@ -11,9 +11,5 @@ def solve_variant(problem_text: str, variant: str, slm, llm, config: BPAConfig) 
     if variant == "llm_only":
         return solve_engine_only(problem_text, llm, config, account="llm")
     if variant == "glimprouter_hinit":
-        return bpa_solve(problem_text, slm, llm, config.with_updates(cascade_mode="hinit", apply_arbitration=False))
-    if variant == "bpa_logging_only":
-        return bpa_solve(problem_text, slm, llm, config.with_updates(cascade_mode="bpa", apply_arbitration=False))
-    if variant == "bpa_arbitration":
-        return bpa_solve(problem_text, slm, llm, config.with_updates(cascade_mode="bpa", apply_arbitration=True))
+        return bpa_solve(problem_text, slm, llm, config)
     raise ValueError(f"Unknown variant: {variant}")

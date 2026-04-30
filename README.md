@@ -1,120 +1,65 @@
-# BPA v2.1 Experiments
+# SLM Sampling Disagreement Experiments
 
-This repository now contains two runnable paths:
+This repository now focuses on one research question:
 
-- **BPA v2.1** in `bpa/`: uses the vLLM Python offline API (`vllm.LLM`) directly. This is the default path for the new experiments.
-- **OpenAI-compatible vLLM server** via `server/serve.sh`: useful for legacy `src/glimp_router.py` or for future HTTP-backend experiments. The current `bpa/` runner does not need these HTTP servers.
+> Can SLM self-sampling disagreement at reasoning boundaries reveal where the SLM reaches its reasoning limit?
 
-## Environment
+The retained runnable paths are:
 
-Install the experiment environment on the GPU host:
+- `slm_only`
+- `llm_only`
+- `glimprouter_hinit`
+- pure-SLM boundary sampling diagnostics
+- LLM oracle / boundary continuation labeling
+- disagreement analysis and top-quantile sanity routing
+
+## 1. Setup
+
+Install dependencies on the GPU host:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Edit `configs/bpa_default.json` before a real run:
-
-- `slm_model_path`: local path or HF id for `DeepSeek-R1-Distill-Qwen-1.5B`
-- `llm_model_path`: local path or HF id for `Qwen-32B`
-- `dataset_paths.math500`: local MATH500 file
-- `dataset_paths.aime24`: local AIME24 file
-- `dataset_paths.aime25`: local `aime25.parquet`
-- `dataset_paths.gpqa`: local GPQA-Diamond json/jsonl
-- `slm_engine_kwargs` / `llm_engine_kwargs`: vLLM engine settings such as tensor parallel size
-
-Default offline BPA runs load the SLM and LLM as two vLLM engines in the same Python process. Do not leave both engines at vLLM's default `gpu_memory_utilization=0.9`, because the first engine can reserve almost all available GPU memory before the second engine starts. The default config uses:
+Edit `configs/bpa_default.json` before running experiments:
 
 ```json
-"slm_engine_kwargs": {
-  "gpu_memory_utilization": 0.2
-},
-"llm_engine_kwargs": {
-  "gpu_memory_utilization": 0.7
+{
+  "slm_model_path": "/path/to/DeepSeek-R1-Distill-Qwen-1.5B",
+  "llm_model_path": "/path/to/Qwen-or-DeepSeek-target-model",
+  "dataset_paths": {
+    "math500": "data/math500.jsonl",
+    "aime24": "data/aime24.jsonl"
+  }
 }
 ```
 
-For larger LLMs, also set tensor parallelism, for example:
+Supported local dataset formats: `.jsonl`, `.json`, `.csv`, `.tsv`, `.parquet`.
 
-```json
-"llm_engine_kwargs": {
-  "gpu_memory_utilization": 0.75,
-  "tensor_parallel_size": 2
-}
-```
+For MATH/AIME rows, provide `problem` and one of `answer`, `solution`, or `target`.
 
-## Local Dataset Files
+## 2. Test Commands
 
-Dataset loading is fully local. The experiment runner does not call HuggingFace Hub or `datasets.load_dataset`.
-
-Supported local formats:
-
-- `.jsonl`: one JSON object per line
-- `.json`: either a list of objects or an object containing `data`, `train`, `test`, `examples`, or `rows`
-- `.csv` / `.tsv`: header row required
-- `.parquet`: requires `pandas` and `pyarrow`
-
-Expected columns:
-
-- MATH500 / AIME24 / AIME25: `problem` plus one of `answer`, `solution`, or `target`
-- GPQA-Diamond: `problem`/`question` plus either `A`-`D` choices and `answer`, or original GPQA-style `Correct Answer`, `Incorrect Answer 1`, `Incorrect Answer 2`, `Incorrect Answer 3`
-- HumanEval: `prompt`; execution evaluation is intentionally not implemented in the first BPA pass
-
-Example config fragment:
-
-```json
-"dataset_paths": {
-  "math500": "/data/benchmarks/math500.jsonl",
-  "aime24": "/data/benchmarks/aime24.jsonl",
-  "aime25": "/data/benchmarks/aime25.parquet",
-  "gpqa": "/data/benchmarks/gpqa_diamond.jsonl",
-  "gpqa_diamond": "/data/benchmarks/gpqa_diamond.jsonl",
-  "humaneval": "/data/benchmarks/HumanEval.jsonl"
-}
-```
-
-## BPA v2.1 Offline Runs
-
-First verify tokenizer rendering. This checks whether the selected chat template inserts thinking markers as expected and avoids double `<think>`:
+Run static compilation and unit tests:
 
 ```bash
-python -m bpa.eval.render_sanity --config configs/bpa_default.json
+python -m compileall bpa tests
+python -m unittest tests.test_bpa_core
 ```
 
-Run the prompt-logprobs smoke test before full BPA arbitration:
+Check chat-template rendering:
 
 ```bash
-python -m bpa.eval.exp_d5_prompt_logprobs_smoke \
-  --config configs/bpa_default.json \
-  --dataset math500 \
-  --max-problems 5
+python -m bpa.eval.render_sanity \
+  --config configs/bpa_default.json
 ```
 
-For a lighter backend-stability check, cap scored trigger positions:
+## 3. Baseline Runs
+
+Run 50 MATH500 problems for the retained baselines:
 
 ```bash
-python -m bpa.eval.exp_d5_prompt_logprobs_smoke \
-  --config configs/bpa_default.json \
-  --dataset math500 \
-  --max-problems 1 \
-  --max-steps 12 \
-  --max-triggers-per-problem 3
-```
-
-By default D5 sweeps `prompt_logprobs_sweep = [1, 5, 20]`. Many vLLM builds cap `prompt_logprobs` at 20 unless the engine is started with a larger `max_logprobs`, so `50` is not enabled by default. To test `50`, set both:
-
-```json
-"prompt_logprobs_sweep": [1, 5, 20, 50],
-"llm_engine_kwargs": {
-  "gpu_memory_utilization": 0.7,
-  "max_logprobs": 50
-}
-```
-
-Run the first-week baselines on a small MATH500 slice:
-
-```bash
-for variant in slm_only llm_only glimprouter_hinit bpa_logging_only bpa_arbitration; do
+for variant in slm_only llm_only glimprouter_hinit; do
   python -m bpa.eval.main_benchmark \
     --config configs/bpa_default.json \
     --variant "${variant}" \
@@ -123,127 +68,176 @@ for variant in slm_only llm_only glimprouter_hinit bpa_logging_only bpa_arbitrat
 done
 ```
 
-Run diagnostics:
-
-```bash
-python -m bpa.eval.exp_d0_first_token --config configs/bpa_default.json --dataset math500 --max-problems 50
-python -m bpa.eval.exp_d1_cascade_funnel --config configs/bpa_default.json --dataset math500 --max-problems 200
-```
-
-Outputs are written under `bpa_results/` by default:
-
-- `*.problem.json`
-- `*.steps.jsonl`
-- `*.branches.jsonl`
-- `summary.csv`
-- diagnostic files under `bpa_results/diagnostics/`
-
-## GPU Memory Troubleshooting
-
-If you see an error like:
+Outputs:
 
 ```text
-Free memory on device cuda:0 (...) is less than desired GPU memory utilization (0.9, ...)
+bpa_results/math500/{variant}/summary.csv
+bpa_results/math500/{variant}/summary_metrics.json
+bpa_results/math500/{variant}/{problem_id}/
 ```
 
-it means vLLM is trying to reserve more memory than is currently free. In BPA offline runs this often happens during D5 when the SLM has already been loaded and the LLM starts afterward.
+## 4. Boundary Sampling
 
-If D5 writes `EngineDeadError` into records, those rows are not valid branch-scoring results. The current runner now treats `EngineDeadError` as fatal, writes partial valid records plus `bpa_results/diagnostics/d5_prompt_logprobs_smoke/aborted.json`, and exits non-zero.
-
-Fixes, in order:
-
-1. Check for unrelated GPU users:
+Collect pure-SLM boundary-level K-rollout disagreement on MATH500:
 
 ```bash
-nvidia-smi
+python -m bpa.eval.exp_sampling_disagreement \
+  --config configs/bpa_default.json \
+  --dataset math500 \
+  --max-problems 100 \
+  --probe-k 4 \
+  --probe-temperature 0.7 \
+  --probe-max-tokens 32
 ```
 
-2. Lower per-engine reservations in `configs/bpa_default.json`:
-
-```json
-"slm_engine_kwargs": {
-  "gpu_memory_utilization": 0.15,
-  "max_model_len": 8192
-},
-"llm_engine_kwargs": {
-  "gpu_memory_utilization": 0.75,
-  "max_model_len": 8192
-}
-```
-
-3. If the LLM is a 32B FP16/BF16 model, a single 24 GiB GPU is not enough. Use a quantized checkpoint, reduce the LLM size, or set `tensor_parallel_size` across enough GPUs.
-
-4. Reduce `max_model_len` if you do not need a 16k+ context for the smoke test.
-
-## vLLM Server Script Review
-
-The redesigned `server/serve.sh` is reasonable and safer than the old script:
-
-- It validates `MODEL` and `PYTHON_BIN` before starting.
-- It uses `/health` and `/v1/models` checks instead of assuming startup succeeded.
-- It avoids killing an occupied port unless `FORCE_RESTART=1` is explicitly set.
-- It logs each run to a timestamped file under `server/vllm_logs`.
-- It keeps optional flags (`--chat-template`, `--trust-remote-code`, `--enforce-eager`, `--enable-prefix-caching`) explicit.
-
-Recommended adjustments:
-
-- For BPA-style long-prefix workloads, use `ENABLE_PREFIX_CACHING=1` unless you are debugging prefix-cache behavior.
-- Keep `ENFORCE_EAGER=0` for normal throughput; set it to `1` only for debugging or CUDA graph issues.
-- `MAX_MODEL_LEN=65536` is aggressive. Use it only if the model and GPU memory support it; otherwise start with `16384` or `32768`.
-- Set `TENSOR_PARALLEL_SIZE` if a 32B model cannot fit on one GPU.
-- Set `API_KEY` or bind `HOST=127.0.0.1` if the server is reachable by other users; `HOST=0.0.0.0` without auth exposes the OpenAI-compatible endpoint on the network.
-- `TRUST_REMOTE_CODE=1` may be required for some local model repos, but leave it off when the model does not need custom code.
-
-## OpenAI-Compatible vLLM Server Commands
-
-These commands start HTTP servers. They are not required by `bpa.eval.main_benchmark`, which uses offline vLLM. Replace model paths with your local paths.
-
-Start the SLM server:
+For AIME24:
 
 ```bash
-PYTHON_BIN=/home/lhyang/anaconda3/envs/glimp_router/bin/python \
-MODEL=/path/to/DeepSeek-R1-Distill-Qwen-1.5B \
-SERVED_MODEL_NAME=DeepSeek-R1-Distill-Qwen-1.5B \
-PORT=8000 \
-CUDA_DEVICE=0 \
-GPU_MEMORY_UTILIZATION=0.75 \
-MAX_MODEL_LEN=32768 \
-DTYPE=auto \
-CHAT_TEMPLATE="$(pwd)/server/template/deepseekr1.jinja" \
-TRUST_REMOTE_CODE=1 \
-ENABLE_PREFIX_CACHING=1 \
-bash server/serve.sh
+python -m bpa.eval.exp_sampling_disagreement \
+  --config configs/bpa_default.json \
+  --dataset aime24 \
+  --max-problems 30 \
+  --probe-k 4 \
+  --probe-temperature 0.7 \
+  --probe-max-tokens 32
 ```
 
-Start the LLM server:
+Outputs:
 
-```bash
-PYTHON_BIN=/home/lhyang/anaconda3/envs/glimp_router/bin/python \
-MODEL=/path/to/Qwen-32B \
-SERVED_MODEL_NAME=Qwen-32B \
-PORT=8001 \
-CUDA_DEVICE=1 \
-GPU_MEMORY_UTILIZATION=0.85 \
-MAX_MODEL_LEN=32768 \
-TENSOR_PARALLEL_SIZE=2 \
-DTYPE=auto \
-CHAT_TEMPLATE="$(pwd)/server/template/qwen3.jinja" \
-TRUST_REMOTE_CODE=1 \
-ENABLE_PREFIX_CACHING=1 \
-bash server/serve.sh
+```text
+bpa_results/diagnostics/sampling_disagreement/{dataset}/probes.jsonl
+bpa_results/diagnostics/sampling_disagreement/{dataset}/problem_summary.csv
 ```
 
-If a port is occupied by an unhealthy process and you intentionally want to restart it:
+Main disagreement metrics:
+
+- `operation_vote_disagreement`
+- `number_vote_disagreement`
+- `self_bleu_disagreement`
+- `char_jaccard_disagreement`
+- `structured_disagreement`
+
+## 5. LLM Oracle
+
+Run LLM-only oracle traces for the same problem slice:
 
 ```bash
-FORCE_RESTART=1 PORT=8000 MODEL=/path/to/model bash server/serve.sh
+python -m bpa.eval.exp_llm_oracle \
+  --config configs/bpa_default.json \
+  --dataset math500 \
+  --max-problems 100
 ```
 
-Check server status:
+Outputs:
+
+```text
+bpa_results/diagnostics/llm_oracle/math500/oracle_summary.csv
+bpa_results/diagnostics/llm_oracle/math500/oracle_traces.jsonl
+```
+
+## 6. Boundary Labels
+
+For each problem, select evenly spaced SLM boundaries and let the LLM continue from each prefix:
 
 ```bash
-curl -fsS http://127.0.0.1:8000/health
-curl -fsS http://127.0.0.1:8000/v1/models
-curl -fsS http://127.0.0.1:8001/health
-curl -fsS http://127.0.0.1:8001/v1/models
+python -m bpa.eval.exp_boundary_continuation \
+  --config configs/bpa_default.json \
+  --dataset math500 \
+  --max-problems 100 \
+  --boundaries-per-problem 5 \
+  --continuation-max-tokens 2048
+```
+
+Outputs:
+
+```text
+bpa_results/diagnostics/boundary_continuation/math500/boundary_labels.csv
+bpa_results/diagnostics/boundary_continuation/math500/boundary_labels.jsonl
+```
+
+Default `critical=True` definition:
+
+```text
+SLM final answer is wrong
+AND LLM oracle is not failed
+AND LLM continuation from this boundary answers correctly
+```
+
+## 7. Analysis and Plotting
+
+Generate distribution plots, quantile plots, dip-test results, and AUROC:
+
+```bash
+python -m bpa.eval.analyze_sampling_disagreement \
+  --config configs/bpa_default.json \
+  --dataset math500 \
+  --metrics operation_vote_disagreement number_vote_disagreement self_bleu_disagreement char_jaccard_disagreement structured_disagreement \
+  --num-bins 10
+```
+
+Plot and analysis outputs:
+
+```text
+bpa_results/diagnostics/sampling_analysis/math500/analysis_summary.json
+bpa_results/diagnostics/sampling_analysis/math500/distribution_summary.csv
+bpa_results/diagnostics/sampling_analysis/math500/distribution_{metric}.png
+bpa_results/diagnostics/sampling_analysis/math500/critical_by_quantile_{metric}.csv
+bpa_results/diagnostics/sampling_analysis/math500/critical_by_quantile_{metric}.png
+```
+
+Continue this direction only if:
+
+```text
+dip test p < 0.05 or the distribution is visually bimodal
+AUROC(disagreement -> critical) > 0.65
+P(critical | disagreement quantile) is mostly monotonic increasing
+```
+
+## 8. Top-20% Routing Sanity Check
+
+If the phenomenon holds, run a simple top-20% disagreement routing check:
+
+```bash
+python -m bpa.eval.exp_disagreement_routing \
+  --config configs/bpa_default.json \
+  --dataset math500 \
+  --max-problems 50 \
+  --metric number_vote_disagreement \
+  --threshold-quantile 0.8 \
+  --probe-k 4 \
+  --probe-temperature 0.7 \
+  --probe-max-tokens 32
+```
+
+Outputs:
+
+```text
+bpa_results/diagnostics/disagreement_routing/math500/summary.csv
+bpa_results/diagnostics/disagreement_routing/math500/summary_metrics.json
+bpa_results/diagnostics/disagreement_routing/math500/routing_boundaries.jsonl
+```
+
+Compare this with:
+
+```text
+bpa_results/math500/slm_only/summary.csv
+bpa_results/math500/glimprouter_hinit/summary.csv
+bpa_results/diagnostics/disagreement_routing/math500/summary.csv
+```
+
+## 9. Recommended First-Week Command Order
+
+```bash
+python -m compileall bpa tests
+python -m unittest tests.test_bpa_core
+python -m bpa.eval.render_sanity --config configs/bpa_default.json
+
+for variant in slm_only llm_only glimprouter_hinit; do
+  python -m bpa.eval.main_benchmark --config configs/bpa_default.json --variant "${variant}" --dataset math500 --max-problems 50
+done
+
+python -m bpa.eval.exp_sampling_disagreement --config configs/bpa_default.json --dataset math500 --max-problems 100 --probe-k 4 --probe-temperature 0.7 --probe-max-tokens 32
+python -m bpa.eval.exp_llm_oracle --config configs/bpa_default.json --dataset math500 --max-problems 100
+python -m bpa.eval.exp_boundary_continuation --config configs/bpa_default.json --dataset math500 --max-problems 100 --boundaries-per-problem 5 --continuation-max-tokens 2048
+python -m bpa.eval.analyze_sampling_disagreement --config configs/bpa_default.json --dataset math500 --metrics operation_vote_disagreement number_vote_disagreement self_bleu_disagreement char_jaccard_disagreement structured_disagreement --num-bins 10
 ```

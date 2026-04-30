@@ -17,7 +17,7 @@ from .baselines import solve_variant
 from .benchmark_eval import benchmark_eval_match
 from .datasets import load_eval_dataset
 
-VARIANTS = ("slm_only", "llm_only", "glimprouter_hinit", "bpa_logging_only", "bpa_arbitration")
+VARIANTS = ("slm_only", "llm_only", "glimprouter_hinit")
 MATH_DATASETS = {"math500", "aime24", "aime25"}
 
 
@@ -94,7 +94,6 @@ def _problem_output_paths(output_root: Path, dataset: str, variant: str, problem
     return [
         root / f"{stem}.problem.json",
         root / f"{stem}.steps.jsonl",
-        root / f"{stem}.branches.jsonl",
         root / f"{stem}.trace.json",
     ]
 
@@ -248,12 +247,7 @@ def write_problem_outputs(root: Path, dataset: str, variant: str, problem, resul
         {"problem_id": problem.problem_id, "question_id": problem.question_id, **row}
         for row in _step_rows(result)
     ]
-    branch_rows = [
-        {"problem_id": problem.problem_id, "question_id": problem.question_id, **row}
-        for row in result.state.branch_logs
-    ]
     write_jsonl(problem_root / f"{problem.problem_id}.steps.jsonl", step_rows)
-    write_jsonl(problem_root / f"{problem.problem_id}.branches.jsonl", branch_rows)
     write_json(problem_root / f"{problem.problem_id}.trace.json", result.state.trace)
 
 

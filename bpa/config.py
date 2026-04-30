@@ -26,18 +26,10 @@ class BPAConfig:
     max_model_len: int = 16384
     enable_prefix_caching: bool = True
 
-    # BPA defaults from the implementation spec.
+    # L0 h-init routing defaults used by the GlimpRouter baseline.
     l0_topk: int = 10
     l0_margin_thresh: float = 0.4
     l0_entropy_thresh: float = 0.5
-    rollout_length: int = 16
-    l2_divergence_thresh: float = 0.15
-    l2_text_jaccard_thresh: float = 0.4
-    prompt_logprobs_topk: int = 20
-    prompt_logprobs_sweep: list[int] = field(default_factory=lambda: [1, 5, 20])
-    llm_scoring_context_window: int = 0  # 0 means exact full-prefix scoring.
-    score_missing_ratio_thresh: float = 0.2
-    invalid_fallback: str = "skip"
     max_step_tokens: int = 1024
     max_total_tokens: int = 16384
     final_answer_max_tokens: int = 1024
@@ -49,12 +41,8 @@ class BPAConfig:
     repetition_ngram_size: int = 8
     repetition_ngram_threshold: int = 4
     slm_to_llm_flop_ratio: float = 0.05
-    arbitration_tie_margin: float = 0.05
 
     # Runtime switches used by baselines and diagnostic runs.
-    cascade_mode: str = "bpa"  # "bpa" | "hinit"
-    apply_arbitration: bool = True
-    collect_branch_logs: bool = True
     reset_prefix_cache_after_problem: bool = True
 
     def __post_init__(self) -> None:

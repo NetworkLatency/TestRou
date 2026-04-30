@@ -4,116 +4,24 @@ import re
 import time
 from dataclasses import dataclass
 
-from .arbitration import llm_arbitrate
 from .cascade.l0 import l0_filter
-from .cascade.l1 import l1_shadow_rollout
-from .cascade.l2 import l2_compute
 from .config import BPAConfig
 from .engines import finish_reason, generated_text, generated_token_ids
 from .phase_machine import CLOSE_THINK_TAG, check_and_transition_phase
 from .render import render_for_continuation
 from .safety import clean_latex_answer, ensure_step_terminator, extract_answer, extract_last_boxed, update_repetition
-from .state import CascadeResult, Decision, GenerationState, Phase, RejectedBranch, RepetitionState, TraceEvent
+from .state import CascadeResult, Decision, GenerationState, Phase, RepetitionState, TraceEvent
 from .trace import BPAResult
 
 
-EOS_FINISH_REASONS = {"eos", "branch_eos"}
+EOS_FINISH_REASONS = {"eos"}
 
 
 def run_cascade(state: GenerationState, slm, llm, config: BPAConfig) -> CascadeResult:
     l0 = l0_filter(state, slm, config)
     state.trace.append(TraceEvent(state.step_count, "l0", l0.to_dict()))
-
-    if config.cascade_mode == "hinit":
-        decision = Decision.LLM_FULL if l0.passed else Decision.SLM_DIRECT
-        return CascadeResult(decision=decision, l0=l0)
-
-    if not l0.passed:
-        return CascadeResult(decision=Decision.SLM_DIRECT, l0=l0)
-
-    try:
-        branch1, branch2 = l1_shadow_rollout(state, slm, config, l0)
-    except ValueError as exc:
-        state.trace.append(TraceEvent(state.step_count, "l1_skipped", {"reason": str(exc)}))
-        return CascadeResult(decision=Decision.SLM_DIRECT, l0=l0)
-
-    state.trace.append(
-        TraceEvent(
-            state.step_count,
-            "l1",
-            {
-                "b1_text": branch1.raw_rollout_text[:200],
-                "b2_text": branch2.raw_rollout_text[:200],
-                "b1_truncated": branch1.step_branch_was_truncated,
-                "b2_truncated": branch2.step_branch_was_truncated,
-                "b1_finish_reason": branch1.finish_reason,
-                "b2_finish_reason": branch2.finish_reason,
-                "b1_ended_by_eos": branch1.ended_by_eos,
-                "b2_ended_by_eos": branch2.ended_by_eos,
-            },
-        )
-    )
-
-    l2 = l2_compute(branch1, branch2, config)
-    state.trace.append(TraceEvent(state.step_count, "l2", l2.to_dict()))
-
-    arbitration = None
-    if l2.triggered_arbitration:
-        arbitration = llm_arbitrate(state, llm, branch1, branch2, config)
-        state.trace.append(TraceEvent(state.step_count, "arbitration", arbitration.to_dict()))
-
-    if config.collect_branch_logs:
-        state.branch_logs.append(
-            {
-                "step_idx": state.step_count,
-                "problem_text": state.problem_text,
-                "assistant_prefix_text": state.assistant_prefix_text,
-                "l0": l0.to_dict(),
-                "branch1": branch1.to_dict(),
-                "branch2": branch2.to_dict(),
-                "l2": l2.to_dict(),
-                "arbitration": arbitration.to_dict() if arbitration is not None else None,
-            }
-        )
-
-    if not l2.triggered_arbitration:
-        return CascadeResult(decision=Decision.SLM_DIRECT, l0=l0, l1=(branch1, branch2), l2=l2)
-
-    if arbitration is None or arbitration.is_invalid:
-        if config.invalid_fallback == "llm_full":
-            return CascadeResult(
-                decision=Decision.LLM_FULL,
-                l0=l0,
-                l1=(branch1, branch2),
-                l2=l2,
-                arbitration=arbitration,
-            )
-        return CascadeResult(
-            decision=Decision.SLM_DIRECT,
-            l0=l0,
-            l1=(branch1, branch2),
-            l2=l2,
-            arbitration=arbitration,
-        )
-
-    winner = branch1 if arbitration.winner_idx == 0 else branch2
-    loser = branch2 if arbitration.winner_idx == 0 else branch1
-    state.rejected_branches_log.append(
-        RejectedBranch(
-            step_idx=state.step_count,
-            loser_text=loser.step_branch_text,
-            winner_text=winner.step_branch_text,
-            l2=l2,
-        )
-    )
-    return CascadeResult(
-        decision=Decision.LLM_ARBITRATE,
-        l0=l0,
-        l1=(branch1, branch2),
-        l2=l2,
-        arbitration=arbitration,
-        winner_branch=winner,
-    )
+    decision = Decision.LLM_FULL if l0.passed else Decision.SLM_DIRECT
+    return CascadeResult(decision=decision, l0=l0)
 
 
 def _generate_step_with_engine(state: GenerationState, engine, config: BPAConfig, account: str, prefix_extension: str = "") -> tuple[str, str]:
@@ -150,10 +58,6 @@ def _slm_generate_step(state: GenerationState, slm, config: BPAConfig) -> tuple[
     return _generate_step_with_engine(state, slm, config, account="slm")
 
 
-def _slm_continue_step(state: GenerationState, slm, config: BPAConfig, prefix_extension: str) -> tuple[str, str]:
-    return _generate_step_with_engine(state, slm, config, account="slm", prefix_extension=prefix_extension)
-
-
 def _llm_generate_step(state: GenerationState, llm, config: BPAConfig) -> tuple[str, str]:
     return _generate_step_with_engine(state, llm, config, account="llm")
 
@@ -164,19 +68,6 @@ def generate_one_step(state: GenerationState, slm, llm, config: BPAConfig, casca
 
     if cascade.decision == Decision.LLM_FULL:
         return _llm_generate_step(state, llm, config)
-
-    if cascade.decision == Decision.LLM_ARBITRATE:
-        if not config.apply_arbitration:
-            return _slm_generate_step(state, slm, config)
-        if cascade.winner_branch is None:
-            return _slm_generate_step(state, slm, config)
-        winner = cascade.winner_branch
-        if winner.ended_by_eos:
-            return winner.step_branch_text, "branch_eos"
-        if winner.step_branch_was_truncated:
-            return winner.step_branch_text + "\n\n", "stop_in_branch"
-        suffix_text, finish = _slm_continue_step(state, slm, config, prefix_extension=winner.step_branch_text)
-        return winner.step_branch_text + suffix_text, finish
 
     raise ValueError(f"Unknown cascade decision: {cascade.decision}")
 
@@ -284,11 +175,9 @@ def _looks_like_restart_after_answer(step_text: str) -> bool:
     return lower.startswith(restart_prefixes)
 
 
-def _generation_source(cascade: CascadeResult, config: BPAConfig) -> str:
+def _generation_source(cascade: CascadeResult) -> str:
     if cascade.decision == Decision.LLM_FULL:
         return "llm"
-    if cascade.decision == Decision.LLM_ARBITRATE and config.apply_arbitration and cascade.winner_branch is not None:
-        return "slm_branch_llm_arbitrated"
     return "slm"
 
 
@@ -434,13 +323,11 @@ def bpa_solve(problem_text: str, slm, llm, config: BPAConfig) -> BPAResult:
         log_row = {
             "step_idx": state.step_count - 1,
             "decision": cascade.decision.value,
-            "generation_source": _generation_source(cascade, config),
+            "generation_source": _generation_source(cascade),
             "finish_reason": finish,
             "step_text": step_text_normalized,
             "phase_after": state.phase.value,
         }
-        if cascade.winner_branch is not None:
-            log_row["branch_finish_reason"] = cascade.winner_branch.finish_reason
         if final_decision is not None and final_decision.signal is not None:
             log_row["final_stop_signal"] = final_decision.signal
         step_logs.append(log_row)

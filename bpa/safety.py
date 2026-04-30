@@ -8,7 +8,7 @@ from .state import RepetitionState
 
 
 def ensure_step_terminator(step_text: str, finish_reason: str) -> str:
-    if finish_reason in {"eos", "branch_eos"}:
+    if finish_reason == "eos":
         return step_text
     if not step_text.endswith("\n\n"):
         return step_text + "\n\n"
