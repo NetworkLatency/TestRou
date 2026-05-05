@@ -15,14 +15,16 @@ from bpa.eval.benchmark_eval import benchmark_eval_match
 from bpa.eval.datasets import EvalProblem, load_eval_dataset
 from bpa.eval.sampling_disagreement import (
     extract_number_signature,
+    extract_novel_number_signature,
     extract_operation_signature,
+    extract_rhs_number_signature,
     extract_structured_signature,
     rollout_disagreement_metrics,
 )
 from bpa.phase_machine import CLOSE_THINK_TAG, check_and_transition_phase
 from bpa.pipeline import FinalStopDecision, FinalStopState, _is_eos_finish, _slm_generate_step
 from bpa.render import render_for_continuation
-from bpa.safety import ensure_step_terminator, extract_answer, update_repetition
+from bpa.safety import ensure_step_terminator, extract_answer, update_strict_step_repetition
 from bpa.state import GenerationState, Phase, RepetitionState, TraceEvent
 from bpa.trace import BPAResult, json_safe
 
@@ -34,12 +36,19 @@ PROBLEM_SUMMARY_FIELDS = [
     "final_answer",
     "correct",
     "num_boundaries",
+    "num_initial_probes",
+    "num_thinking_boundaries",
+    "num_final_answer_boundaries",
     "mean_structured_disagreement",
     "max_structured_disagreement",
     "mean_operation_vote_disagreement",
     "max_operation_vote_disagreement",
     "mean_number_vote_disagreement",
     "max_number_vote_disagreement",
+    "mean_novel_number_vote_disagreement",
+    "max_novel_number_vote_disagreement",
+    "mean_rhs_number_vote_disagreement",
+    "max_rhs_number_vote_disagreement",
     "mean_self_bleu_disagreement",
     "max_self_bleu_disagreement",
     "mean_char_jaccard_disagreement",
@@ -99,6 +108,7 @@ def _sample_probe_rollouts(
     out = slm.generate(rendered, sampling)[0]
     probe_wall_time = time.time() - generate_start
 
+    context_text = f"{state.problem_text}\n{state.assistant_prefix_text}"
     rollouts = []
     probe_decode_tokens = 0
     for completion in getattr(out, "outputs", []) or []:
@@ -108,6 +118,8 @@ def _sample_probe_rollouts(
         signature = extract_structured_signature(text)
         operation_signature = extract_operation_signature(text)
         number_signature = extract_number_signature(text)
+        novel_number_signature = extract_novel_number_signature(text, context_text)
+        rhs_number_signature = extract_rhs_number_signature(text, context_text)
         probe_decode_tokens += len(token_ids)
         rollouts.append(
             {
@@ -123,12 +135,19 @@ def _sample_probe_rollouts(
                 "number_signature_type": number_signature["signature_type"],
                 "number_signature_value": number_signature["signature_value"],
                 "number_signature": number_signature["signature"],
+                "novel_number_signature_type": novel_number_signature["signature_type"],
+                "novel_number_signature_value": novel_number_signature["signature_value"],
+                "novel_number_signature": novel_number_signature["signature"],
+                "rhs_number_signature_type": rhs_number_signature["signature_type"],
+                "rhs_number_signature_value": rhs_number_signature["signature_value"],
+                "rhs_number_signature": rhs_number_signature["signature"],
             }
         )
 
     metrics = rollout_disagreement_metrics(
         [row["text"] for row in rollouts],
         [row["mean_logprob"] for row in rollouts],
+        context_text=context_text,
     )
     row = {
         "assistant_prefix_text": state.assistant_prefix_text,
@@ -190,20 +209,23 @@ def run_sampling_disagreement(
             break
 
         phase_before_step = state.phase
-        probe_row: dict[str, Any] | None = None
-        if phase_before_step == Phase.THINKING:
-            probe_row, cost = _sample_probe_rollouts(
-                state,
-                slm,
-                probe_k=probe_k,
-                probe_temperature=probe_temperature,
-                probe_max_tokens=probe_max_tokens,
-                probe_stop=probe_stop,
-            )
-            probe_row["boundary_idx"] = boundary_idx
+        probe_row, cost = _sample_probe_rollouts(
+            state,
+            slm,
+            probe_k=probe_k,
+            probe_temperature=probe_temperature,
+            probe_max_tokens=probe_max_tokens,
+            probe_stop=probe_stop,
+        )
+        is_initial_probe = len(state.assistant_prefix_text) == 0
+        probe_row["boundary_idx"] = -1 if is_initial_probe else boundary_idx
+        probe_row["phase_before_step"] = phase_before_step.value
+        probe_row["target_step_idx"] = state.step_count
+        probe_row["is_initial_probe"] = is_initial_probe
+        if not is_initial_probe:
             boundary_idx += 1
-            for key in probe_cost:
-                probe_cost[key] += cost[key]
+        for key in probe_cost:
+            probe_cost[key] += cost[key]
 
         decode_tokens_before = state.slm_decode_tokens
         step_text, finish = _slm_generate_step(state, slm, config)
@@ -233,14 +255,13 @@ def run_sampling_disagreement(
                     )
                 )
 
-        if probe_row is not None:
-            probe_row["main_step_text"] = step_text_normalized
-            probe_row["main_step_finish_reason"] = finish
-            probe_rows.append(probe_row)
+        probe_row["main_step_text"] = step_text_normalized
+        probe_row["main_step_finish_reason"] = finish
+        probe_rows.append(probe_row)
 
         log_row = {
             "step_idx": state.step_count - 1,
-            "decision": "slm_sampling_probe" if phase_before_step == Phase.THINKING else "slm_direct",
+            "decision": "slm_sampling_probe",
             "generation_source": "slm",
             "finish_reason": finish,
             "step_text": step_text_normalized,
@@ -251,12 +272,7 @@ def run_sampling_disagreement(
         step_logs.append(log_row)
 
         if state.phase == Phase.THINKING:
-            trigger = update_repetition(
-                rep,
-                step_text_normalized,
-                config.repetition_ngram_size,
-                config.repetition_ngram_threshold,
-            )
+            trigger = update_strict_step_repetition(rep, step_text_normalized)
             if trigger is not None:
                 state.assistant_prefix_text += CLOSE_THINK_TAG + "\n\n"
                 state.has_seen_close_think = True
@@ -294,6 +310,10 @@ def build_problem_summary(
     if problem.gold_answer is not None:
         correct = benchmark_eval_match(result.answer, problem.gold_answer, dataset)
         result.correct = correct
+    real_probe_rows = [row for row in probe_rows if int(row.get("boundary_idx", -1)) >= 0 and not row.get("is_initial_probe")]
+    num_initial_probes = sum(1 for row in probe_rows if row.get("is_initial_probe") or int(row.get("boundary_idx", 0)) < 0)
+    num_thinking_boundaries = sum(1 for row in real_probe_rows if row.get("phase_before_step") == Phase.THINKING.value)
+    num_final_answer_boundaries = sum(1 for row in real_probe_rows if row.get("phase_before_step") == Phase.FINAL_ANSWER.value)
 
     return {
         "problem_id": problem.problem_id,
@@ -301,19 +321,26 @@ def build_problem_summary(
         "gold_answer": problem.gold_answer,
         "final_answer": result.answer,
         "correct": correct,
-        "num_boundaries": len(probe_rows),
-        "mean_structured_disagreement": _mean([row.get("structured_disagreement") for row in probe_rows]),
-        "max_structured_disagreement": _max([row.get("structured_disagreement") for row in probe_rows]),
-        "mean_operation_vote_disagreement": _mean([row.get("operation_vote_disagreement") for row in probe_rows]),
-        "max_operation_vote_disagreement": _max([row.get("operation_vote_disagreement") for row in probe_rows]),
-        "mean_number_vote_disagreement": _mean([row.get("number_vote_disagreement") for row in probe_rows]),
-        "max_number_vote_disagreement": _max([row.get("number_vote_disagreement") for row in probe_rows]),
-        "mean_self_bleu_disagreement": _mean([row.get("self_bleu_disagreement") for row in probe_rows]),
-        "max_self_bleu_disagreement": _max([row.get("self_bleu_disagreement") for row in probe_rows]),
-        "mean_char_jaccard_disagreement": _mean([row.get("char_jaccard_disagreement") for row in probe_rows]),
-        "max_char_jaccard_disagreement": _max([row.get("char_jaccard_disagreement") for row in probe_rows]),
-        "mean_score_variance": _mean([row.get("score_variance") for row in probe_rows]),
-        "max_score_variance": _max([row.get("score_variance") for row in probe_rows]),
+        "num_boundaries": len(real_probe_rows),
+        "num_initial_probes": num_initial_probes,
+        "num_thinking_boundaries": num_thinking_boundaries,
+        "num_final_answer_boundaries": num_final_answer_boundaries,
+        "mean_structured_disagreement": _mean([row.get("structured_disagreement") for row in real_probe_rows]),
+        "max_structured_disagreement": _max([row.get("structured_disagreement") for row in real_probe_rows]),
+        "mean_operation_vote_disagreement": _mean([row.get("operation_vote_disagreement") for row in real_probe_rows]),
+        "max_operation_vote_disagreement": _max([row.get("operation_vote_disagreement") for row in real_probe_rows]),
+        "mean_number_vote_disagreement": _mean([row.get("number_vote_disagreement") for row in real_probe_rows]),
+        "max_number_vote_disagreement": _max([row.get("number_vote_disagreement") for row in real_probe_rows]),
+        "mean_novel_number_vote_disagreement": _mean([row.get("novel_number_vote_disagreement") for row in real_probe_rows]),
+        "max_novel_number_vote_disagreement": _max([row.get("novel_number_vote_disagreement") for row in real_probe_rows]),
+        "mean_rhs_number_vote_disagreement": _mean([row.get("rhs_number_vote_disagreement") for row in real_probe_rows]),
+        "max_rhs_number_vote_disagreement": _max([row.get("rhs_number_vote_disagreement") for row in real_probe_rows]),
+        "mean_self_bleu_disagreement": _mean([row.get("self_bleu_disagreement") for row in real_probe_rows]),
+        "max_self_bleu_disagreement": _max([row.get("self_bleu_disagreement") for row in real_probe_rows]),
+        "mean_char_jaccard_disagreement": _mean([row.get("char_jaccard_disagreement") for row in real_probe_rows]),
+        "max_char_jaccard_disagreement": _max([row.get("char_jaccard_disagreement") for row in real_probe_rows]),
+        "mean_score_variance": _mean([row.get("score_variance") for row in real_probe_rows]),
+        "max_score_variance": _max([row.get("score_variance") for row in real_probe_rows]),
         "total_wall_time": result.total_wall_time,
         "slm_decode_tokens": result.state.slm_decode_tokens,
         "slm_prefill_tokens": result.state.slm_prefill_tokens,

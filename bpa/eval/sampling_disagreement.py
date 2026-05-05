@@ -76,6 +76,45 @@ def _extract_first_number(text: str) -> str | None:
     return _normalize_signature_value(first.group(0))
 
 
+def _normalize_number_value(value: str) -> str:
+    normalized = clean_latex_answer(_normalize_signature_value(value))
+    normalized = normalized.replace(",", "")
+    normalized = re.sub(r"\s+", "", normalized)
+    return normalized
+
+
+def _number_matches(text: str) -> list[tuple[int, str]]:
+    matches: list[tuple[int, str]] = []
+    for pattern in _LATEX_NUMBER_PATTERNS:
+        matches.extend((match.start(), _normalize_signature_value(match.group(0))) for match in pattern.finditer(text))
+    matches.extend((match.start(), _normalize_signature_value(match.group(0))) for match in _PLAIN_NUMBER_PATTERN.finditer(text))
+    return sorted(matches, key=lambda item: item[0])
+
+
+def _context_number_values(context_text: str) -> set[str]:
+    return {_normalize_number_value(value) for _, value in _number_matches(context_text)}
+
+
+def _extract_first_novel_number(text: str, context_text: str = "") -> str | None:
+    context_numbers = _context_number_values(context_text)
+    for _, value in _number_matches(text):
+        if _normalize_number_value(value) not in context_numbers:
+            return value
+    return None
+
+
+def _extract_first_rhs_number(text: str, context_text: str = "") -> str | None:
+    context_numbers = _context_number_values(context_text)
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        rhs = line.split("=", 1)[1]
+        for _, value in _number_matches(rhs):
+            if _normalize_number_value(value) not in context_numbers:
+                return value
+    return _extract_first_novel_number(text, context_text)
+
+
 def _extract_first_operator(text: str) -> str | None:
     operator = _OPERATOR_PATTERN.search(text)
     return operator.group(1).lower() if operator is not None else None
@@ -103,6 +142,20 @@ def extract_structured_signature(text: str) -> dict[str, str]:
 
 def extract_number_signature(text: str) -> dict[str, str]:
     number = _extract_first_number(text)
+    if number is None:
+        return _signature("none", "")
+    return _signature("number", number)
+
+
+def extract_novel_number_signature(text: str, context_text: str = "") -> dict[str, str]:
+    number = _extract_first_novel_number(text, context_text)
+    if number is None:
+        return _signature("none", "")
+    return _signature("number", number)
+
+
+def extract_rhs_number_signature(text: str, context_text: str = "") -> dict[str, str]:
+    number = _extract_first_rhs_number(text, context_text)
     if number is None:
         return _signature("none", "")
     return _signature("number", number)
@@ -163,6 +216,16 @@ def operation_vote_disagreement(texts: list[str]) -> dict[str, Any]:
 def number_vote_disagreement(texts: list[str]) -> dict[str, Any]:
     signatures = [extract_number_signature(text)["signature"] for text in texts]
     return _renamed_vote_result(compute_vote_disagreement(signatures), "number")
+
+
+def novel_number_vote_disagreement(texts: list[str], context_text: str = "") -> dict[str, Any]:
+    signatures = [extract_novel_number_signature(text, context_text)["signature"] for text in texts]
+    return _renamed_vote_result(compute_vote_disagreement(signatures), "novel_number")
+
+
+def rhs_number_vote_disagreement(texts: list[str], context_text: str = "") -> dict[str, Any]:
+    signatures = [extract_rhs_number_signature(text, context_text)["signature"] for text in texts]
+    return _renamed_vote_result(compute_vote_disagreement(signatures), "rhs_number")
 
 
 def _char_units(text: str) -> set[str]:
@@ -255,7 +318,7 @@ def score_variance(scores: list[float | None]) -> float | None:
     return sum((value - mean) ** 2 for value in values) / len(values)
 
 
-def rollout_disagreement_metrics(texts: list[str], scores: list[float | None]) -> dict[str, Any]:
+def rollout_disagreement_metrics(texts: list[str], scores: list[float | None], context_text: str = "") -> dict[str, Any]:
     structured = compute_vote_disagreement([extract_structured_signature(text)["signature"] for text in texts])
     return {
         "signature_counts": structured["signature_counts"],
@@ -264,6 +327,8 @@ def rollout_disagreement_metrics(texts: list[str], scores: list[float | None]) -
         "structured_disagreement": structured["structured_disagreement"],
         **operation_vote_disagreement(texts),
         **number_vote_disagreement(texts),
+        **novel_number_vote_disagreement(texts, context_text),
+        **rhs_number_vote_disagreement(texts, context_text),
         "self_bleu_disagreement": self_bleu_disagreement(texts),
         "char_jaccard_disagreement": char_jaccard_disagreement(texts),
         "score_variance": score_variance(scores),

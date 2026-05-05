@@ -9,7 +9,7 @@ from .config import BPAConfig
 from .engines import finish_reason, generated_text, generated_token_ids
 from .phase_machine import CLOSE_THINK_TAG, check_and_transition_phase
 from .render import render_for_continuation
-from .safety import clean_latex_answer, ensure_step_terminator, extract_answer, extract_last_boxed, update_repetition
+from .safety import clean_latex_answer, ensure_step_terminator, extract_answer, extract_last_boxed, update_repetition, update_strict_step_repetition
 from .state import CascadeResult, Decision, GenerationState, Phase, RepetitionState, TraceEvent
 from .trace import BPAResult
 
@@ -333,12 +333,7 @@ def bpa_solve(problem_text: str, slm, llm, config: BPAConfig) -> BPAResult:
         step_logs.append(log_row)
 
         if state.phase == Phase.THINKING:
-            trigger = update_repetition(
-                rep,
-                step_text_normalized,
-                config.repetition_ngram_size,
-                config.repetition_ngram_threshold,
-            )
+            trigger = update_strict_step_repetition(rep, step_text_normalized)
             if trigger is not None:
                 state.assistant_prefix_text += CLOSE_THINK_TAG + "\n\n"
                 state.has_seen_close_think = True

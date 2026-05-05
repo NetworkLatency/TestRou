@@ -10,7 +10,7 @@ from bpa.config import BPAConfig
 from bpa.cascade.l0 import entropy_and_margin
 from bpa.eval.benchmark_eval import benchmark_eval_match, normalize_math_expr
 from bpa.eval.datasets import EvalProblem, load_eval_dataset, load_local_rows
-from bpa.eval.analyze_sampling_disagreement import auroc, quantile_rows
+from bpa.eval.analyze_sampling_disagreement import analyze, auroc, quantile_rows
 from bpa.eval.exp_boundary_continuation import (
     build_boundary_label_rows,
     make_boundary_label,
@@ -32,11 +32,15 @@ from bpa.eval.main_benchmark import (
 from bpa.eval.sampling_disagreement import (
     char_jaccard_disagreement,
     compute_vote_disagreement,
+    extract_novel_number_signature,
     extract_number_signature,
     extract_operation_signature,
+    extract_rhs_number_signature,
     extract_structured_signature,
+    novel_number_vote_disagreement,
     number_vote_disagreement,
     operation_vote_disagreement,
+    rhs_number_vote_disagreement,
     rollout_disagreement_metrics,
     score_variance,
     self_bleu_disagreement,
@@ -44,7 +48,7 @@ from bpa.eval.sampling_disagreement import (
 from bpa.phase_machine import check_and_transition_phase, detect_close_think
 from bpa.pipeline import bpa_solve
 from bpa.render import render_for_continuation
-from bpa.safety import clean_latex_answer, ensure_step_terminator, extract_answer, update_repetition
+from bpa.safety import clean_latex_answer, ensure_step_terminator, extract_answer, update_repetition, update_strict_step_repetition
 from bpa.state import GenerationState, RepetitionState
 
 
@@ -203,6 +207,11 @@ class CoreTests(unittest.TestCase):
         self.assertIsNone(update_repetition(rep, "This is a long enough step."))
         self.assertEqual(update_repetition(rep, "This is a long enough step."), "duplicate_step")
 
+        strict_rep = RepetitionState()
+        internally_repetitive = r"\frac{1}{2} + \frac{1}{2} + \frac{1}{2} + \frac{1}{2}."
+        self.assertIsNone(update_strict_step_repetition(strict_rep, internally_repetitive))
+        self.assertEqual(update_strict_step_repetition(strict_rep, internally_repetitive), "duplicate_step")
+
     def test_l0_entropy_margin(self):
         h, margin = entropy_and_margin({1: 0.0, 2: math.log(0.5)})
         self.assertGreater(h, 0.0)
@@ -216,6 +225,16 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(extract_structured_signature("No math event here.")["signature"], "none:")
         self.assertEqual(extract_number_signature("First value is 17.")["signature"], "number:17")
         self.assertEqual(extract_operation_signature("We simplify the equation.")["signature"], "operator:simplify")
+
+    def test_context_aware_number_signatures(self):
+        context = "Problem: the point is (0, 3)."
+        self.assertEqual(extract_number_signature("Copy (0, 3), then y = 7.")["signature"], "number:0")
+        self.assertEqual(extract_novel_number_signature("Copy (0, 3), then y = 7.", context)["signature"], "number:7")
+        self.assertEqual(extract_rhs_number_signature("Copy (0, 3), then y = 7.", context)["signature"], "number:7")
+
+        texts = ["copy 0 then y = 5", "copy 0 then y = 5", "copy 0 then y = 6", "copy 0 then y = 5"]
+        self.assertAlmostEqual(novel_number_vote_disagreement(texts, "Problem gives 0")["novel_number_vote_disagreement"], 0.25)
+        self.assertAlmostEqual(rhs_number_vote_disagreement(texts, "Problem gives 0")["rhs_number_vote_disagreement"], 0.25)
 
     def test_vote_disagreement(self):
         result = compute_vote_disagreement(["a", "a", "a", "b"])
@@ -239,6 +258,8 @@ class CoreTests(unittest.TestCase):
         metrics = rollout_disagreement_metrics(texts, [-1.0, -1.1, -1.2, -1.0])
         self.assertIn("operation_vote_disagreement", metrics)
         self.assertIn("number_vote_disagreement", metrics)
+        self.assertIn("novel_number_vote_disagreement", metrics)
+        self.assertIn("rhs_number_vote_disagreement", metrics)
         self.assertIn("self_bleu_disagreement", metrics)
 
     def test_score_variance(self):
@@ -351,6 +372,10 @@ class CoreTests(unittest.TestCase):
                 "solve for x",
                 "calculate 2",
                 "solve for x",
+                "answer is 1",
+                "answer is 1",
+                "answer is 2",
+                "answer is 1",
             ],
         )
         result, probes, probe_cost = run_sampling_disagreement(
@@ -362,22 +387,34 @@ class CoreTests(unittest.TestCase):
             probe_max_tokens=32,
         )
         self.assertEqual(result.answer, "1")
-        self.assertEqual(len(probes), 2)
+        self.assertEqual(len(probes), 3)
+        self.assertEqual(probes[0]["boundary_idx"], -1)
+        self.assertTrue(probes[0]["is_initial_probe"])
+        self.assertEqual(probes[0]["prefix_char_len"], 0)
+        self.assertEqual(probes[1]["boundary_idx"], 0)
+        self.assertFalse(probes[1]["is_initial_probe"])
+        self.assertEqual(probes[1]["phase_before_step"], "thinking")
+        self.assertEqual(probes[2]["boundary_idx"], 1)
+        self.assertEqual(probes[2]["phase_before_step"], "final_answer")
         self.assertAlmostEqual(probes[0]["structured_disagreement"], 0.25)
-        self.assertEqual(probe_cost["probe_generate_calls"], 2)
+        self.assertEqual(probe_cost["probe_generate_calls"], 3)
 
         problem = EvalProblem(problem_id=1, question_id="q1", problem_text="Problem: x?", raw={}, gold_answer="1")
         summary = build_problem_summary(problem, result, probes, probe_cost, "math500")
+        self.assertEqual(summary["num_boundaries"], 2)
+        self.assertEqual(summary["num_initial_probes"], 1)
+        self.assertEqual(summary["num_thinking_boundaries"], 1)
+        self.assertEqual(summary["num_final_answer_boundaries"], 1)
         enriched = enrich_probe_rows(problem, probes, result, "math500")
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = Path(tmp) / "sampling"
             write_sampling_outputs(out_dir, enriched, [summary])
             self.assertTrue((out_dir / "probes.jsonl").exists())
             self.assertTrue((out_dir / "problem_summary.csv").exists())
-            self.assertEqual(len((out_dir / "probes.jsonl").read_text(encoding="utf-8").splitlines()), 2)
+            self.assertEqual(len((out_dir / "probes.jsonl").read_text(encoding="utf-8").splitlines()), 3)
 
     def test_boundary_label_helpers(self):
-        rows = [{"boundary_idx": idx} for idx in range(10)]
+        rows = [{"boundary_idx": -1, "is_initial_probe": True}] + [{"boundary_idx": idx} for idx in range(10)]
         selected = select_evenly_spaced(rows, 5)
         self.assertEqual([row["boundary_idx"] for row in selected], [0, 2, 4, 7, 9])
         self.assertEqual(make_boundary_label(slm_final_correct=False, llm_oracle_correct=True, llm_continuation_correct=True)[0], True)
@@ -385,6 +422,22 @@ class CoreTests(unittest.TestCase):
 
     def test_boundary_continuation_fake_label(self):
         problem = EvalProblem(problem_id=1, question_id="q1", problem_text="Problem: x?", raw={}, gold_answer="1")
+        initial_probe = {
+            "problem_id": 1,
+            "question_id": "q1",
+            "boundary_idx": -1,
+            "is_initial_probe": True,
+            "assistant_prefix_text": "",
+            "prefix_char_len": 0,
+            "prefix_token_len": 10,
+            "operation_vote_disagreement": 1.0,
+            "number_vote_disagreement": 1.0,
+            "novel_number_vote_disagreement": 1.0,
+            "rhs_number_vote_disagreement": 1.0,
+            "self_bleu_disagreement": 1.0,
+            "char_jaccard_disagreement": 1.0,
+            "structured_disagreement": 1.0,
+        }
         probe = {
             "problem_id": 1,
             "question_id": "q1",
@@ -394,6 +447,8 @@ class CoreTests(unittest.TestCase):
             "prefix_token_len": 20,
             "operation_vote_disagreement": 0.25,
             "number_vote_disagreement": 0.75,
+            "novel_number_vote_disagreement": 0.5,
+            "rhs_number_vote_disagreement": 0.5,
             "self_bleu_disagreement": 0.5,
             "char_jaccard_disagreement": 0.5,
             "structured_disagreement": 0.75,
@@ -402,7 +457,7 @@ class CoreTests(unittest.TestCase):
         csv_rows, jsonl_rows = build_boundary_label_rows(
             dataset="math500",
             problems=[problem],
-            probes=[probe],
+            probes=[initial_probe, probe],
             problem_summary={"1": {"correct": False, "final_answer": "2"}},
             oracle_summary={"1": {"llm_correct": True, "llm_answer": "1"}},
             llm=llm,
@@ -410,7 +465,9 @@ class CoreTests(unittest.TestCase):
             continuation_max_tokens=64,
         )
         self.assertEqual(len(csv_rows), 1)
+        self.assertEqual(csv_rows[0]["boundary_idx"], 0)
         self.assertTrue(csv_rows[0]["critical"])
+        self.assertEqual(csv_rows[0]["rhs_number_vote_disagreement"], 0.5)
         self.assertIn("full_text", jsonl_rows[0])
 
     def test_analysis_helpers(self):
@@ -418,11 +475,37 @@ class CoreTests(unittest.TestCase):
         rows = quantile_rows([0.1, 0.2, 0.9, 1.0], [False, False, True, True], 2)
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[1]["critical_rate"], 1.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            probes = [
+                {"boundary_idx": -1, "is_initial_probe": True},
+                {"boundary_idx": 0, "is_initial_probe": False},
+            ]
+            summary = analyze(probes, [], [], 10, Path(tmp) / "analysis")
+            self.assertEqual(summary["num_probes_raw"], 2)
+            self.assertEqual(summary["num_probes"], 1)
+            summary = analyze(probes, [], [], 10, Path(tmp) / "analysis_include", include_initial_probe=True)
+            self.assertEqual(summary["num_probes"], 2)
 
     def test_disagreement_routing_fake_problem(self):
         slm = SamplingProbeEngine(
-            outputs=[(r"\boxed{1}", "eos")],
-            probe_outputs=["x = 1", "x = 2", "x = 3", "x = 4"],
+            outputs=[
+                ("Let x = 0.\n\n", "stop"),
+                (r"\boxed{1}", "eos"),
+            ],
+            probe_outputs=[
+                "x = 1",
+                "x = 1",
+                "x = 1",
+                "x = 1",
+                "x = 1",
+                "x = 2",
+                "x = 3",
+                "x = 4",
+                "answer = 1",
+                "answer = 1",
+                "answer = 1",
+                "answer = 1",
+            ],
         )
         llm = SequencedEngine([("</think>\n\n", "stop")])
         result, boundaries, probe_cost = run_disagreement_routing(
@@ -430,28 +513,35 @@ class CoreTests(unittest.TestCase):
             slm,
             llm,
             BPAConfig(max_total_tokens=200),
-            metric="number_vote_disagreement",
+            metric="rhs_number_vote_disagreement",
             threshold=0.5,
             probe_k=4,
             probe_temperature=0.7,
             probe_max_tokens=32,
         )
         self.assertEqual(result.answer, "1")
-        self.assertEqual(len(boundaries), 1)
-        self.assertTrue(boundaries[0]["routed_to_llm"])
-        self.assertEqual(probe_cost["probe_generate_calls"], 1)
+        self.assertEqual(len(boundaries), 3)
+        self.assertEqual(boundaries[0]["boundary_idx"], -1)
+        self.assertFalse(boundaries[0]["routed_to_llm"])
+        self.assertTrue(boundaries[1]["routed_to_llm"])
+        self.assertEqual(boundaries[2]["phase_before_step"], "final_answer")
+        self.assertFalse(boundaries[2]["routed_to_llm"])
+        self.assertEqual(probe_cost["probe_generate_calls"], 3)
 
     def test_threshold_from_probes(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "probes.jsonl"
             rows = [
-                {"number_vote_disagreement": 0.0},
-                {"number_vote_disagreement": 0.25},
-                {"number_vote_disagreement": 0.75},
-                {"number_vote_disagreement": 1.0},
+                {"boundary_idx": -1, "is_initial_probe": True, "rhs_number_vote_disagreement": 1.0},
+                {"boundary_idx": 0, "is_initial_probe": False, "rhs_number_vote_disagreement": 0.0},
+                {"boundary_idx": 1, "is_initial_probe": False, "rhs_number_vote_disagreement": 0.25},
             ]
             path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
-            self.assertAlmostEqual(threshold_from_probes(path, "number_vote_disagreement", 0.5), 0.5)
+            self.assertAlmostEqual(threshold_from_probes(path, "rhs_number_vote_disagreement", 0.5), 0.125)
+            self.assertAlmostEqual(
+                threshold_from_probes(path, "rhs_number_vote_disagreement", 0.5, include_initial_probe=True),
+                0.25,
+            )
 
     def test_routed_final_continues_router_after_close_think(self):
         slm = SequencedEngine([("</think>\n\n", "stop"), ("The answer is 42.", "eos")])

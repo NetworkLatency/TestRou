@@ -17,7 +17,7 @@ from bpa.eval.datasets import load_eval_dataset
 from bpa.eval.exp_sampling_disagreement import _max, _mean, _sample_probe_rollouts
 from bpa.phase_machine import CLOSE_THINK_TAG, check_and_transition_phase
 from bpa.pipeline import FinalStopDecision, FinalStopState, _is_eos_finish, _llm_generate_step, _slm_generate_step
-from bpa.safety import ensure_step_terminator, extract_answer, update_repetition
+from bpa.safety import ensure_step_terminator, extract_answer, update_strict_step_repetition
 from bpa.state import GenerationState, Phase, RepetitionState, TraceEvent
 from bpa.trace import BPAResult, json_safe
 
@@ -65,10 +65,38 @@ def _default_probe_path(config: BPAConfig, dataset: str) -> Path:
     return Path(config.output_dir) / "diagnostics" / "sampling_disagreement" / dataset / "probes.jsonl"
 
 
-def threshold_from_probes(path: Path, metric: str, quantile: float) -> float:
+def _parse_bool(value: Any) -> bool | None:
+    if value is None or value == "":
+        return None
+    text = str(value).strip().lower()
+    if value is True or text == "true":
+        return True
+    if value is False or text == "false":
+        return False
+    return None
+
+
+def _is_initial_probe(row: dict[str, Any]) -> bool:
+    parsed = _parse_bool(row.get("is_initial_probe"))
+    if parsed is not None:
+        return parsed
+    try:
+        if int(row.get("boundary_idx", 0)) < 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    try:
+        return int(row.get("prefix_char_len", 1)) == 0
+    except (TypeError, ValueError):
+        return False
+
+
+def threshold_from_probes(path: Path, metric: str, quantile: float, *, include_initial_probe: bool = False) -> float:
     rows = _read_jsonl(path)
     values = []
     for row in rows:
+        if not include_initial_probe and _is_initial_probe(row):
+            continue
         value = row.get(metric)
         if value is None:
             continue
@@ -113,23 +141,26 @@ def run_disagreement_routing(
 
         phase_before_step = state.phase
         route_to_llm = False
-        probe_row: dict[str, Any] | None = None
         metric_value = None
-        if phase_before_step == Phase.THINKING:
-            probe_row, cost = _sample_probe_rollouts(
-                state,
-                slm,
-                probe_k=probe_k,
-                probe_temperature=probe_temperature,
-                probe_max_tokens=probe_max_tokens,
-                probe_stop=probe_stop,
-            )
-            probe_row["boundary_idx"] = boundary_idx
+        probe_row, cost = _sample_probe_rollouts(
+            state,
+            slm,
+            probe_k=probe_k,
+            probe_temperature=probe_temperature,
+            probe_max_tokens=probe_max_tokens,
+            probe_stop=probe_stop,
+        )
+        is_initial_probe = len(state.assistant_prefix_text) == 0
+        probe_row["boundary_idx"] = -1 if is_initial_probe else boundary_idx
+        probe_row["phase_before_step"] = phase_before_step.value
+        probe_row["target_step_idx"] = state.step_count
+        probe_row["is_initial_probe"] = is_initial_probe
+        if not is_initial_probe:
             boundary_idx += 1
-            for key in probe_cost:
-                probe_cost[key] += cost[key]
-            metric_value = probe_row.get(metric)
-            route_to_llm = metric_value is not None and float(metric_value) >= threshold
+        for key in probe_cost:
+            probe_cost[key] += cost[key]
+        metric_value = probe_row.get(metric)
+        route_to_llm = (not is_initial_probe) and metric_value is not None and float(metric_value) >= threshold
 
         decode_tokens_before = state.slm_decode_tokens + state.llm_decode_tokens
         if route_to_llm:
@@ -156,14 +187,13 @@ def run_disagreement_routing(
             if final_decision.signal is not None:
                 state.trace.append(TraceEvent(state.step_count, final_decision.signal, final_decision.event_data or {}))
 
-        if probe_row is not None:
-            probe_row["metric"] = metric
-            probe_row["metric_value"] = metric_value
-            probe_row["threshold"] = threshold
-            probe_row["routed_to_llm"] = route_to_llm
-            probe_row["main_step_text"] = step_text_normalized
-            probe_row["main_step_finish_reason"] = finish
-            boundary_rows.append(probe_row)
+        probe_row["metric"] = metric
+        probe_row["metric_value"] = metric_value
+        probe_row["threshold"] = threshold
+        probe_row["routed_to_llm"] = route_to_llm
+        probe_row["main_step_text"] = step_text_normalized
+        probe_row["main_step_finish_reason"] = finish
+        boundary_rows.append(probe_row)
 
         log_row = {
             "step_idx": state.step_count - 1,
@@ -181,12 +211,7 @@ def run_disagreement_routing(
         step_logs.append(log_row)
 
         if state.phase == Phase.THINKING:
-            trigger = update_repetition(
-                rep,
-                step_text_normalized,
-                config.repetition_ngram_size,
-                config.repetition_ngram_threshold,
-            )
+            trigger = update_strict_step_repetition(rep, step_text_normalized)
             if trigger is not None:
                 state.assistant_prefix_text += CLOSE_THINK_TAG + "\n\n"
                 state.has_seen_close_think = True
@@ -245,7 +270,7 @@ def main() -> None:
     parser.add_argument("--max-problems", type=int, default=50)
     parser.add_argument("--threshold-source", default=None)
     parser.add_argument("--threshold-quantile", type=float, default=0.8)
-    parser.add_argument("--metric", default="number_vote_disagreement")
+    parser.add_argument("--metric", default="rhs_number_vote_disagreement")
     parser.add_argument("--probe-k", type=int, default=4)
     parser.add_argument("--probe-temperature", type=float, default=0.7)
     parser.add_argument("--probe-max-tokens", type=int, default=32)
@@ -275,7 +300,8 @@ def main() -> None:
         if problem.gold_answer is not None:
             correct = benchmark_eval_match(result.answer, problem.gold_answer, args.dataset)
             result.correct = correct
-        metric_values = [row.get(args.metric) for row in boundary_rows]
+        real_boundary_rows = [row for row in boundary_rows if not _is_initial_probe(row)]
+        metric_values = [row.get(args.metric) for row in real_boundary_rows]
         summary_rows.append(
             {
                 "dataset": args.dataset,
@@ -287,8 +313,8 @@ def main() -> None:
                 "metric": args.metric,
                 "threshold": threshold,
                 "threshold_quantile": args.threshold_quantile,
-                "num_boundaries": len(boundary_rows),
-                "num_llm_routed_steps": sum(1 for row in boundary_rows if row.get("routed_to_llm")),
+                "num_boundaries": len(real_boundary_rows),
+                "num_llm_routed_steps": sum(1 for row in real_boundary_rows if row.get("routed_to_llm")),
                 "num_slm_steps": result.state.slm_generate_calls,
                 "max_metric_value": _max(metric_values),
                 "mean_metric_value": _mean(metric_values),

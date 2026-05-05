@@ -16,7 +16,8 @@ from bpa.trace import json_safe
 
 DEFAULT_METRICS = [
     "operation_vote_disagreement",
-    "number_vote_disagreement",
+    "rhs_number_vote_disagreement",
+    "novel_number_vote_disagreement",
     "self_bleu_disagreement",
     "char_jaccard_disagreement",
     "structured_disagreement",
@@ -59,6 +60,21 @@ def _parse_bool(value: Any) -> bool | None:
     if value is False or text == "false":
         return False
     return None
+
+
+def _is_initial_probe(row: dict[str, Any]) -> bool:
+    parsed = _parse_bool(row.get("is_initial_probe"))
+    if parsed is not None:
+        return parsed
+    try:
+        if int(row.get("boundary_idx", 0)) < 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    try:
+        return int(row.get("prefix_char_len", 1)) == 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _default_probe_path(config: BPAConfig, dataset: str) -> Path:
@@ -187,9 +203,20 @@ def analyze(
     metrics: list[str],
     num_bins: int,
     out_dir: Path,
+    *,
+    include_initial_probe: bool = False,
 ) -> dict[str, Any]:
+    raw_probe_count = len(probes)
+    if not include_initial_probe:
+        probes = [row for row in probes if not _is_initial_probe(row)]
     labeled = _merge_labels(probes, labels) if labels else []
-    summary: dict[str, Any] = {"num_probes": len(probes), "num_labeled": len(labeled), "metrics": {}}
+    summary: dict[str, Any] = {
+        "num_probes_raw": raw_probe_count,
+        "num_probes": len(probes),
+        "num_labeled": len(labeled),
+        "include_initial_probe": include_initial_probe,
+        "metrics": {},
+    }
     quantile_tables: dict[str, list[dict[str, Any]]] = {}
     distribution_rows: list[dict[str, Any]] = []
 
@@ -252,6 +279,7 @@ def main() -> None:
     parser.add_argument("--labels-path", default=None)
     parser.add_argument("--metrics", nargs="*", default=DEFAULT_METRICS)
     parser.add_argument("--num-bins", type=int, default=10)
+    parser.add_argument("--include-initial-probe", action="store_true", help="Include boundary_idx=-1 diagnostics in plots and metrics.")
     args = parser.parse_args()
 
     config = BPAConfig.from_json(args.config)
@@ -260,7 +288,7 @@ def main() -> None:
     probes = _read_jsonl(probes_path)
     labels = _read_csv(labels_path)
     out_dir = Path(config.output_dir) / "diagnostics" / "sampling_analysis" / args.dataset
-    analyze(probes, labels, args.metrics, args.num_bins, out_dir)
+    analyze(probes, labels, args.metrics, args.num_bins, out_dir, include_initial_probe=args.include_initial_probe)
     print(f"Wrote {out_dir / 'analysis_summary.json'}")
 
 

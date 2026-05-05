@@ -49,6 +49,26 @@ def update_repetition(
     return None
 
 
+def update_strict_step_repetition(rep: RepetitionState, new_step_text: str, min_chars: int = 10) -> str | None:
+    normalized = new_step_text.rstrip("\n").rstrip()
+    if len(normalized) < min_chars:
+        rep.recent_steps.append(normalized)
+        return None
+
+    if rep.recent_steps and rep.recent_steps[-1] == normalized:
+        rep.triggered = True
+        rep.trigger_reason = "duplicate_step"
+        return "duplicate_step"
+
+    if len(rep.recent_steps) >= 2 and rep.recent_steps[-2] == normalized:
+        rep.triggered = True
+        rep.trigger_reason = "alternating_step"
+        return "alternating_step"
+
+    rep.recent_steps.append(normalized)
+    return None
+
+
 def extract_last_boxed(text: Optional[str]) -> Optional[str]:
     if not isinstance(text, str) or not text:
         return None

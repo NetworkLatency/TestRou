@@ -40,6 +40,8 @@ CSV_FIELDS = [
     "continuation_prefill_tokens",
     "operation_vote_disagreement",
     "number_vote_disagreement",
+    "novel_number_vote_disagreement",
+    "rhs_number_vote_disagreement",
     "self_bleu_disagreement",
     "char_jaccard_disagreement",
     "structured_disagreement",
@@ -73,6 +75,21 @@ def _parse_bool(value: Any) -> bool | None:
     return None
 
 
+def _is_initial_probe(row: dict[str, Any]) -> bool:
+    parsed = _parse_bool(row.get("is_initial_probe"))
+    if parsed is not None:
+        return parsed
+    try:
+        if int(row.get("boundary_idx", 0)) < 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    try:
+        return int(row.get("prefix_char_len", 1)) == 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _first_present(*values: Any) -> Any:
     for value in values:
         if value not in (None, ""):
@@ -81,6 +98,7 @@ def _first_present(*values: Any) -> Any:
 
 
 def select_evenly_spaced(rows: list[dict[str, Any]], count: int) -> list[dict[str, Any]]:
+    rows = [row for row in rows if not _is_initial_probe(row)]
     rows = sorted(rows, key=lambda row: int(row.get("boundary_idx", 0)))
     if count <= 0 or len(rows) <= count:
         return rows
@@ -214,6 +232,8 @@ def build_boundary_label_rows(
             "continuation_prefill_tokens": continuation["prefill_tokens"],
             "operation_vote_disagreement": probe.get("operation_vote_disagreement"),
             "number_vote_disagreement": probe.get("number_vote_disagreement"),
+            "novel_number_vote_disagreement": probe.get("novel_number_vote_disagreement"),
+            "rhs_number_vote_disagreement": probe.get("rhs_number_vote_disagreement"),
             "self_bleu_disagreement": probe.get("self_bleu_disagreement"),
             "char_jaccard_disagreement": probe.get("char_jaccard_disagreement"),
             "structured_disagreement": probe.get("structured_disagreement"),
