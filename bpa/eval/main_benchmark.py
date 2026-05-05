@@ -177,7 +177,6 @@ def _existing_row_from_problem_output(
             "llm_wall_time",
             "model_wall_time",
             "llm_wall_time_share",
-            "equivalent_llm_tokens",
             "stop_reason",
         ]
     }
@@ -215,8 +214,6 @@ def _existing_row_from_problem_output(
         row["model_wall_time"] = model_wall_time
     if row.get("llm_wall_time_share") is None:
         row["llm_wall_time_share"] = (llm_wall_time / model_wall_time) if model_wall_time else 0.0
-    if row.get("equivalent_llm_tokens") is None:
-        row["equivalent_llm_tokens"] = slm_total * config.slm_to_llm_flop_ratio + llm_total
     if problem.gold_answer is not None:
         predicted = row.get("answer")
         row["correct"] = benchmark_eval_match(predicted, problem.gold_answer, dataset)
@@ -242,7 +239,7 @@ def _step_rows(result):
 
 def write_problem_outputs(root: Path, dataset: str, variant: str, problem, result, config: BPAConfig) -> None:
     problem_root = root / dataset / variant / str(problem.problem_id)
-    write_json(problem_root / f"{problem.problem_id}.problem.json", {"raw": problem.raw, **result_summary(result, config.slm_to_llm_flop_ratio)})
+    write_json(problem_root / f"{problem.problem_id}.problem.json", {"raw": problem.raw, **result_summary(result)})
     step_rows = [
         {"problem_id": problem.problem_id, "question_id": problem.question_id, **row}
         for row in _step_rows(result)
@@ -298,7 +295,7 @@ def main() -> None:
         if problem.gold_answer is not None:
             predicted = result.answer if args.dataset in MATH_DATASETS else result.state.assistant_prefix_text
             result.correct = benchmark_eval_match(predicted, problem.gold_answer, args.dataset)
-        summary = result_summary(result, config.slm_to_llm_flop_ratio)
+        summary = result_summary(result)
         summary.update(
             {
                 "dataset": args.dataset,

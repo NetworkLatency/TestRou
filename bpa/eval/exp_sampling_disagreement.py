@@ -10,6 +10,7 @@ from typing import Any
 from tqdm import tqdm
 
 from bpa.config import BPAConfig
+from bpa.context_budget import ContextBudgetExceeded, generation_budget_for_rendered
 from bpa.engines import init_engines, logprob_value
 from bpa.eval.benchmark_eval import benchmark_eval_match
 from bpa.eval.datasets import EvalProblem, load_eval_dataset
@@ -21,8 +22,7 @@ from bpa.eval.sampling_disagreement import (
     extract_structured_signature,
     rollout_disagreement_metrics,
 )
-from bpa.phase_machine import CLOSE_THINK_TAG, check_and_transition_phase
-from bpa.pipeline import FinalStopDecision, FinalStopState, _is_eos_finish, _slm_generate_step
+from bpa.pipeline import _is_eos_finish, _slm_generate_step
 from bpa.render import render_for_continuation
 from bpa.safety import ensure_step_terminator, extract_answer, update_strict_step_repetition
 from bpa.state import GenerationState, Phase, RepetitionState, TraceEvent
@@ -37,8 +37,6 @@ PROBLEM_SUMMARY_FIELDS = [
     "correct",
     "num_boundaries",
     "num_initial_probes",
-    "num_thinking_boundaries",
-    "num_final_answer_boundaries",
     "mean_structured_disagreement",
     "max_structured_disagreement",
     "mean_operation_vote_disagreement",
@@ -89,6 +87,7 @@ def _completion_mean_logprob(completion: Any) -> float | None:
 def _sample_probe_rollouts(
     state: GenerationState,
     slm,
+    config: BPAConfig,
     probe_k: int,
     probe_temperature: float,
     probe_max_tokens: int,
@@ -96,8 +95,9 @@ def _sample_probe_rollouts(
 ) -> tuple[dict[str, Any], dict[str, float | int]]:
     tokenizer = slm.ensure_tokenizer()
     rendered = render_for_continuation(state.problem_text, state.assistant_prefix_text, tokenizer)
+    max_tokens, prompt_tokens = generation_budget_for_rendered(rendered, slm, config, probe_max_tokens)
     sampling = slm.sampling_params(
-        max_tokens=probe_max_tokens,
+        max_tokens=max_tokens,
         temperature=probe_temperature,
         stop=[probe_stop],
         include_stop_str_in_output=True,
@@ -152,13 +152,13 @@ def _sample_probe_rollouts(
     row = {
         "assistant_prefix_text": state.assistant_prefix_text,
         "prefix_char_len": len(state.assistant_prefix_text),
-        "prefix_token_len": len(slm.encode(rendered)),
+        "prefix_token_len": prompt_tokens,
         "rollouts": rollouts,
         **metrics,
     }
     cost = {
         "probe_decode_tokens": probe_decode_tokens,
-        "probe_prefill_tokens": len(slm.encode(rendered)),
+        "probe_prefill_tokens": prompt_tokens,
         "probe_generate_calls": 1,
         "probe_wall_time": probe_wall_time,
     }
@@ -190,7 +190,6 @@ def run_sampling_disagreement(
 
     state = GenerationState(problem_text=problem_text, generation_protocol="slm_sampling_disagreement")
     rep = RepetitionState()
-    final_stop = FinalStopState()
     start_time = time.time()
     step_logs: list[dict[str, Any]] = []
     probe_rows: list[dict[str, Any]] = []
@@ -204,22 +203,27 @@ def run_sampling_disagreement(
 
     while state.phase != Phase.DONE:
         if state.slm_decode_tokens >= config.max_total_tokens:
-            state.trace.append(TraceEvent(state.step_count, "budget_exhausted_total", {}))
-            state.stop_reason = "budget"
+            state.trace.append(TraceEvent(state.step_count, "total_token_budget_exhausted", {}))
+            state.stop_reason = "total_token_budget"
             break
 
-        phase_before_step = state.phase
-        probe_row, cost = _sample_probe_rollouts(
-            state,
-            slm,
-            probe_k=probe_k,
-            probe_temperature=probe_temperature,
-            probe_max_tokens=probe_max_tokens,
-            probe_stop=probe_stop,
-        )
+        try:
+            probe_row, cost = _sample_probe_rollouts(
+                state,
+                slm,
+                config,
+                probe_k=probe_k,
+                probe_temperature=probe_temperature,
+                probe_max_tokens=probe_max_tokens,
+                probe_stop=probe_stop,
+            )
+        except ContextBudgetExceeded as exc:
+            state.phase = Phase.DONE
+            state.stop_reason = "context_budget"
+            state.trace.append(TraceEvent(state.step_count, "context_budget_exhausted", exc.to_trace_data()))
+            break
         is_initial_probe = len(state.assistant_prefix_text) == 0
         probe_row["boundary_idx"] = -1 if is_initial_probe else boundary_idx
-        probe_row["phase_before_step"] = phase_before_step.value
         probe_row["target_step_idx"] = state.step_count
         probe_row["is_initial_probe"] = is_initial_probe
         if not is_initial_probe:
@@ -228,32 +232,17 @@ def run_sampling_disagreement(
             probe_cost[key] += cost[key]
 
         decode_tokens_before = state.slm_decode_tokens
-        step_text, finish = _slm_generate_step(state, slm, config)
+        try:
+            step_text, finish = _slm_generate_step(state, slm, config)
+        except ContextBudgetExceeded as exc:
+            state.phase = Phase.DONE
+            state.stop_reason = "context_budget"
+            state.trace.append(TraceEvent(state.step_count, "context_budget_exhausted", exc.to_trace_data()))
+            break
         step_text_normalized = ensure_step_terminator(step_text, finish)
         generated_step_tokens = state.slm_decode_tokens - decode_tokens_before
-        final_decision: FinalStopDecision | None = None
-
-        if phase_before_step == Phase.FINAL_ANSWER:
-            final_decision = final_stop.observe(step_text_normalized, finish, generated_step_tokens, config)
-
-        if final_decision is None or final_decision.append_step:
-            state.assistant_prefix_text += step_text_normalized
+        state.assistant_prefix_text += step_text_normalized
         state.step_count += 1
-
-        if final_decision is None or final_decision.append_step:
-            check_and_transition_phase(state, step_text_normalized)
-
-        if phase_before_step == Phase.FINAL_ANSWER and final_decision is not None and final_decision.stop_reason is not None:
-            state.phase = Phase.DONE
-            state.stop_reason = final_decision.stop_reason
-            if final_decision.signal is not None:
-                state.trace.append(
-                    TraceEvent(
-                        state.step_count,
-                        final_decision.signal,
-                        final_decision.event_data or {},
-                    )
-                )
 
         probe_row["main_step_text"] = step_text_normalized
         probe_row["main_step_finish_reason"] = finish
@@ -265,28 +254,24 @@ def run_sampling_disagreement(
             "generation_source": "slm",
             "finish_reason": finish,
             "step_text": step_text_normalized,
-            "phase_after": state.phase.value,
+            "generated_step_tokens": generated_step_tokens,
         }
-        if final_decision is not None and final_decision.signal is not None:
-            log_row["final_stop_signal"] = final_decision.signal
         step_logs.append(log_row)
 
-        if state.phase == Phase.THINKING:
-            trigger = update_strict_step_repetition(rep, step_text_normalized)
-            if trigger is not None:
-                state.assistant_prefix_text += CLOSE_THINK_TAG + "\n\n"
-                state.has_seen_close_think = True
-                state.phase = Phase.FINAL_ANSWER
-                state.trace.append(
-                    TraceEvent(
-                        state.step_count,
-                        "thinking_repetition_force_close",
-                        {"trigger_reason": trigger},
-                    )
-                )
-                rep = RepetitionState()
+        if generated_step_tokens <= 0 and not step_text_normalized.strip():
+            state.phase = Phase.DONE
+            state.stop_reason = "empty_step"
+            state.trace.append(TraceEvent(state.step_count, "empty_step", {}))
+            break
 
-        if _is_eos_finish(finish) and phase_before_step != Phase.FINAL_ANSWER:
+        trigger = update_strict_step_repetition(rep, step_text_normalized)
+        if trigger is not None:
+            state.phase = Phase.DONE
+            state.stop_reason = trigger
+            state.trace.append(TraceEvent(state.step_count, "step_repetition_stop", {"trigger_reason": trigger}))
+            break
+
+        if _is_eos_finish(finish):
             state.phase = Phase.DONE
             state.stop_reason = "eos"
 
@@ -312,8 +297,6 @@ def build_problem_summary(
         result.correct = correct
     real_probe_rows = [row for row in probe_rows if int(row.get("boundary_idx", -1)) >= 0 and not row.get("is_initial_probe")]
     num_initial_probes = sum(1 for row in probe_rows if row.get("is_initial_probe") or int(row.get("boundary_idx", 0)) < 0)
-    num_thinking_boundaries = sum(1 for row in real_probe_rows if row.get("phase_before_step") == Phase.THINKING.value)
-    num_final_answer_boundaries = sum(1 for row in real_probe_rows if row.get("phase_before_step") == Phase.FINAL_ANSWER.value)
 
     return {
         "problem_id": problem.problem_id,
@@ -323,8 +306,6 @@ def build_problem_summary(
         "correct": correct,
         "num_boundaries": len(real_probe_rows),
         "num_initial_probes": num_initial_probes,
-        "num_thinking_boundaries": num_thinking_boundaries,
-        "num_final_answer_boundaries": num_final_answer_boundaries,
         "mean_structured_disagreement": _mean([row.get("structured_disagreement") for row in real_probe_rows]),
         "max_structured_disagreement": _max([row.get("structured_disagreement") for row in real_probe_rows]),
         "mean_operation_vote_disagreement": _mean([row.get("operation_vote_disagreement") for row in real_probe_rows]),

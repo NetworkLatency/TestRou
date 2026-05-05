@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-import re
 import time
-from dataclasses import dataclass
 
 from .cascade.l0 import l0_filter
 from .config import BPAConfig
+from .context_budget import ContextBudgetExceeded, generation_budget_for_rendered
 from .engines import finish_reason, generated_text, generated_token_ids
-from .phase_machine import CLOSE_THINK_TAG, check_and_transition_phase
 from .render import render_for_continuation
-from .safety import clean_latex_answer, ensure_step_terminator, extract_answer, extract_last_boxed, update_repetition, update_strict_step_repetition
+from .safety import ensure_step_terminator, extract_answer, update_strict_step_repetition
 from .state import CascadeResult, Decision, GenerationState, Phase, RepetitionState, TraceEvent
 from .trace import BPAResult
 
@@ -30,8 +28,11 @@ def _generate_step_with_engine(state: GenerationState, engine, config: BPAConfig
         state.assistant_prefix_text + prefix_extension,
         engine.ensure_tokenizer(),
     )
+    remaining_total_tokens = max(config.max_total_tokens - state.slm_decode_tokens - state.llm_decode_tokens, 1)
+    requested_step_tokens = min(config.max_step_tokens, remaining_total_tokens)
+    max_tokens, prompt_tokens = generation_budget_for_rendered(rendered, engine, config, requested_step_tokens)
     sampling = engine.sampling_params(
-        max_tokens=config.max_step_tokens,
+        max_tokens=max_tokens,
         temperature=0.0,
         stop=["\n\n"],
         include_stop_str_in_output=True,
@@ -45,11 +46,11 @@ def _generate_step_with_engine(state: GenerationState, engine, config: BPAConfig
         state.slm_generate_calls += 1
         state.slm_wall_time += generate_wall_time
         state.slm_decode_tokens += token_count
-        state.slm_prefill_tokens += len(engine.encode(rendered))
+        state.slm_prefill_tokens += prompt_tokens
     else:
         state.llm_generation_wall_time += generate_wall_time
         state.llm_decode_tokens += token_count
-        state.llm_prefill_tokens += len(engine.encode(rendered))
+        state.llm_prefill_tokens += prompt_tokens
         state.llm_full_calls += 1
     return generated_text(out), finish_reason(out)
 
@@ -72,107 +73,8 @@ def generate_one_step(state: GenerationState, slm, llm, config: BPAConfig, casca
     raise ValueError(f"Unknown cascade decision: {cascade.decision}")
 
 
-def _ends_with_chunk_stop(text: str, stops: list[str]) -> bool:
-    return any(text.endswith(stop) for stop in stops)
-
-
-def llm_generate_final_with_rep_guard(state: GenerationState, llm, config: BPAConfig) -> tuple[str, str]:
-    rep = RepetitionState()
-    accumulated_text = ""
-    accumulated_tokens = 0
-    chunk_stops = [".\n", "!\n", "?\n", "\n\n"]
-
-    while accumulated_tokens < config.final_answer_max_tokens:
-        rendered = render_for_continuation(
-            state.problem_text,
-            state.assistant_prefix_text + accumulated_text,
-            llm.ensure_tokenizer(),
-        )
-        remaining = config.final_answer_max_tokens - accumulated_tokens
-        sampling = llm.sampling_params(
-            max_tokens=min(remaining, config.final_answer_chunk_tokens),
-            temperature=0.0,
-            stop=chunk_stops,
-            include_stop_str_in_output=True,
-        )
-        generate_start = time.time()
-        out = llm.generate(rendered, sampling)[0]
-        state.llm_generation_wall_time += time.time() - generate_start
-        chunk_text = generated_text(out)
-        chunk_tokens = len(generated_token_ids(out))
-        chunk_finish = finish_reason(out)
-
-        state.llm_decode_tokens += chunk_tokens
-        state.llm_prefill_tokens += len(llm.encode(rendered))
-        state.llm_full_calls += 1
-
-        accumulated_text += chunk_text
-        accumulated_tokens += chunk_tokens
-
-        if chunk_finish == "eos" or (chunk_finish == "stop" and not _ends_with_chunk_stop(chunk_text, chunk_stops)):
-            return accumulated_text, "eos"
-
-        trigger = update_repetition(
-            rep,
-            chunk_text,
-            config.repetition_ngram_size,
-            config.repetition_ngram_threshold,
-        )
-        if trigger is not None:
-            return accumulated_text, "repetition"
-
-        if not chunk_text or chunk_tokens == 0:
-            return accumulated_text, "empty_chunk"
-
-    return accumulated_text, "max_tokens"
-
-
-def _normalized_step_for_duplicate(step_text: str) -> str:
-    return step_text.rstrip()
-
-
 def _is_eos_finish(finish: str) -> bool:
     return finish in EOS_FINISH_REASONS
-
-
-def _extract_final_answer_candidate(step_text: str) -> str | None:
-    boxed = extract_last_boxed(step_text)
-    if boxed is not None:
-        return clean_latex_answer(boxed)
-    return extract_answer(step_text)
-
-
-def _has_final_answer_marker(step_text: str) -> bool:
-    lower = step_text.lower()
-    if "final answer" in lower:
-        return True
-    if re.search(r"\banswer\s*:", lower):
-        return True
-    if re.search(r"\bthe\s+answer\s+is\b", lower):
-        return True
-    if re.search(r"\btherefore\b[\s\S]{0,120}\\boxed", lower):
-        return True
-    return False
-
-
-def _looks_like_restart_after_answer(step_text: str) -> bool:
-    lower = step_text.lstrip().lower()
-    if not lower:
-        return False
-    restart_prefixes = (
-        "step-by-step",
-        "step by step",
-        "let's solve",
-        "lets solve",
-        "we need",
-        "first,",
-        "first ",
-        "to solve",
-        "solution:",
-        "reasoning",
-        "we start",
-    )
-    return lower.startswith(restart_prefixes)
 
 
 def _generation_source(cascade: CascadeResult) -> str:
@@ -181,144 +83,35 @@ def _generation_source(cascade: CascadeResult) -> str:
     return "slm"
 
 
-@dataclass
-class FinalStopDecision:
-    stop_reason: str | None = None
-    append_step: bool = True
-    signal: str | None = None
-    event_data: dict | None = None
-
-
-@dataclass
-class FinalStopState:
-    previous_step: str | None = None
-    previous_candidate: str | None = None
-    candidate_repeat_count: int = 0
-    candidate_marker_seen: bool = False
-    seen_marked_candidate: str | None = None
-    final_steps: int = 0
-    final_tokens: int = 0
-
-    def observe(self, step_text: str, finish: str, generated_tokens: int, config: BPAConfig) -> FinalStopDecision:
-        self.final_steps += 1
-        self.final_tokens += max(generated_tokens, 0)
-
-        normalized_step = _normalized_step_for_duplicate(step_text)
-        candidate = _extract_final_answer_candidate(step_text)
-        has_marker = _has_final_answer_marker(step_text)
-
-        if candidate is not None and candidate == self.previous_candidate:
-            self.candidate_repeat_count += 1
-            self.candidate_marker_seen = self.candidate_marker_seen or has_marker
-        elif candidate is not None:
-            self.candidate_repeat_count = 1
-            self.candidate_marker_seen = has_marker
-        else:
-            self.candidate_repeat_count = 0
-            self.candidate_marker_seen = False
-
-        if candidate is not None and has_marker:
-            self.seen_marked_candidate = candidate
-
-        decision = FinalStopDecision(event_data={"finish_reason": finish})
-
-        if _is_eos_finish(finish):
-            decision.stop_reason = "final_eos"
-            decision.signal = "final_eos"
-        elif self.previous_step is not None and normalized_step == self.previous_step:
-            decision.stop_reason = "final_duplicate_step"
-            decision.signal = "final_duplicate_step"
-            decision.event_data = {"step_text": normalized_step[:200]}
-        elif (
-            candidate is not None
-            and self.candidate_repeat_count >= config.final_answer_stability_repeats
-            and self.candidate_marker_seen
-        ):
-            decision.stop_reason = "final_answer_stable"
-            decision.signal = "final_answer_stable"
-            decision.event_data = {
-                "answer_candidate": candidate,
-                "repeat_count": self.candidate_repeat_count,
-            }
-        elif (
-            self.seen_marked_candidate is not None
-            and _looks_like_restart_after_answer(step_text)
-            and candidate != self.seen_marked_candidate
-        ):
-            decision.stop_reason = "final_restarted_after_answer"
-            decision.signal = "final_restarted_after_answer"
-            decision.append_step = False
-            decision.event_data = {
-                "previous_answer_candidate": self.seen_marked_candidate,
-                "restart_preview": normalized_step[:200],
-            }
-        elif self.final_steps >= config.max_final_steps:
-            decision.stop_reason = "final_step_budget"
-            decision.signal = "final_step_budget"
-            decision.event_data = {"final_steps": self.final_steps}
-        elif self.final_tokens >= config.max_final_tokens:
-            decision.stop_reason = "final_token_budget"
-            decision.signal = "final_token_budget"
-            decision.event_data = {"final_tokens": self.final_tokens}
-
-        self.previous_step = normalized_step
-        self.previous_candidate = candidate
-        return decision
-
-
 def bpa_solve(problem_text: str, slm, llm, config: BPAConfig) -> BPAResult:
     state = GenerationState(problem_text=problem_text)
     rep = RepetitionState()
-    final_stop = FinalStopState()
     start_time = time.time()
     step_logs: list[dict] = []
 
     while state.phase != Phase.DONE:
         if state.slm_decode_tokens + state.llm_decode_tokens >= config.max_total_tokens:
-            state.trace.append(TraceEvent(state.step_count, "budget_exhausted_total", {}))
-            state.stop_reason = "budget"
+            state.trace.append(TraceEvent(state.step_count, "total_token_budget_exhausted", {}))
+            state.stop_reason = "total_token_budget"
             break
 
-        phase_before_step = state.phase
-
-        if state.phase == Phase.FINAL_ANSWER and config.final_answer_mode == "llm_chunked":
-            final_text, final_stop_reason = llm_generate_final_with_rep_guard(state, llm, config)
-            state.assistant_prefix_text += final_text
+        try:
+            cascade = run_cascade(state, slm, llm, config)
+            if state.slm_decode_tokens + state.llm_decode_tokens >= config.max_total_tokens:
+                state.trace.append(TraceEvent(state.step_count, "total_token_budget_exhausted", {}))
+                state.stop_reason = "total_token_budget"
+                break
+            decode_tokens_before = state.slm_decode_tokens + state.llm_decode_tokens
+            step_text, finish = generate_one_step(state, slm, llm, config, cascade)
+        except ContextBudgetExceeded as exc:
             state.phase = Phase.DONE
-            state.stop_reason = f"final_{final_stop_reason}"
-            if final_stop_reason == "repetition":
-                state.trace.append(TraceEvent(state.step_count, "final_answer_stopped_by_repetition", {}))
+            state.stop_reason = "context_budget"
+            state.trace.append(TraceEvent(state.step_count, "context_budget_exhausted", exc.to_trace_data()))
             break
-
-        cascade = run_cascade(state, slm, llm, config)
-        decode_tokens_before = state.slm_decode_tokens + state.llm_decode_tokens
-        step_text, finish = generate_one_step(state, slm, llm, config, cascade)
         step_text_normalized = ensure_step_terminator(step_text, finish)
         generated_step_tokens = state.slm_decode_tokens + state.llm_decode_tokens - decode_tokens_before
-        final_decision: FinalStopDecision | None = None
-
-        if phase_before_step == Phase.FINAL_ANSWER:
-            final_decision = final_stop.observe(step_text_normalized, finish, generated_step_tokens, config)
-
-        if final_decision is None or final_decision.append_step:
-            state.assistant_prefix_text += step_text_normalized
+        state.assistant_prefix_text += step_text_normalized
         state.step_count += 1
-
-        if final_decision is None or final_decision.append_step:
-            check_and_transition_phase(state, step_text_normalized)
-
-        if phase_before_step == Phase.FINAL_ANSWER:
-            if final_decision is not None and final_decision.stop_reason is not None:
-                state.phase = Phase.DONE
-                state.stop_reason = final_decision.stop_reason
-                if final_decision.signal is not None:
-                    state.trace.append(
-                        TraceEvent(
-                            state.step_count,
-                            final_decision.signal,
-                            final_decision.event_data or {},
-                        )
-                    )
 
         log_row = {
             "step_idx": state.step_count - 1,
@@ -326,28 +119,24 @@ def bpa_solve(problem_text: str, slm, llm, config: BPAConfig) -> BPAResult:
             "generation_source": _generation_source(cascade),
             "finish_reason": finish,
             "step_text": step_text_normalized,
-            "phase_after": state.phase.value,
+            "generated_step_tokens": generated_step_tokens,
         }
-        if final_decision is not None and final_decision.signal is not None:
-            log_row["final_stop_signal"] = final_decision.signal
         step_logs.append(log_row)
 
-        if state.phase == Phase.THINKING:
-            trigger = update_strict_step_repetition(rep, step_text_normalized)
-            if trigger is not None:
-                state.assistant_prefix_text += CLOSE_THINK_TAG + "\n\n"
-                state.has_seen_close_think = True
-                state.phase = Phase.FINAL_ANSWER
-                state.trace.append(
-                    TraceEvent(
-                        state.step_count,
-                        "thinking_repetition_force_close",
-                        {"trigger_reason": trigger},
-                    )
-                )
-                rep = RepetitionState()
+        if generated_step_tokens <= 0 and not step_text_normalized.strip():
+            state.phase = Phase.DONE
+            state.stop_reason = "empty_step"
+            state.trace.append(TraceEvent(state.step_count, "empty_step", {}))
+            break
 
-        if _is_eos_finish(finish) and phase_before_step != Phase.FINAL_ANSWER:
+        trigger = update_strict_step_repetition(rep, step_text_normalized)
+        if trigger is not None:
+            state.phase = Phase.DONE
+            state.stop_reason = trigger
+            state.trace.append(TraceEvent(state.step_count, "step_repetition_stop", {"trigger_reason": trigger}))
+            break
+
+        if _is_eos_finish(finish):
             state.phase = Phase.DONE
             state.stop_reason = "eos"
 
@@ -363,7 +152,14 @@ def solve_engine_only(problem_text: str, engine, config: BPAConfig, account: str
     state = GenerationState(problem_text=problem_text, generation_protocol="oneshot")
     start_time = time.time()
     rendered = render_for_continuation(problem_text, "", engine.ensure_tokenizer())
-    sampling = engine.sampling_params(max_tokens=config.max_total_tokens, temperature=0.0)
+    try:
+        max_tokens, prompt_tokens = generation_budget_for_rendered(rendered, engine, config, config.max_total_tokens)
+    except ContextBudgetExceeded as exc:
+        state.phase = Phase.DONE
+        state.stop_reason = "context_budget"
+        state.trace.append(TraceEvent(state.step_count, "context_budget_exhausted", exc.to_trace_data()))
+        return BPAResult(answer=None, state=state, total_wall_time=time.time() - start_time)
+    sampling = engine.sampling_params(max_tokens=max_tokens, temperature=0.0)
     generate_start = time.time()
     out = engine.generate(rendered, sampling)[0]
     generate_wall_time = time.time() - generate_start
@@ -373,11 +169,11 @@ def solve_engine_only(problem_text: str, engine, config: BPAConfig, account: str
         state.slm_generate_calls += 1
         state.slm_wall_time += generate_wall_time
         state.slm_decode_tokens += token_count
-        state.slm_prefill_tokens += len(engine.encode(rendered))
+        state.slm_prefill_tokens += prompt_tokens
     else:
         state.llm_generation_wall_time += generate_wall_time
         state.llm_decode_tokens += token_count
-        state.llm_prefill_tokens += len(engine.encode(rendered))
+        state.llm_prefill_tokens += prompt_tokens
         state.llm_full_calls += 1
     state.assistant_prefix_text = text
     state.phase = Phase.DONE

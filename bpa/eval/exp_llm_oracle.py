@@ -66,7 +66,7 @@ def main() -> None:
         if problem.gold_answer is not None:
             correct = benchmark_eval_match(result.answer, problem.gold_answer, args.dataset)
             result.correct = correct
-        summary = result_summary(result, config.slm_to_llm_flop_ratio)
+        summary = result_summary(result)
         summary_rows.append(
             {
                 "dataset": args.dataset,

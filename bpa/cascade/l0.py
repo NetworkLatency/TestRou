@@ -6,9 +6,15 @@ import time
 import numpy as np
 
 from bpa.config import BPAConfig
+from bpa.context_budget import generation_budget_for_rendered
 from bpa.engines import completion_logprobs, generated_token_ids, logprob_value
 from bpa.render import render_for_continuation
 from bpa.state import GenerationState, L0Result
+
+
+GLIMPROUTER_HINIT_TOPK = 10
+GLIMPROUTER_HINIT_MARGIN_THRESH = 0.4
+GLIMPROUTER_HINIT_ENTROPY_THRESH = 0.5
 
 
 def classify_first_char(token_str: str) -> str:
@@ -57,21 +63,22 @@ def _top_logprobs_from_output(output) -> dict[int, float]:
 
 def l0_filter(state: GenerationState, slm, config: BPAConfig) -> L0Result:
     rendered = render_for_continuation(state.problem_text, state.assistant_prefix_text, slm.ensure_tokenizer())
-    sampling = slm.sampling_params(max_tokens=1, temperature=0.0, logprobs=config.l0_topk)
+    max_tokens, prompt_tokens = generation_budget_for_rendered(rendered, slm, config, 1)
+    sampling = slm.sampling_params(max_tokens=max_tokens, temperature=0.0, logprobs=GLIMPROUTER_HINIT_TOPK)
     generate_start = time.time()
     out = slm.generate(rendered, sampling)[0]
     state.slm_wall_time += time.time() - generate_start
     state.slm_generate_calls += 1
     token_ids = generated_token_ids(out)
     state.slm_decode_tokens += len(token_ids) or 1
-    state.slm_prefill_tokens += len(slm.encode(rendered))
+    state.slm_prefill_tokens += prompt_tokens
 
     top_logprobs = _top_logprobs_from_output(out)
     h_init, margin = entropy_and_margin(top_logprobs)
     sorted_ids = [tok_id for tok_id, _ in sorted(top_logprobs.items(), key=lambda kv: kv[1], reverse=True)]
     top_token_strs = [slm.decode([tok_id]) for tok_id in sorted_ids]
     first_char_class = classify_first_char(top_token_strs[0] if top_token_strs else "")
-    passed = (margin < config.l0_margin_thresh) or (h_init > config.l0_entropy_thresh)
+    passed = (margin < GLIMPROUTER_HINIT_MARGIN_THRESH) or (h_init > GLIMPROUTER_HINIT_ENTROPY_THRESH)
     return L0Result(
         passed=passed,
         h_init=h_init,

@@ -45,7 +45,6 @@ from bpa.eval.sampling_disagreement import (
     score_variance,
     self_bleu_disagreement,
 )
-from bpa.phase_machine import check_and_transition_phase, detect_close_think
 from bpa.pipeline import bpa_solve
 from bpa.render import render_for_continuation
 from bpa.safety import clean_latex_answer, ensure_step_terminator, extract_answer, update_repetition, update_strict_step_repetition
@@ -185,16 +184,6 @@ class EmptyAssistantRejectingTokenizer(FakeTokenizer):
 
 
 class CoreTests(unittest.TestCase):
-    def test_detect_close_think_cross_boundary(self):
-        found, rel = detect_close_think("abc</thi", "nk>tail")
-        self.assertTrue(found)
-        self.assertEqual(rel, -5)
-
-        state = GenerationState(problem_text="p", assistant_prefix_text="abc</think>tail")
-        check_and_transition_phase(state, "nk>tail")
-        self.assertEqual(state.assistant_prefix_text, "abc</think>")
-        self.assertTrue(state.has_seen_close_think)
-
     def test_render_empty_prefix_uses_generation_prompt(self):
         tok = EmptyAssistantRejectingTokenizer()
         self.assertEqual(render_for_continuation("p", "", tok), "USER:p\nASSISTANT:")
@@ -314,7 +303,6 @@ class CoreTests(unittest.TestCase):
                 "llm_prefill_tokens": 4,
                 "llm_scoring_calls": 5,
                 "llm_full_calls": 6,
-                "equivalent_llm_tokens": 7.5,
                 "stop_reason": "final_eos",
             }
             (problem_root / "7.problem.json").write_text(json.dumps(saved), encoding="utf-8")
@@ -393,9 +381,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(probes[0]["prefix_char_len"], 0)
         self.assertEqual(probes[1]["boundary_idx"], 0)
         self.assertFalse(probes[1]["is_initial_probe"])
-        self.assertEqual(probes[1]["phase_before_step"], "thinking")
         self.assertEqual(probes[2]["boundary_idx"], 1)
-        self.assertEqual(probes[2]["phase_before_step"], "final_answer")
         self.assertAlmostEqual(probes[0]["structured_disagreement"], 0.25)
         self.assertEqual(probe_cost["probe_generate_calls"], 3)
 
@@ -403,8 +389,8 @@ class CoreTests(unittest.TestCase):
         summary = build_problem_summary(problem, result, probes, probe_cost, "math500")
         self.assertEqual(summary["num_boundaries"], 2)
         self.assertEqual(summary["num_initial_probes"], 1)
-        self.assertEqual(summary["num_thinking_boundaries"], 1)
-        self.assertEqual(summary["num_final_answer_boundaries"], 1)
+        self.assertNotIn("num_thinking_boundaries", summary)
+        self.assertNotIn("num_final_answer_boundaries", summary)
         enriched = enrich_probe_rows(problem, probes, result, "math500")
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = Path(tmp) / "sampling"
@@ -461,6 +447,7 @@ class CoreTests(unittest.TestCase):
             problem_summary={"1": {"correct": False, "final_answer": "2"}},
             oracle_summary={"1": {"llm_correct": True, "llm_answer": "1"}},
             llm=llm,
+            config=BPAConfig(),
             boundaries_per_problem=1,
             continuation_max_tokens=64,
         )
@@ -524,7 +511,6 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(boundaries[0]["boundary_idx"], -1)
         self.assertFalse(boundaries[0]["routed_to_llm"])
         self.assertTrue(boundaries[1]["routed_to_llm"])
-        self.assertEqual(boundaries[2]["phase_before_step"], "final_answer")
         self.assertFalse(boundaries[2]["routed_to_llm"])
         self.assertEqual(probe_cost["probe_generate_calls"], 3)
 
@@ -543,90 +529,46 @@ class CoreTests(unittest.TestCase):
                 0.25,
             )
 
-    def test_routed_final_continues_router_after_close_think(self):
+    def test_unified_stepwise_continues_after_close_think(self):
         slm = SequencedEngine([("</think>\n\n", "stop"), ("The answer is 42.", "eos")])
         llm = SequencedEngine(fail_on_generate=True)
-        result = bpa_solve("p", slm, llm, BPAConfig(final_answer_mode="routed", max_total_tokens=200))
-        self.assertEqual(result.state.stop_reason, "final_eos")
+        result = bpa_solve("p", slm, llm, BPAConfig(max_total_tokens=200))
+        self.assertEqual(result.state.stop_reason, "eos")
         self.assertEqual(llm.generate_calls, 0)
         self.assertIn("The answer is 42.", result.state.assistant_prefix_text)
 
-    def test_routed_final_does_not_use_ngram_repetition_guard(self):
+    def test_unified_does_not_stop_on_internal_ngram_repetition(self):
         repeated_phrase = "alpha alpha alpha alpha alpha alpha alpha alpha.\n\n"
         slm = SequencedEngine(
             [
-                ("</think>\n\n", "stop"),
                 (repeated_phrase, "stop"),
                 ("Different final step.", "eos"),
             ]
         )
         llm = SequencedEngine(fail_on_generate=True)
-        result = bpa_solve("p", slm, llm, BPAConfig(final_answer_mode="routed", max_total_tokens=300))
-        self.assertEqual(result.state.stop_reason, "final_eos")
+        result = bpa_solve("p", slm, llm, BPAConfig(max_total_tokens=300))
+        self.assertEqual(result.state.stop_reason, "eos")
         self.assertIn("Different final step.", result.state.assistant_prefix_text)
-        self.assertFalse(any(event.event == "final_answer_stopped_by_repetition" for event in result.state.trace))
+        self.assertFalse(any(event.event == "step_repetition_stop" for event in result.state.trace))
 
-    def test_routed_final_stops_on_duplicate_final_step(self):
+    def test_unified_stops_on_duplicate_step(self):
         slm = SequencedEngine(
             [
-                ("</think>\n\n", "stop"),
                 ("Same final step.\n\n", "stop"),
                 ("Same final step.", "stop"),
             ]
         )
         llm = SequencedEngine(fail_on_generate=True)
-        result = bpa_solve("p", slm, llm, BPAConfig(final_answer_mode="routed", max_total_tokens=300))
-        self.assertEqual(result.state.stop_reason, "final_duplicate_step")
-        self.assertTrue(any(event.event == "final_duplicate_step" for event in result.state.trace))
+        result = bpa_solve("p", slm, llm, BPAConfig(max_total_tokens=300))
+        self.assertEqual(result.state.stop_reason, "duplicate_step")
+        self.assertTrue(any(event.event == "step_repetition_stop" for event in result.state.trace))
 
-    def test_routed_final_stops_on_stable_answer_candidate(self):
-        slm = SequencedEngine(
-            [
-                ("</think>\n\n", "stop"),
-                (r"**Final Answer:** \(\boxed{225}\)" + "\n\n", "stop"),
-                (r"\boxed{225}" + "\n\n", "stop"),
-            ]
-        )
+    def test_unified_context_budget_stops_before_generation(self):
+        slm = SequencedEngine(fail_on_generate=True)
         llm = SequencedEngine(fail_on_generate=True)
-        result = bpa_solve("p", slm, llm, BPAConfig(final_answer_mode="routed", max_total_tokens=300))
-        self.assertEqual(result.state.stop_reason, "final_answer_stable")
-        self.assertEqual(result.answer, "225")
-
-    def test_routed_final_does_not_stop_on_repeated_intermediate_box_without_marker(self):
-        slm = SequencedEngine(
-            [
-                ("</think>\n\n", "stop"),
-                (r"We compute \boxed{1} as an intermediate value." + "\n\n", "stop"),
-                (r"Again \boxed{1} appears while checking." + "\n\n", "stop"),
-                (r"**Final Answer:** \(\boxed{2}\)", "eos"),
-            ]
-        )
-        llm = SequencedEngine(fail_on_generate=True)
-        result = bpa_solve("p", slm, llm, BPAConfig(final_answer_mode="routed", max_total_tokens=400))
-        self.assertEqual(result.state.stop_reason, "final_eos")
-        self.assertEqual(result.answer, "2")
-
-    def test_routed_final_stops_and_discards_restart_after_marked_answer(self):
-        slm = SequencedEngine(
-            [
-                ("</think>\n\n", "stop"),
-                (r"**Final Answer:** \(\boxed{225}\)" + "\n\n", "stop"),
-                (r"Step-by-step explanation: First compute \boxed{1}." + "\n\n", "stop"),
-            ]
-        )
-        llm = SequencedEngine(fail_on_generate=True)
-        result = bpa_solve("p", slm, llm, BPAConfig(final_answer_mode="routed", max_total_tokens=400))
-        self.assertEqual(result.state.stop_reason, "final_restarted_after_answer")
-        self.assertEqual(result.answer, "225")
-        self.assertNotIn("Step-by-step explanation", result.state.assistant_prefix_text)
-
-    def test_llm_chunked_final_mode_keeps_legacy_final_generator(self):
-        slm = SequencedEngine([("</think>\n\n", "stop")])
-        llm = SequencedEngine([("LLM final.", "eos")])
-        result = bpa_solve("p", slm, llm, BPAConfig(final_answer_mode="llm_chunked", max_total_tokens=200))
-        self.assertEqual(result.state.stop_reason, "final_eos")
-        self.assertEqual(llm.generate_calls, 1)
-        self.assertIn("LLM final.", result.state.assistant_prefix_text)
+        result = bpa_solve("long prompt", slm, llm, BPAConfig(max_model_len=8, max_total_tokens=100))
+        self.assertEqual(result.state.stop_reason, "context_budget")
+        self.assertEqual(slm.generate_calls, 0)
 
 
 if __name__ == "__main__":

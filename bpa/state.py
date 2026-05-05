@@ -7,8 +7,7 @@ from typing import Any
 
 
 class Phase(Enum):
-    THINKING = "thinking"
-    FINAL_ANSWER = "final_answer"
+    RUNNING = "running"
     DONE = "done"
 
 
@@ -29,8 +28,7 @@ class GenerationState:
     problem_text: str
     assistant_prefix_text: str = ""
     generation_protocol: str = "routed_stepwise"
-    phase: Phase = Phase.THINKING
-    has_seen_close_think: bool = False
+    phase: Phase = Phase.RUNNING
     step_count: int = 0
     slm_decode_tokens: int = 0
     slm_prefill_tokens: int = 0

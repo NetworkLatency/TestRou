@@ -11,6 +11,7 @@ from typing import Any
 from tqdm import tqdm
 
 from bpa.config import BPAConfig
+from bpa.context_budget import ContextBudgetExceeded, generation_budget_for_rendered
 from bpa.engines import finish_reason, generated_text, generated_token_ids, init_engines
 from bpa.eval.benchmark_eval import benchmark_eval_match
 from bpa.eval.datasets import EvalProblem, load_eval_dataset
@@ -128,10 +129,23 @@ def continue_boundary_with_llm(
     problem_text: str,
     assistant_prefix_text: str,
     llm,
+    config: BPAConfig,
     max_tokens: int,
 ) -> dict[str, Any]:
     rendered = render_for_continuation(problem_text, assistant_prefix_text, llm.ensure_tokenizer())
-    sampling = llm.sampling_params(max_tokens=max_tokens, temperature=0.0)
+    try:
+        generation_max_tokens, prompt_tokens = generation_budget_for_rendered(rendered, llm, config, max_tokens)
+    except ContextBudgetExceeded as exc:
+        return {
+            "continuation_text": "",
+            "full_text": assistant_prefix_text,
+            "answer": extract_answer(assistant_prefix_text),
+            "finish_reason": "context_budget",
+            "wall_time": 0.0,
+            "decode_tokens": 0,
+            "prefill_tokens": exc.prompt_tokens,
+        }
+    sampling = llm.sampling_params(max_tokens=generation_max_tokens, temperature=0.0)
     generate_start = time.time()
     out = llm.generate(rendered, sampling)[0]
     wall_time = time.time() - generate_start
@@ -144,7 +158,7 @@ def continue_boundary_with_llm(
         "finish_reason": finish_reason(out),
         "wall_time": wall_time,
         "decode_tokens": len(generated_token_ids(out)),
-        "prefill_tokens": len(llm.encode(rendered)),
+        "prefill_tokens": prompt_tokens,
     }
 
 
@@ -173,6 +187,7 @@ def build_boundary_label_rows(
     problem_summary: dict[str, dict[str, Any]],
     oracle_summary: dict[str, dict[str, Any]],
     llm,
+    config: BPAConfig,
     boundaries_per_problem: int,
     continuation_max_tokens: int,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -198,6 +213,7 @@ def build_boundary_label_rows(
             problem.problem_text,
             str(probe.get("assistant_prefix_text") or ""),
             llm,
+            config,
             max_tokens=continuation_max_tokens,
         )
         llm_continuation_correct = None
@@ -299,6 +315,7 @@ def main() -> None:
         problem_summary=problem_summary,
         oracle_summary=oracle_summary,
         llm=llm,
+        config=config,
         boundaries_per_problem=args.boundaries_per_problem,
         continuation_max_tokens=args.continuation_max_tokens,
     )

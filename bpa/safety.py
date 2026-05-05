@@ -3,8 +3,10 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from .phase_machine import CLOSE_THINK_TAG
 from .state import RepetitionState
+
+
+CLOSE_THINK_TAG = "</think>"
 
 
 def ensure_step_terminator(step_text: str, finish_reason: str) -> str:

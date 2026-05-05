@@ -11,12 +11,12 @@ import numpy as np
 from tqdm import tqdm
 
 from bpa.config import BPAConfig
+from bpa.context_budget import ContextBudgetExceeded
 from bpa.engines import init_engines
 from bpa.eval.benchmark_eval import benchmark_eval_match
 from bpa.eval.datasets import load_eval_dataset
 from bpa.eval.exp_sampling_disagreement import _max, _mean, _sample_probe_rollouts
-from bpa.phase_machine import CLOSE_THINK_TAG, check_and_transition_phase
-from bpa.pipeline import FinalStopDecision, FinalStopState, _is_eos_finish, _llm_generate_step, _slm_generate_step
+from bpa.pipeline import _is_eos_finish, _llm_generate_step, _slm_generate_step
 from bpa.safety import ensure_step_terminator, extract_answer, update_strict_step_repetition
 from bpa.state import GenerationState, Phase, RepetitionState, TraceEvent
 from bpa.trace import BPAResult, json_safe
@@ -121,7 +121,6 @@ def run_disagreement_routing(
 ) -> tuple[BPAResult, list[dict[str, Any]], dict[str, float | int]]:
     state = GenerationState(problem_text=problem_text, generation_protocol="disagreement_top_quantile_routing")
     rep = RepetitionState()
-    final_stop = FinalStopState()
     start_time = time.time()
     step_logs: list[dict[str, Any]] = []
     boundary_rows: list[dict[str, Any]] = []
@@ -135,24 +134,29 @@ def run_disagreement_routing(
 
     while state.phase != Phase.DONE:
         if state.slm_decode_tokens + state.llm_decode_tokens >= config.max_total_tokens:
-            state.trace.append(TraceEvent(state.step_count, "budget_exhausted_total", {}))
-            state.stop_reason = "budget"
+            state.trace.append(TraceEvent(state.step_count, "total_token_budget_exhausted", {}))
+            state.stop_reason = "total_token_budget"
             break
 
-        phase_before_step = state.phase
         route_to_llm = False
         metric_value = None
-        probe_row, cost = _sample_probe_rollouts(
-            state,
-            slm,
-            probe_k=probe_k,
-            probe_temperature=probe_temperature,
-            probe_max_tokens=probe_max_tokens,
-            probe_stop=probe_stop,
-        )
+        try:
+            probe_row, cost = _sample_probe_rollouts(
+                state,
+                slm,
+                config,
+                probe_k=probe_k,
+                probe_temperature=probe_temperature,
+                probe_max_tokens=probe_max_tokens,
+                probe_stop=probe_stop,
+            )
+        except ContextBudgetExceeded as exc:
+            state.phase = Phase.DONE
+            state.stop_reason = "context_budget"
+            state.trace.append(TraceEvent(state.step_count, "context_budget_exhausted", exc.to_trace_data()))
+            break
         is_initial_probe = len(state.assistant_prefix_text) == 0
         probe_row["boundary_idx"] = -1 if is_initial_probe else boundary_idx
-        probe_row["phase_before_step"] = phase_before_step.value
         probe_row["target_step_idx"] = state.step_count
         probe_row["is_initial_probe"] = is_initial_probe
         if not is_initial_probe:
@@ -163,29 +167,20 @@ def run_disagreement_routing(
         route_to_llm = (not is_initial_probe) and metric_value is not None and float(metric_value) >= threshold
 
         decode_tokens_before = state.slm_decode_tokens + state.llm_decode_tokens
-        if route_to_llm:
-            step_text, finish = _llm_generate_step(state, llm, config)
-        else:
-            step_text, finish = _slm_generate_step(state, slm, config)
+        try:
+            if route_to_llm:
+                step_text, finish = _llm_generate_step(state, llm, config)
+            else:
+                step_text, finish = _slm_generate_step(state, slm, config)
+        except ContextBudgetExceeded as exc:
+            state.phase = Phase.DONE
+            state.stop_reason = "context_budget"
+            state.trace.append(TraceEvent(state.step_count, "context_budget_exhausted", exc.to_trace_data()))
+            break
         step_text_normalized = ensure_step_terminator(step_text, finish)
         generated_step_tokens = state.slm_decode_tokens + state.llm_decode_tokens - decode_tokens_before
-        final_decision: FinalStopDecision | None = None
-
-        if phase_before_step == Phase.FINAL_ANSWER:
-            final_decision = final_stop.observe(step_text_normalized, finish, generated_step_tokens, config)
-
-        if final_decision is None or final_decision.append_step:
-            state.assistant_prefix_text += step_text_normalized
+        state.assistant_prefix_text += step_text_normalized
         state.step_count += 1
-
-        if final_decision is None or final_decision.append_step:
-            check_and_transition_phase(state, step_text_normalized)
-
-        if phase_before_step == Phase.FINAL_ANSWER and final_decision is not None and final_decision.stop_reason is not None:
-            state.phase = Phase.DONE
-            state.stop_reason = final_decision.stop_reason
-            if final_decision.signal is not None:
-                state.trace.append(TraceEvent(state.step_count, final_decision.signal, final_decision.event_data or {}))
 
         probe_row["metric"] = metric
         probe_row["metric_value"] = metric_value
@@ -201,25 +196,27 @@ def run_disagreement_routing(
             "generation_source": "llm" if route_to_llm else "slm",
             "finish_reason": finish,
             "step_text": step_text_normalized,
-            "phase_after": state.phase.value,
+            "generated_step_tokens": generated_step_tokens,
             "metric": metric if metric_value is not None else None,
             "metric_value": metric_value,
             "threshold": threshold if metric_value is not None else None,
         }
-        if final_decision is not None and final_decision.signal is not None:
-            log_row["final_stop_signal"] = final_decision.signal
         step_logs.append(log_row)
 
-        if state.phase == Phase.THINKING:
-            trigger = update_strict_step_repetition(rep, step_text_normalized)
-            if trigger is not None:
-                state.assistant_prefix_text += CLOSE_THINK_TAG + "\n\n"
-                state.has_seen_close_think = True
-                state.phase = Phase.FINAL_ANSWER
-                state.trace.append(TraceEvent(state.step_count, "thinking_repetition_force_close", {"trigger_reason": trigger}))
-                rep = RepetitionState()
+        if generated_step_tokens <= 0 and not step_text_normalized.strip():
+            state.phase = Phase.DONE
+            state.stop_reason = "empty_step"
+            state.trace.append(TraceEvent(state.step_count, "empty_step", {}))
+            break
 
-        if _is_eos_finish(finish) and phase_before_step != Phase.FINAL_ANSWER:
+        trigger = update_strict_step_repetition(rep, step_text_normalized)
+        if trigger is not None:
+            state.phase = Phase.DONE
+            state.stop_reason = trigger
+            state.trace.append(TraceEvent(state.step_count, "step_repetition_stop", {"trigger_reason": trigger}))
+            break
+
+        if _is_eos_finish(finish):
             state.phase = Phase.DONE
             state.stop_reason = "eos"
 
