@@ -45,6 +45,7 @@ from bpa.eval.sampling_disagreement import (
     score_variance,
     self_bleu_disagreement,
 )
+from bpa.engines import ModelEngine, completion_logprobs, generated_text, generated_token_ids
 from bpa.pipeline import bpa_solve
 from bpa.render import render_for_continuation
 from bpa.safety import clean_latex_answer, ensure_step_terminator, extract_answer, update_repetition, update_strict_step_repetition
@@ -205,6 +206,43 @@ class CoreTests(unittest.TestCase):
         h, margin = entropy_and_margin({1: 0.0, 2: math.log(0.5)})
         self.assertGreater(h, 0.0)
         self.assertGreater(margin, 0.0)
+
+    def test_openai_backend_wraps_completion_like_vllm_output(self):
+        engine = ModelEngine(
+            name="llm",
+            model_path="Qwen3-14B",
+            backend="openai",
+            api_base_url="http://192.168.3.13:8080/v1",
+            api_model="Qwen3-14B",
+        )
+        engine.tokenizer = FakeTokenizer()
+        sampling = engine.sampling_params(
+            max_tokens=8,
+            temperature=0.0,
+            stop=["\n\n"],
+            include_stop_str_in_output=True,
+            logprobs=1,
+        )
+        kwargs = engine._openai_completion_kwargs(sampling)
+        self.assertEqual(kwargs["max_tokens"], 8)
+        self.assertEqual(kwargs["logprobs"], 1)
+        self.assertTrue(kwargs["extra_body"]["include_stop_str_in_output"])
+
+        completion = engine._openai_choice_to_completion(
+            Obj(
+                text="AB",
+                finish_reason="stop",
+                logprobs=Obj(
+                    tokens=["A", "B"],
+                    token_logprobs=[-0.1, -0.2],
+                    top_logprobs=[{"A": -0.1}, {"B": -0.2}],
+                ),
+            )
+        )
+        output = Obj(outputs=[completion])
+        self.assertEqual(generated_text(output), "AB")
+        self.assertEqual(generated_token_ids(output), [ord("A"), ord("B")])
+        self.assertAlmostEqual(completion_logprobs(output)[0][ord("A")].logprob, -0.1)
 
     def test_structured_signature_priority(self):
         self.assertEqual(extract_structured_signature(r"final \boxed{42}")["signature"], "boxed:42")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 from transformers import AutoTokenizer
@@ -32,6 +33,10 @@ class ModelEngine:
     name: str
     model_path: str
     tokenizer_path: str | None = None
+    backend: str = "vllm"
+    api_base_url: str | None = None
+    api_key: str = "EMPTY"
+    api_model: str | None = None
     engine_kwargs: dict[str, Any] = field(default_factory=dict)
     cuda_visible_devices: str | None = None
     llm: Any | None = None
@@ -45,6 +50,19 @@ class ModelEngine:
                 use_fast=True,
             )
         if self.llm is None:
+            if self.backend == "openai":
+                if not self.api_base_url:
+                    raise RuntimeError(f"OpenAI-compatible backend for {self.name!r} requires api_base_url.")
+                try:
+                    from openai import OpenAI
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "The openai package is required for remote OpenAI-compatible vLLM endpoints. "
+                        "Install it on the experiment host."
+                    ) from exc
+                self.llm = OpenAI(api_key=self.api_key, base_url=self.api_base_url)
+                return self
+
             try:
                 from vllm import LLM
             except ImportError as exc:
@@ -84,6 +102,8 @@ class ModelEngine:
         )
 
     def sampling_params(self, **kwargs: Any) -> Any:
+        if self.backend == "openai":
+            return dict(kwargs)
         try:
             from vllm import SamplingParams
         except ImportError as exc:
@@ -99,9 +119,13 @@ class ModelEngine:
 
     def generate(self, prompts: Any, sampling_params: Any) -> Any:
         self.load()
+        if self.backend == "openai":
+            return self._generate_openai(prompts, sampling_params)
         return self.llm.generate(prompts, sampling_params)
 
     def reset_prefix_cache(self) -> bool:
+        if self.backend == "openai":
+            return True
         if self.llm is None:
             return True
         reset = getattr(self.llm, "reset_prefix_cache", None)
@@ -133,6 +157,106 @@ class ModelEngine:
             pass
         return ok
 
+    def _generate_openai(self, prompts: Any, sampling_params: Any) -> list[Any]:
+        prompt_list = prompts if isinstance(prompts, list) else [prompts]
+        return [self._generate_openai_one(prompt, sampling_params) for prompt in prompt_list]
+
+    def _generate_openai_one(self, prompt: Any, sampling_params: Any) -> Any:
+        prompt_text = self._prompt_to_text(prompt)
+        kwargs = self._openai_completion_kwargs(sampling_params)
+        response = self.llm.completions.create(
+            model=self.api_model or self.model_path,
+            prompt=prompt_text,
+            **kwargs,
+        )
+        choices = sorted(list(getattr(response, "choices", []) or []), key=lambda choice: getattr(choice, "index", 0))
+        return SimpleNamespace(outputs=[self._openai_choice_to_completion(choice) for choice in choices])
+
+    def _prompt_to_text(self, prompt: Any) -> str:
+        if isinstance(prompt, str):
+            return prompt
+        if isinstance(prompt, dict) and "prompt_token_ids" in prompt:
+            return self.decode(list(prompt["prompt_token_ids"]))
+        token_ids = getattr(prompt, "prompt_token_ids", None)
+        if token_ids is not None:
+            return self.decode(list(token_ids))
+        return str(prompt)
+
+    @staticmethod
+    def _sampling_value(sampling_params: Any, key: str, default: Any = None) -> Any:
+        if isinstance(sampling_params, dict):
+            return sampling_params.get(key, default)
+        return getattr(sampling_params, key, default)
+
+    def _openai_completion_kwargs(self, sampling_params: Any) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {}
+        passthrough = (
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "n",
+            "stop",
+            "presence_penalty",
+            "frequency_penalty",
+            "seed",
+        )
+        for key in passthrough:
+            value = self._sampling_value(sampling_params, key)
+            if value is not None:
+                kwargs[key] = value
+
+        logprobs = self._sampling_value(sampling_params, "logprobs")
+        if logprobs is not None:
+            kwargs["logprobs"] = int(logprobs)
+
+        extra_body: dict[str, Any] = {}
+        include_stop = self._sampling_value(sampling_params, "include_stop_str_in_output")
+        if include_stop is not None:
+            extra_body["include_stop_str_in_output"] = bool(include_stop)
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+        return kwargs
+
+    def _openai_choice_to_completion(self, choice: Any) -> Any:
+        text = str(getattr(choice, "text", "") or "")
+        token_ids, logprob_steps = self._openai_logprobs_to_vllm_shape(getattr(choice, "logprobs", None), text)
+        return SimpleNamespace(
+            text=text,
+            token_ids=token_ids,
+            finish_reason=str(getattr(choice, "finish_reason", "") or ""),
+            logprobs=logprob_steps,
+        )
+
+    def _token_id_for_openai_token(self, token: str) -> int:
+        token_ids = self.encode(token)
+        if not token_ids:
+            return 0
+        return int(token_ids[0])
+
+    def _openai_logprobs_to_vllm_shape(self, logprobs: Any, text: str) -> tuple[list[int], list[dict[int, Any]]]:
+        if logprobs is None:
+            return self.encode(text), []
+
+        tokens = list(getattr(logprobs, "tokens", None) or [])
+        token_logprobs = list(getattr(logprobs, "token_logprobs", None) or [])
+        top_logprobs = list(getattr(logprobs, "top_logprobs", None) or [])
+        if not tokens:
+            return self.encode(text), []
+
+        token_ids: list[int] = []
+        logprob_steps: list[dict[int, Any]] = []
+        for idx, token in enumerate(tokens):
+            token_id = self._token_id_for_openai_token(str(token))
+            token_ids.append(token_id)
+            step: dict[int, Any] = {}
+            if idx < len(top_logprobs) and top_logprobs[idx]:
+                for top_token, logprob in dict(top_logprobs[idx]).items():
+                    step[self._token_id_for_openai_token(str(top_token))] = SimpleNamespace(logprob=float(logprob))
+            if idx < len(token_logprobs) and token_logprobs[idx] is not None:
+                step.setdefault(token_id, SimpleNamespace(logprob=float(token_logprobs[idx])))
+            logprob_steps.append(step)
+        return token_ids, logprob_steps
+
 
 def _engine_kwargs(config: BPAConfig, specific: dict[str, Any]) -> dict[str, Any]:
     kwargs = {
@@ -149,6 +273,10 @@ def init_engines(config: BPAConfig) -> tuple[ModelEngine, ModelEngine]:
         name="slm",
         model_path=config.slm_model_path,
         tokenizer_path=config.slm_tokenizer_path,
+        backend="openai" if config.slm_api_base_url else config.slm_backend,
+        api_base_url=config.slm_api_base_url,
+        api_key=config.slm_api_key,
+        api_model=config.slm_api_model,
         engine_kwargs=_engine_kwargs(config, config.slm_engine_kwargs),
         cuda_visible_devices=config.slm_device,
     )
@@ -156,6 +284,10 @@ def init_engines(config: BPAConfig) -> tuple[ModelEngine, ModelEngine]:
         name="llm",
         model_path=config.llm_model_path,
         tokenizer_path=config.llm_tokenizer_path,
+        backend="openai" if config.llm_api_base_url else config.llm_backend,
+        api_base_url=config.llm_api_base_url,
+        api_key=config.llm_api_key,
+        api_model=config.llm_api_model,
         engine_kwargs=_engine_kwargs(config, config.llm_engine_kwargs),
         cuda_visible_devices=config.llm_device,
     )

@@ -27,12 +27,29 @@ Edit `configs/bpa_default.json` before running experiments:
 {
   "slm_model_path": "/path/to/DeepSeek-R1-Distill-Qwen-1.5B",
   "llm_model_path": "/path/to/Qwen-or-DeepSeek-target-model",
+  "slm_backend": "vllm",
+  "llm_backend": "vllm",
   "dataset_paths": {
     "math500": "data/math500.jsonl",
     "aime24": "data/aime24.jsonl"
   }
 }
 ```
+
+By default both models are loaded in-process with `vllm.LLM`. To use a target model served by an OpenAI-compatible vLLM server, set the LLM backend fields:
+
+```json
+{
+  "llm_model_path": "Qwen3-14B",
+  "llm_tokenizer_path": "/path/to/local/Qwen3-14B-tokenizer-or-model",
+  "llm_backend": "openai",
+  "llm_api_base_url": "http://192.168.3.13:8080/v1",
+  "llm_api_key": "EMPTY",
+  "llm_api_model": "Qwen3-14B"
+}
+```
+
+`llm_api_model` must match the model name exposed by the remote vLLM server. `llm_tokenizer_path` should point to a local tokenizer so the experiment host can render chat templates and estimate context length without network access. Setting `llm_api_base_url` is enough to switch the LLM engine to the OpenAI-compatible backend; leaving it `null` keeps local vLLM loading.
 
 Supported local dataset formats: `.jsonl`, `.json`, `.csv`, `.tsv`, `.parquet`.
 

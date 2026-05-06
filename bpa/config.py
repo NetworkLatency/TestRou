@@ -13,6 +13,14 @@ class BPAConfig:
     llm_model_path: str = "Qwen-32B"
     slm_tokenizer_path: str | None = None
     llm_tokenizer_path: str | None = None
+    slm_backend: str = "vllm"
+    llm_backend: str = "vllm"
+    slm_api_base_url: str | None = None
+    llm_api_base_url: str | None = None
+    slm_api_key: str = "EMPTY"
+    llm_api_key: str = "EMPTY"
+    slm_api_model: str | None = None
+    llm_api_model: str | None = None
     output_dir: str = "bpa_results"
     dataset_paths: dict[str, str] = field(default_factory=dict)
     system_prompt: str | None = None
@@ -37,6 +45,10 @@ class BPAConfig:
             raise ValueError("max_total_tokens must be >= 1")
         if self.max_step_tokens < 1:
             raise ValueError("max_step_tokens must be >= 1")
+        for name in ("slm_backend", "llm_backend"):
+            backend = getattr(self, name)
+            if backend not in {"vllm", "openai"}:
+                raise ValueError(f"{name} must be 'vllm' or 'openai', got {backend!r}")
 
     @classmethod
     def from_json(cls, path: str | Path) -> "BPAConfig":
