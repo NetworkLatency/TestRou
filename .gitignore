@@ -10,4 +10,8 @@ data/lcbv5/
 data/lcbv6/
 nohup*.out
 server/vllm_logs
+<<<<<<< HEAD
 bpa_results
+=======
+router_result
+>>>>>>> 3ff25b6bb3eef1bd778e590d2c7a88b46bc8b7d3
