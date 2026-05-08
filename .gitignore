@@ -9,3 +9,4 @@ data/lcbv5/
 data/lcbv6/
 nohup*.out
 server/vllm_logs
+router_result

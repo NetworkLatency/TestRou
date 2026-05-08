@@ -247,7 +247,7 @@ def generate_dashboard(logs_path, save_to, small_accuracy=None, large_accuracy=N
 
 def main():
     parser = argparse.ArgumentParser(description="Generate FA-Routing diagnostic dashboard.")
-    parser.add_argument("--logs_path", help="Output directory or a .steps.jsonl/.problem.json file",default="router_result/aime25")
+    parser.add_argument("--logs_path", help="Output directory or a .steps.jsonl/.problem.json file",default="router_result/gpqa")
     parser.add_argument("--save_to", default="fa_dashboard.png", help="Dashboard image path")
     parser.add_argument("--small_accuracy", type=float, default=None, help="Optional A_S horizontal line")
     parser.add_argument("--large_accuracy", type=float, default=None, help="Optional A_L horizontal line")

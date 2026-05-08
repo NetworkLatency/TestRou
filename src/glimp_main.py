@@ -1,5 +1,5 @@
 import argparse
-from glimp_router_timing_full import glimprouter
+from glimp_router import glimprouter
 from datasets import load_dataset
 import os
 from tqdm import tqdm
@@ -46,8 +46,8 @@ def get_dataset(dataset_name):
         options = "math"
     elif dataset_name == "gpqa":
         dataset = load_dataset(
-            "parquet",
-            data_files="data/gpqa.parquet",  # NOTE: change to the directory of your GPQA dataset, e.g. "../data/gpqa/gpqa_diamond_test.jsonl"
+            'json',
+            data_files="YOUR_DIRECTORY_OF_GPQA_DATASET",  # NOTE: change to the directory of your GPQA dataset, e.g. "../data/gpqa/gpqa_diamond_test.jsonl"
             split="train",
         )
         options = "gpqa"
@@ -86,41 +86,6 @@ def extract_answer(result, options):
     return s
 
 
-def summarize_timing_from_result(result):
-    stats = {
-        "routing_glimpse_ms": 0.0,
-        "small_model_time_ms": 0.0,
-        "switch_time_ms": 0.0,
-        "large_model_time_ms": 0.0,
-        "small_model_steps": 0,
-        "large_model_steps": 0,
-    }
-
-    for step in result:
-        glimpse_ms = float(step.get("t_glimpse_ms", 0.0) or 0.0)
-        step_ms = float(step.get("t_step_generation_ms", 0.0) or 0.0)
-        prefill_ms = float(step.get("t_handoff_prefill_ms", 0.0) or 0.0)
-        generator = step.get("generator")
-
-        stats["routing_glimpse_ms"] += glimpse_ms
-
-        if generator == "SLM":
-            stats["small_model_time_ms"] += step_ms
-            stats["small_model_steps"] += 1
-        elif generator == "LLM":
-            stats["switch_time_ms"] += prefill_ms
-            stats["large_model_time_ms"] += max(0.0, step_ms - prefill_ms)
-            stats["large_model_steps"] += 1
-
-    stats["measured_total_ms"] = (
-        stats["routing_glimpse_ms"]
-        + stats["small_model_time_ms"]
-        + stats["switch_time_ms"]
-        + stats["large_model_time_ms"]
-    )
-    return stats
-
-
 def main(args):
     print(f"Args:")
     pprint(vars(args))
@@ -145,11 +110,6 @@ def main(args):
 
     answers = {}
     generation_time = []
-    timing_breakdown = []
-    total_routing_glimpse_ms = 0.0
-    total_small_model_ms = 0.0
-    total_switch_ms = 0.0
-    total_large_model_ms = 0.0
     max_problems = args.max_problems if args.max_problems is not None and args.max_problems > 0 else None
     total_problems = min(len(dataset), max_problems) if max_problems is not None else len(dataset)
     # Generate answers and record timing per problem.
@@ -181,21 +141,6 @@ def main(args):
             )
             e_time = time.time()
 
-            wall_time_ms = (e_time - s_time) * 1000
-            timing_stats = summarize_timing_from_result(result)
-            timing_stats.update({
-                "problem_id": problem_id,
-                "repeat_id": repeat_id,
-                "wall_time_ms": wall_time_ms,
-                "other_overhead_ms": max(0.0, wall_time_ms - timing_stats["measured_total_ms"]),
-            })
-            timing_breakdown.append(timing_stats)
-
-            total_routing_glimpse_ms += timing_stats["routing_glimpse_ms"]
-            total_small_model_ms += timing_stats["small_model_time_ms"]
-            total_switch_ms += timing_stats["switch_time_ms"]
-            total_large_model_ms += timing_stats["large_model_time_ms"]
-
             answer_repeat.append({'answer': extract_answer(result, options), 'id': problem_id, "question_id": problem.get("question_id", "")})
             time_repeat.append(e_time - s_time)
         answers[problem_id] = answer_repeat
@@ -214,63 +159,6 @@ def main(args):
             json.dump(item, f, ensure_ascii=False, indent=4)
     
     print(f"Total Time: {sum(generation_time)}; Avg Time: {sum(generation_time)/len(generation_time)}")
-
-    total_wall_time_ms = sum(generation_time) * 1000
-    total_measured_ms = (
-        total_routing_glimpse_ms
-        + total_small_model_ms
-        + total_switch_ms
-        + total_large_model_ms
-    )
-    total_other_overhead_ms = max(0.0, total_wall_time_ms - total_measured_ms)
-
-    print("\n" + "=" * 80)
-    print("Timing Breakdown")
-    print("=" * 80)
-    print(f"Total Wall Time              : {total_wall_time_ms / 1000:.4f} s")
-    print(f"Routing / Glimpse Time       : {total_routing_glimpse_ms / 1000:.4f} s")
-    print(f"Small Model Generation Time  : {total_small_model_ms / 1000:.4f} s")
-    print(f"Switch Time                  : {total_switch_ms / 1000:.4f} s")
-    print(f"Large Model Generation Time  : {total_large_model_ms / 1000:.4f} s")
-    print(f"Other Python Overhead        : {total_other_overhead_ms / 1000:.4f} s")
-    print("-" * 80)
-
-    if total_measured_ms > 0:
-        print(f"Routing / Glimpse Ratio      : {total_routing_glimpse_ms / total_measured_ms:.2%}")
-        print(f"Small Model Time Ratio       : {total_small_model_ms / total_measured_ms:.2%}")
-        print(f"Switch Time Ratio            : {total_switch_ms / total_measured_ms:.2%}")
-        print(f"Large Model Time Ratio       : {total_large_model_ms / total_measured_ms:.2%}")
-
-    llm_total_ms = total_switch_ms + total_large_model_ms
-    if llm_total_ms > 0:
-        print(f"Switch / LLM Total Ratio     : {total_switch_ms / llm_total_ms:.2%}")
-
-    timing_output = {
-        "summary": {
-            "total_wall_time_ms": total_wall_time_ms,
-            "routing_glimpse_ms": total_routing_glimpse_ms,
-            "small_model_time_ms": total_small_model_ms,
-            "switch_time_ms": total_switch_ms,
-            "large_model_time_ms": total_large_model_ms,
-            "other_overhead_ms": total_other_overhead_ms,
-            "switch_ratio_in_llm_time": (
-                total_switch_ms / (total_switch_ms + total_large_model_ms)
-                if (total_switch_ms + total_large_model_ms) > 0 else 0.0
-            ),
-            "switch_ratio_in_measured_time": (
-                total_switch_ms / total_measured_ms if total_measured_ms > 0 else 0.0
-            ),
-        },
-        "details": timing_breakdown,
-    }
-
-    output_dir = os.path.join(args.output_dir, args.dataset_name)
-    os.makedirs(output_dir, exist_ok=True)
-    timing_output_file = os.path.join(output_dir, "timing_breakdown.json")
-    with open(timing_output_file, "w", encoding="utf-8") as f:
-        json.dump(timing_output, f, ensure_ascii=False, indent=4)
-
-    print(f"\nTiming breakdown saved to: {timing_output_file}")
 
     if args.generate_dashboard:
         try:
