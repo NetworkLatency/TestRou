@@ -212,6 +212,23 @@ P(critical | disagreement quantile) is mostly monotonic increasing
 
 ## 8. Top-20% Routing Sanity Check
 
+To route with the stricter 4-sample majority rule, reuse the best agreed SLM rollout instead of generating a fresh SLM step:
+
+```bash
+python -m bpa.eval.exp_disagreement_routing \
+  --config configs/bpa_default.json \
+  --dataset math500 \
+  --max-problems 50 \
+  --routing-mode majority \
+  --agreement-signature-key signature \
+  --min-agreement-count 3 \
+  --probe-k 4 \
+  --probe-temperature 0.7 \
+  --probe-max-tokens 32
+```
+
+With `--probe-k 4 --min-agreement-count 3`, a 3/4 or 4/4 signature majority stays on SLM and appends the rollout in that majority group with the highest `mean_logprob`; a 2/4 split routes the step to the LLM. The initial empty assistant prefix is still generated normally; this rule applies after a reasoning boundary exists.
+
 If the phenomenon holds, run a simple top-20% disagreement routing check:
 
 ```bash

@@ -174,6 +174,34 @@ class SamplingProbeEngine(SequencedEngine):
         return super().generate(prompts, sampling_params)
 
 
+class WeightedSamplingProbeEngine(SequencedEngine):
+    def __init__(self, outputs=None, probe_outputs=None):
+        super().__init__(outputs)
+        self.probe_outputs = list(probe_outputs or [])
+
+    def generate(self, prompts, sampling_params):
+        if sampling_params.get("n"):
+            self.generate_calls += 1
+            k = int(sampling_params["n"])
+            if len(self.probe_outputs) < k:
+                raise AssertionError("no queued probe outputs")
+            completions = []
+            for _ in range(k):
+                item = self.probe_outputs.pop(0)
+                text, mean_logprob, finish = item
+                token_ids = list(range(len(text)))
+                completions.append(
+                    Obj(
+                        text=text,
+                        token_ids=token_ids,
+                        finish_reason=finish,
+                        logprobs=[{token_id: Obj(logprob=mean_logprob)} for token_id in token_ids],
+                    )
+                )
+            return [Obj(outputs=completions)]
+        return super().generate(prompts, sampling_params)
+
+
 class EmptyAssistantRejectingTokenizer(FakeTokenizer):
     def apply_chat_template(self, messages, tokenize=False, continue_final_message=True, add_generation_prompt=False):
         if continue_final_message and messages[-1]["role"] == "assistant":
@@ -551,6 +579,80 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(boundaries[1]["routed_to_llm"])
         self.assertFalse(boundaries[2]["routed_to_llm"])
         self.assertEqual(probe_cost["probe_generate_calls"], 3)
+
+    def test_majority_routing_reuses_highest_logprob_probe(self):
+        slm = WeightedSamplingProbeEngine(
+            outputs=[
+                ("First step.\n\n", "stop"),
+            ],
+            probe_outputs=[
+                ("initial a", -0.2, "stop"),
+                ("initial a", -0.2, "stop"),
+                ("initial b", -0.2, "stop"),
+                ("initial c", -0.2, "stop"),
+                (r"low confidence \boxed{1}", -0.4, "stop"),
+                (r"chosen \boxed{1}", -0.05, "eos"),
+                (r"medium \boxed{1}", -0.2, "stop"),
+                (r"wrong \boxed{2}", -0.01, "eos"),
+            ],
+        )
+        llm = SequencedEngine(fail_on_generate=True)
+        result, boundaries, _ = run_disagreement_routing(
+            "Problem: x?",
+            slm,
+            llm,
+            BPAConfig(max_total_tokens=200),
+            routing_mode="majority",
+            agreement_signature_key="signature",
+            min_agreement_count=3,
+            probe_k=4,
+            probe_temperature=0.7,
+            probe_max_tokens=32,
+        )
+        self.assertEqual(result.answer, "1")
+        self.assertEqual(len(boundaries), 2)
+        self.assertFalse(boundaries[0]["reused_probe_rollout"])
+        self.assertTrue(boundaries[1]["reused_probe_rollout"])
+        self.assertFalse(boundaries[1]["routed_to_llm"])
+        self.assertEqual(boundaries[1]["agreement_majority_count"], 3)
+        self.assertEqual(boundaries[1]["selected_rollout_idx"], 1)
+        self.assertIn(r"chosen \boxed{1}", result.state.assistant_prefix_text)
+        self.assertEqual(result.state.slm_generate_calls, 1)
+
+    def test_majority_routing_sends_two_two_split_to_llm(self):
+        slm = WeightedSamplingProbeEngine(
+            outputs=[
+                ("First step.\n\n", "stop"),
+            ],
+            probe_outputs=[
+                ("initial a", -0.2, "stop"),
+                ("initial a", -0.2, "stop"),
+                ("initial b", -0.2, "stop"),
+                ("initial c", -0.2, "stop"),
+                (r"\boxed{1}", -0.1, "stop"),
+                (r"\boxed{1}", -0.1, "stop"),
+                (r"\boxed{2}", -0.1, "stop"),
+                (r"\boxed{2}", -0.1, "stop"),
+            ],
+        )
+        llm = SequencedEngine([(r"\boxed{9}", "eos")])
+        result, boundaries, _ = run_disagreement_routing(
+            "Problem: x?",
+            slm,
+            llm,
+            BPAConfig(max_total_tokens=200),
+            routing_mode="majority",
+            agreement_signature_key="signature",
+            min_agreement_count=3,
+            probe_k=4,
+            probe_temperature=0.7,
+            probe_max_tokens=32,
+        )
+        self.assertEqual(result.answer, "9")
+        self.assertTrue(boundaries[1]["routed_to_llm"])
+        self.assertFalse(boundaries[1]["reused_probe_rollout"])
+        self.assertEqual(boundaries[1]["agreement_majority_count"], 2)
+        self.assertEqual(llm.generate_calls, 1)
 
     def test_threshold_from_probes(self):
         with tempfile.TemporaryDirectory() as tmp:

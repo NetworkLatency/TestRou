@@ -6,6 +6,8 @@
 *.pyc
 __pycache__/
 
+data/
+
 data/lcbv5/
 data/lcbv6/
 nohup*.out
