@@ -15,12 +15,8 @@ from bpa.trace import json_safe
 
 
 DEFAULT_METRICS = [
-    "operation_vote_disagreement",
-    "rhs_number_vote_disagreement",
-    "novel_number_vote_disagreement",
-    "self_bleu_disagreement",
-    "char_jaccard_disagreement",
-    "structured_disagreement",
+    "prefix_consensus_support_count",
+    "prefix_consensus_vote_fraction",
 ]
 
 
@@ -272,7 +268,7 @@ def analyze(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Analyze sampling disagreement distributions and critical-boundary labels.")
+    parser = argparse.ArgumentParser(description="Analyze numeric probe fields and critical-boundary labels.")
     parser.add_argument("--config", required=True, help="Path to BPAConfig JSON.")
     parser.add_argument("--dataset", default="math500", choices=["math500", "aime24", "aime25", "gpqa", "gpqa_diamond"])
     parser.add_argument("--probes-path", default=None)

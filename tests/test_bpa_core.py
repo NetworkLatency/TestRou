@@ -16,7 +16,7 @@ from bpa.eval.exp_boundary_continuation import (
     make_boundary_label,
     select_evenly_spaced,
 )
-from bpa.eval.exp_disagreement_routing import run_disagreement_routing, threshold_from_probes
+from bpa.eval.exp_disagreement_routing import run_disagreement_routing
 from bpa.eval.exp_sampling_disagreement import (
     build_problem_summary,
     enrich_probe_rows,
@@ -30,21 +30,7 @@ from bpa.eval.main_benchmark import (
     write_summary_files,
 )
 from bpa.eval.sampling_disagreement import (
-    char_jaccard_disagreement,
-    compute_vote_disagreement,
-    extract_novel_number_signature,
-    extract_number_signature,
-    extract_operation_signature,
-    extract_rhs_number_signature,
     extract_step_evidence,
-    extract_structured_signature,
-    novel_number_vote_disagreement,
-    number_vote_disagreement,
-    operation_vote_disagreement,
-    rhs_number_vote_disagreement,
-    rollout_disagreement_metrics,
-    score_variance,
-    self_bleu_disagreement,
 )
 from bpa.engines import ModelEngine, completion_logprobs, generated_text, generated_token_ids
 from bpa.pipeline import bpa_solve
@@ -280,64 +266,21 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(generated_token_ids(output), [ord("A"), ord("B")])
         self.assertAlmostEqual(completion_logprobs(output)[0][ord("A")].logprob, -0.1)
 
-    def test_structured_signature_priority(self):
-        self.assertEqual(extract_structured_signature(r"final \boxed{42}")["signature"], "boxed:42")
-        self.assertEqual(extract_structured_signature("Use x + 1 = 3 first.")["signature_type"], "equation")
-        self.assertEqual(extract_structured_signature(r"Take \frac{1}{2} of both sides.")["signature_type"], "number")
-        self.assertEqual(extract_structured_signature("We substitute the value.")["signature"], "operator:substitute")
-        self.assertEqual(extract_structured_signature("No math event here.")["signature"], "none:")
-        self.assertEqual(extract_number_signature("First value is 17.")["signature"], "number:17")
-        self.assertEqual(extract_operation_signature("We simplify the equation.")["signature"], "operator:simplify")
-
-    def test_context_aware_number_signatures(self):
-        context = "Problem: the point is (0, 3)."
-        self.assertEqual(extract_number_signature("Copy (0, 3), then y = 7.")["signature"], "number:0")
-        self.assertEqual(extract_novel_number_signature("Copy (0, 3), then y = 7.", context)["signature"], "number:7")
-        self.assertEqual(extract_rhs_number_signature("Copy (0, 3), then y = 7.", context)["signature"], "number:7")
-
-        texts = ["copy 0 then y = 5", "copy 0 then y = 5", "copy 0 then y = 6", "copy 0 then y = 5"]
-        self.assertAlmostEqual(novel_number_vote_disagreement(texts, "Problem gives 0")["novel_number_vote_disagreement"], 0.25)
-        self.assertAlmostEqual(rhs_number_vote_disagreement(texts, "Problem gives 0")["rhs_number_vote_disagreement"], 0.25)
-
-    def test_vote_disagreement(self):
-        result = compute_vote_disagreement(["a", "a", "a", "b"])
-        self.assertEqual(result["signature_counts"], {"a": 3, "b": 1})
-        self.assertAlmostEqual(result["vote_fraction"], 0.75)
-        self.assertAlmostEqual(result["structured_disagreement"], 0.25)
-
-        result = compute_vote_disagreement(["a", "b", "c", "d"])
-        self.assertAlmostEqual(result["structured_disagreement"], 0.75)
-
-    def test_char_jaccard_disagreement(self):
-        self.assertAlmostEqual(char_jaccard_disagreement(["abc def", "abc def"]), 0.0)
-        self.assertGreater(char_jaccard_disagreement(["abc", "xyz"]), 0.9)
-
-    def test_operation_number_and_self_bleu_metrics(self):
-        texts = ["solve x = 1", "solve x = 1", "calculate x = 2", "solve x = 1"]
-        self.assertAlmostEqual(operation_vote_disagreement(texts)["operation_vote_disagreement"], 0.25)
-        self.assertAlmostEqual(number_vote_disagreement(texts)["number_vote_disagreement"], 0.25)
-        self.assertLess(self_bleu_disagreement(["same tokens", "same tokens"]), 0.1)
-        self.assertGreater(self_bleu_disagreement(["alpha beta", "gamma delta"]), 0.0)
-        metrics = rollout_disagreement_metrics(texts, [-1.0, -1.1, -1.2, -1.0])
-        self.assertIn("operation_vote_disagreement", metrics)
-        self.assertIn("number_vote_disagreement", metrics)
-        self.assertIn("novel_number_vote_disagreement", metrics)
-        self.assertIn("rhs_number_vote_disagreement", metrics)
-        self.assertIn("self_bleu_disagreement", metrics)
-
     def test_step_evidence_splits_numbers_and_intent(self):
         evidence = extract_step_evidence("Now solve x = 3/4.\n\n", "Problem mentions 100.")
         self.assertEqual(evidence["rhs_novel_number"], "rhs_novel_number:3/4")
-        self.assertEqual(evidence["equation_claim"], "equation_claim:Nowsolvex=3/4")
+        self.assertEqual(evidence["equation_claim"], "equation_claim:x=3/4")
         self.assertEqual(evidence["operation_intent"], "operation_intent:solve_equation")
         self.assertIn("rhs_novel_number", evidence["evidence_channels"])
 
+        latex = extract_step_evidence(r"Thus \left(\frac{x}{2}\right) = 7.", "")
+        self.assertEqual(latex["equation_claim"], r"equation_claim:(\frac{x}{2})=7")
+
+        rejected = extract_step_evidence("Set the expression equal to 0.", "")
+        self.assertIsNone(rejected["equation_claim"])
+
         generic = extract_step_evidence("Now we continue.\n\n", "Problem mentions 100.")
         self.assertEqual(generic["evidence_channels"], [])
-
-    def test_score_variance(self):
-        self.assertAlmostEqual(score_variance([-1.0, -2.0, None]), 0.25)
-        self.assertIsNone(score_variance([None, -1.0]))
 
     def test_answer_eval(self):
         self.assertEqual(normalize_math_expr(r"\frac{4}{2}"), "2")
@@ -474,7 +417,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(probes[0]["prefix_char_len"], 0)
         self.assertEqual(probes[1]["boundary_idx"], 0)
         self.assertFalse(probes[1]["is_initial_probe"])
-        self.assertAlmostEqual(probes[0]["structured_disagreement"], 0.25)
+        self.assertIn("rollouts", probes[0])
         self.assertEqual(probe_cost["probe_generate_calls"], 2)
 
         problem = EvalProblem(problem_id=1, question_id="q1", problem_text="Problem: x?", raw={}, gold_answer="1")
@@ -508,13 +451,8 @@ class CoreTests(unittest.TestCase):
             "assistant_prefix_text": "",
             "prefix_char_len": 0,
             "prefix_token_len": 10,
-            "operation_vote_disagreement": 1.0,
-            "number_vote_disagreement": 1.0,
-            "novel_number_vote_disagreement": 1.0,
-            "rhs_number_vote_disagreement": 1.0,
-            "self_bleu_disagreement": 1.0,
-            "char_jaccard_disagreement": 1.0,
-            "structured_disagreement": 1.0,
+            "prefix_consensus_support_count": 0,
+            "prefix_consensus_vote_fraction": None,
         }
         probe = {
             "problem_id": 1,
@@ -523,13 +461,10 @@ class CoreTests(unittest.TestCase):
             "assistant_prefix_text": "Let x be unknown.\n\n",
             "prefix_char_len": 20,
             "prefix_token_len": 20,
-            "operation_vote_disagreement": 0.25,
-            "number_vote_disagreement": 0.75,
-            "novel_number_vote_disagreement": 0.5,
-            "rhs_number_vote_disagreement": 0.5,
-            "self_bleu_disagreement": 0.5,
-            "char_jaccard_disagreement": 0.5,
-            "structured_disagreement": 0.75,
+            "prefix_consensus_channel": "rhs_novel_number",
+            "prefix_consensus_value": "rhs_novel_number:1",
+            "prefix_consensus_support_count": 3,
+            "prefix_consensus_vote_fraction": 0.75,
         }
         llm = SequencedEngine([(r"Thus \boxed{1}", "eos")])
         csv_rows, jsonl_rows = build_boundary_label_rows(
@@ -546,7 +481,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(len(csv_rows), 1)
         self.assertEqual(csv_rows[0]["boundary_idx"], 0)
         self.assertTrue(csv_rows[0]["critical"])
-        self.assertEqual(csv_rows[0]["rhs_number_vote_disagreement"], 0.5)
+        self.assertEqual(csv_rows[0]["prefix_consensus_support_count"], 3)
         self.assertIn("full_text", jsonl_rows[0])
 
     def test_analysis_helpers(self):
@@ -565,7 +500,7 @@ class CoreTests(unittest.TestCase):
             summary = analyze(probes, [], [], 10, Path(tmp) / "analysis_include", include_initial_probe=True)
             self.assertEqual(summary["num_probes"], 2)
 
-    def test_disagreement_routing_fake_problem(self):
+    def test_consensus_routing_fake_problem(self):
         slm = SamplingProbeEngine(
             outputs=[
                 ("Let x = 0.\n\n", "stop"),
@@ -583,8 +518,6 @@ class CoreTests(unittest.TestCase):
             slm,
             llm,
             BPAConfig(max_total_tokens=200),
-            metric="rhs_number_vote_disagreement",
-            threshold=0.5,
             probe_k=4,
             probe_temperature=0.7,
             probe_max_tokens=32,
@@ -614,7 +547,6 @@ class CoreTests(unittest.TestCase):
             slm,
             llm,
             BPAConfig(max_total_tokens=200),
-            routing_mode="prefix_consensus",
             min_agreement_count=3,
             probe_k=4,
             probe_temperature=0.7,
@@ -650,7 +582,6 @@ class CoreTests(unittest.TestCase):
             slm,
             llm,
             BPAConfig(max_total_tokens=200),
-            routing_mode="prefix_consensus",
             min_agreement_count=3,
             probe_k=4,
             probe_temperature=0.7,
@@ -683,7 +614,6 @@ class CoreTests(unittest.TestCase):
             slm,
             llm,
             BPAConfig(max_total_tokens=200, post_stop_lookahead_tokens=4),
-            routing_mode="prefix_consensus",
             min_agreement_count=3,
             probe_k=4,
             probe_temperature=0.7,
@@ -694,21 +624,6 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(len(boundaries), 1)
         self.assertTrue(boundaries[0]["reused_probe_rollout"])
         self.assertEqual(boundaries[0]["main_step_finish_reason"], "eos")
-
-    def test_threshold_from_probes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "probes.jsonl"
-            rows = [
-                {"boundary_idx": -1, "is_initial_probe": True, "rhs_number_vote_disagreement": 1.0},
-                {"boundary_idx": 0, "is_initial_probe": False, "rhs_number_vote_disagreement": 0.0},
-                {"boundary_idx": 1, "is_initial_probe": False, "rhs_number_vote_disagreement": 0.25},
-            ]
-            path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
-            self.assertAlmostEqual(threshold_from_probes(path, "rhs_number_vote_disagreement", 0.5), 0.125)
-            self.assertAlmostEqual(
-                threshold_from_probes(path, "rhs_number_vote_disagreement", 0.5, include_initial_probe=True),
-                0.25,
-            )
 
     def test_unified_stepwise_continues_after_close_think(self):
         slm = SequencedEngine([("</think>\n\n", "stop"), ("The answer is 42.", "eos")])

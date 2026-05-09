@@ -39,13 +39,10 @@ CSV_FIELDS = [
     "continuation_wall_time",
     "continuation_decode_tokens",
     "continuation_prefill_tokens",
-    "operation_vote_disagreement",
-    "number_vote_disagreement",
-    "novel_number_vote_disagreement",
-    "rhs_number_vote_disagreement",
-    "self_bleu_disagreement",
-    "char_jaccard_disagreement",
-    "structured_disagreement",
+    "prefix_consensus_channel",
+    "prefix_consensus_value",
+    "prefix_consensus_support_count",
+    "prefix_consensus_vote_fraction",
 ]
 
 
@@ -246,13 +243,10 @@ def build_boundary_label_rows(
             "continuation_wall_time": continuation["wall_time"],
             "continuation_decode_tokens": continuation["decode_tokens"],
             "continuation_prefill_tokens": continuation["prefill_tokens"],
-            "operation_vote_disagreement": probe.get("operation_vote_disagreement"),
-            "number_vote_disagreement": probe.get("number_vote_disagreement"),
-            "novel_number_vote_disagreement": probe.get("novel_number_vote_disagreement"),
-            "rhs_number_vote_disagreement": probe.get("rhs_number_vote_disagreement"),
-            "self_bleu_disagreement": probe.get("self_bleu_disagreement"),
-            "char_jaccard_disagreement": probe.get("char_jaccard_disagreement"),
-            "structured_disagreement": probe.get("structured_disagreement"),
+            "prefix_consensus_channel": probe.get("prefix_consensus_channel"),
+            "prefix_consensus_value": probe.get("prefix_consensus_value"),
+            "prefix_consensus_support_count": probe.get("prefix_consensus_support_count"),
+            "prefix_consensus_vote_fraction": probe.get("prefix_consensus_vote_fraction"),
         }
         csv_rows.append(base)
         jsonl_rows.append(

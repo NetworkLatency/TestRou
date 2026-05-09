@@ -1,30 +1,10 @@
 from __future__ import annotations
 
-import math
 import re
-from collections import Counter
-from itertools import combinations
 from typing import Any
 
 from bpa.safety import clean_latex_answer, extract_last_boxed
 
-
-OPERATOR_KEYWORDS = (
-    "let",
-    "substitute",
-    "plug",
-    "replace",
-    "solve",
-    "equate",
-    "simplify",
-    "calculate",
-    "compute",
-    "pythagorean",
-    "factor",
-    "expand",
-    "differentiate",
-    "integrate",
-)
 
 EVIDENCE_CHANNEL_PRIORITY = (
     "boxed_answer",
@@ -51,26 +31,69 @@ _LATEX_NUMBER_PATTERNS = (
     re.compile(r"\\sqrt\s*\{?[-+]?\d+(?:\.\d+)?\}?"),
 )
 _PLAIN_NUMBER_PATTERN = re.compile(r"(?<![A-Za-z])[-+]?(?:\d+\s*/\s*\d+|\d+(?:\.\d+)?%?)(?![A-Za-z])")
-_OPERATOR_PATTERN = re.compile(r"\b(" + "|".join(re.escape(k) for k in OPERATOR_KEYWORDS) + r")\b", re.IGNORECASE)
-_BLEU_TOKEN_PATTERN = re.compile(r"\\[A-Za-z]+|[A-Za-z]+|[-+]?\d+(?:\.\d+)?|[^\s]")
+_MATH_BOUNDARY_CHARS = set(" \t\r\n.,;:")
+_MATH_SYMBOL_CHARS = set("+-*/^_()[]{}\\|<>")
 
 
 def _normalize_signature_value(value: str) -> str:
     value = value.strip()
     value = re.sub(r"\s+", " ", value)
-    value = value.strip(" \t\r\n$.,;:")
-    return value
+    return value.strip(" \t\r\n$.,;:")
 
 
-def _signature(signature_type: str, value: str) -> dict[str, str]:
-    normalized = _normalize_signature_value(value)
-    if signature_type == "boxed":
-        normalized = clean_latex_answer(normalized)
-    return {
-        "signature_type": signature_type,
-        "signature_value": normalized,
-        "signature": f"{signature_type}:{normalized}",
-    }
+def _balanced_braces(text: str) -> bool:
+    stack: list[str] = []
+    pairs = {")": "(", "]": "[", "}": "{"}
+    for ch in text:
+        if ch in "([{":
+            stack.append(ch)
+        elif ch in pairs:
+            if not stack or stack.pop() != pairs[ch]:
+                return False
+    return not stack
+
+
+def _math_left_boundary(text: str, eq_idx: int) -> int:
+    idx = eq_idx - 1
+    while idx >= 0 and text[idx].isspace():
+        idx -= 1
+    while idx >= 0:
+        ch = text[idx]
+        if ch.isalnum() or ch in _MATH_SYMBOL_CHARS:
+            idx -= 1
+            continue
+        if ch in _MATH_BOUNDARY_CHARS or ch == "$":
+            break
+        break
+    return idx + 1
+
+
+def _math_right_boundary(text: str, eq_idx: int) -> int:
+    idx = eq_idx + 1
+    while idx < len(text) and text[idx].isspace():
+        idx += 1
+    while idx < len(text):
+        ch = text[idx]
+        if ch.isalnum() or ch in _MATH_SYMBOL_CHARS:
+            idx += 1
+            continue
+        if ch in _MATH_BOUNDARY_CHARS or ch == "$":
+            break
+        break
+    return idx
+
+
+def _looks_like_math_side(side: str) -> bool:
+    compact = re.sub(r"\s+", "", side.strip("$ "))
+    if not compact:
+        return False
+    if re.search(r"[A-Za-z0-9\\]", compact) is None:
+        return False
+    allowed_latex = ("frac", "dfrac", "tfrac", "sqrt", "left", "right")
+    for command in allowed_latex:
+        compact = compact.replace(command, "")
+    alpha_words = re.findall(r"[A-Za-z]{2,}", compact)
+    return not alpha_words
 
 
 def _extract_equation(text: str) -> str | None:
@@ -80,36 +103,32 @@ def _extract_equation(text: str) -> str | None:
         line = line.strip()
         if not line:
             continue
-        match = re.search(r"([^.;\n]{0,80}=[^.;\n]{0,80})", line)
-        if match:
-            return _normalize_signature_value(match.group(1))
-        return _normalize_signature_value(line[:160])
+        for match in re.finditer("=", line):
+            left = _math_left_boundary(line, match.start())
+            right = _math_right_boundary(line, match.start())
+            candidate = _normalize_signature_value(line[left:right])
+            if not candidate or candidate.count("=") != 1 or len(candidate) > 120:
+                continue
+            lhs, rhs = candidate.split("=", 1)
+            if not (_looks_like_math_side(lhs) and _looks_like_math_side(rhs)):
+                continue
+            if not _balanced_braces(candidate):
+                continue
+            return candidate
     return None
 
 
 def _normalize_equation_claim(equation: str) -> str:
     normalized = clean_latex_answer(_normalize_signature_value(equation))
     normalized = normalized.replace(r"\left", "").replace(r"\right", "")
-    normalized = re.sub(r"\s+", "", normalized)
-    return normalized
-
-
-def _extract_first_number(text: str) -> str | None:
-    matches: list[re.Match[str]] = []
-    for pattern in _LATEX_NUMBER_PATTERNS:
-        matches.extend(pattern.finditer(text))
-    matches.extend(_PLAIN_NUMBER_PATTERN.finditer(text))
-    if not matches:
-        return None
-    first = min(matches, key=lambda match: match.start())
-    return _normalize_signature_value(first.group(0))
+    normalized = normalized.replace(r"\dfrac", r"\frac").replace(r"\tfrac", r"\frac")
+    return re.sub(r"\s+", "", normalized)
 
 
 def _normalize_number_value(value: str) -> str:
     normalized = clean_latex_answer(_normalize_signature_value(value))
     normalized = normalized.replace(",", "")
-    normalized = re.sub(r"\s+", "", normalized)
-    return normalized
+    return re.sub(r"\s+", "", normalized)
 
 
 def _number_matches(text: str) -> list[tuple[int, str]]:
@@ -159,11 +178,6 @@ def _extract_first_rhs_number(text: str, context_text: str = "") -> str | None:
     return _extract_first_novel_number(text, context_text)
 
 
-def _extract_first_operator(text: str) -> str | None:
-    operator = _OPERATOR_PATTERN.search(text)
-    return operator.group(1).lower() if operator is not None else None
-
-
 def _extract_operation_intent(text: str) -> str | None:
     lowered = f" {text.lower()} "
     for intent, keywords in INTENT_KEYWORDS.items():
@@ -174,26 +188,6 @@ def _extract_operation_intent(text: str) -> str | None:
             elif re.search(r"\b" + re.escape(keyword) + r"\b", lowered):
                 return intent
     return None
-
-
-def extract_structured_signature(text: str) -> dict[str, str]:
-    boxed = extract_last_boxed(text)
-    if boxed is not None:
-        return _signature("boxed", boxed)
-
-    equation = _extract_equation(text)
-    if equation is not None:
-        return _signature("equation", equation)
-
-    number = _extract_first_number(text)
-    if number is not None:
-        return _signature("number", number)
-
-    operator = _extract_first_operator(text)
-    if operator is not None:
-        return _signature("operator", operator)
-
-    return _signature("none", "")
 
 
 def extract_step_evidence(text: str, context_text: str = "") -> dict[str, Any]:
@@ -231,203 +225,6 @@ def extract_step_evidence(text: str, context_text: str = "") -> dict[str, Any]:
         "operation_intent": f"operation_intent:{operation_intent}" if operation_intent else None,
     }
     evidence["evidence_channels"] = [
-        channel
-        for channel in EVIDENCE_CHANNEL_PRIORITY
-        if evidence.get(channel) is not None
+        channel for channel in EVIDENCE_CHANNEL_PRIORITY if evidence.get(channel) is not None
     ]
     return evidence
-
-
-def extract_number_signature(text: str) -> dict[str, str]:
-    number = _extract_first_number(text)
-    if number is None:
-        return _signature("none", "")
-    return _signature("number", number)
-
-
-def extract_novel_number_signature(text: str, context_text: str = "") -> dict[str, str]:
-    number = _extract_first_novel_number(text, context_text)
-    if number is None:
-        return _signature("none", "")
-    return _signature("number", number)
-
-
-def extract_rhs_number_signature(text: str, context_text: str = "") -> dict[str, str]:
-    number = _extract_first_rhs_number(text, context_text)
-    if number is None:
-        return _signature("none", "")
-    return _signature("number", number)
-
-
-def extract_operation_signature(text: str) -> dict[str, str]:
-    operator = _extract_first_operator(text)
-    if operator is None:
-        return _signature("none", "")
-    return _signature("operator", operator)
-
-
-def _signature_key(value: str | dict[str, Any]) -> str:
-    if isinstance(value, dict):
-        signature = value.get("signature")
-        if signature is None:
-            signature_type = value.get("signature_type", "none")
-            signature_value = value.get("signature_value", "")
-            return f"{signature_type}:{signature_value}"
-        return str(signature)
-    return str(value)
-
-
-def compute_vote_disagreement(signatures: list[str] | list[dict[str, Any]]) -> dict[str, Any]:
-    keys = [_signature_key(signature) for signature in signatures]
-    if not keys:
-        return {
-            "signature_counts": {},
-            "majority_signature": None,
-            "vote_fraction": None,
-            "structured_disagreement": None,
-        }
-    counts = Counter(keys)
-    majority_signature, majority_count = counts.most_common(1)[0]
-    vote_fraction = majority_count / len(keys)
-    return {
-        "signature_counts": dict(counts),
-        "majority_signature": majority_signature,
-        "vote_fraction": vote_fraction,
-        "structured_disagreement": 1.0 - vote_fraction,
-    }
-
-
-def _renamed_vote_result(result: dict[str, Any], prefix: str) -> dict[str, Any]:
-    return {
-        f"{prefix}_signature_counts": result["signature_counts"],
-        f"{prefix}_majority_signature": result["majority_signature"],
-        f"{prefix}_vote_fraction": result["vote_fraction"],
-        f"{prefix}_vote_disagreement": result["structured_disagreement"],
-    }
-
-
-def operation_vote_disagreement(texts: list[str]) -> dict[str, Any]:
-    signatures = [extract_operation_signature(text)["signature"] for text in texts]
-    return _renamed_vote_result(compute_vote_disagreement(signatures), "operation")
-
-
-def number_vote_disagreement(texts: list[str]) -> dict[str, Any]:
-    signatures = [extract_number_signature(text)["signature"] for text in texts]
-    return _renamed_vote_result(compute_vote_disagreement(signatures), "number")
-
-
-def novel_number_vote_disagreement(texts: list[str], context_text: str = "") -> dict[str, Any]:
-    signatures = [extract_novel_number_signature(text, context_text)["signature"] for text in texts]
-    return _renamed_vote_result(compute_vote_disagreement(signatures), "novel_number")
-
-
-def rhs_number_vote_disagreement(texts: list[str], context_text: str = "") -> dict[str, Any]:
-    signatures = [extract_rhs_number_signature(text, context_text)["signature"] for text in texts]
-    return _renamed_vote_result(compute_vote_disagreement(signatures), "rhs_number")
-
-
-def _char_units(text: str) -> set[str]:
-    compact = re.sub(r"\s+", " ", text.strip())
-    if not compact:
-        return set()
-    if len(compact) < 3:
-        return set(compact)
-    return {compact[i : i + 3] for i in range(len(compact) - 2)}
-
-
-def char_jaccard_disagreement(texts: list[str]) -> float | None:
-    if len(texts) < 2:
-        return None
-
-    distances: list[float] = []
-    for left, right in combinations(texts, 2):
-        left_units = _char_units(left)
-        right_units = _char_units(right)
-        union = left_units | right_units
-        if not union:
-            distances.append(0.0)
-            continue
-        distances.append(1.0 - (len(left_units & right_units) / len(union)))
-    return sum(distances) / len(distances) if distances else None
-
-
-def _bleu_tokens(text: str) -> list[str]:
-    return [token.lower() for token in _BLEU_TOKEN_PATTERN.findall(text)]
-
-
-def _ngram_counts(tokens: list[str], n: int) -> Counter[tuple[str, ...]]:
-    if len(tokens) < n:
-        return Counter()
-    return Counter(tuple(tokens[i : i + n]) for i in range(len(tokens) - n + 1))
-
-
-def _closest_ref_len(hyp_len: int, refs: list[list[str]]) -> int:
-    return min((len(ref) for ref in refs), key=lambda ref_len: (abs(ref_len - hyp_len), ref_len))
-
-
-def _sentence_bleu(hypothesis: list[str], references: list[list[str]], max_n: int = 4) -> float:
-    if not hypothesis or not references:
-        return 0.0
-    precisions = []
-    for n in range(1, max_n + 1):
-        hyp_counts = _ngram_counts(hypothesis, n)
-        if not hyp_counts:
-            precisions.append(1.0)
-            continue
-        max_ref_counts: Counter[tuple[str, ...]] = Counter()
-        for ref in references:
-            ref_counts = _ngram_counts(ref, n)
-            for gram, count in ref_counts.items():
-                max_ref_counts[gram] = max(max_ref_counts[gram], count)
-        overlap = sum(min(count, max_ref_counts[gram]) for gram, count in hyp_counts.items())
-        # Add-one smoothing keeps short mathematical rollouts from collapsing to zero
-        # when they differ in one symbol.
-        precisions.append((overlap + 1.0) / (sum(hyp_counts.values()) + 1.0))
-
-    hyp_len = len(hypothesis)
-    ref_len = _closest_ref_len(hyp_len, references)
-    brevity_penalty = 1.0 if hyp_len > ref_len else math.exp(1.0 - ref_len / max(hyp_len, 1))
-    return brevity_penalty * math.exp(sum(math.log(value) for value in precisions) / max_n)
-
-
-def self_bleu_disagreement(texts: list[str]) -> float | None:
-    if len(texts) < 2:
-        return None
-    tokenized = [_bleu_tokens(text) for text in texts]
-    scores = []
-    for idx, hypothesis in enumerate(tokenized):
-        references = [tokens for ref_idx, tokens in enumerate(tokenized) if ref_idx != idx]
-        scores.append(_sentence_bleu(hypothesis, references))
-    self_bleu = sum(scores) / len(scores) if scores else 0.0
-    return 1.0 - self_bleu
-
-
-def score_variance(scores: list[float | None]) -> float | None:
-    values = []
-    for score in scores:
-        if score is None:
-            continue
-        value = float(score)
-        if math.isfinite(value):
-            values.append(value)
-    if len(values) < 2:
-        return None
-    mean = sum(values) / len(values)
-    return sum((value - mean) ** 2 for value in values) / len(values)
-
-
-def rollout_disagreement_metrics(texts: list[str], scores: list[float | None], context_text: str = "") -> dict[str, Any]:
-    structured = compute_vote_disagreement([extract_structured_signature(text)["signature"] for text in texts])
-    return {
-        "signature_counts": structured["signature_counts"],
-        "majority_signature": structured["majority_signature"],
-        "vote_fraction": structured["vote_fraction"],
-        "structured_disagreement": structured["structured_disagreement"],
-        **operation_vote_disagreement(texts),
-        **number_vote_disagreement(texts),
-        **novel_number_vote_disagreement(texts, context_text),
-        **rhs_number_vote_disagreement(texts, context_text),
-        "self_bleu_disagreement": self_bleu_disagreement(texts),
-        "char_jaccard_disagreement": char_jaccard_disagreement(texts),
-        "score_variance": score_variance(scores),
-    }

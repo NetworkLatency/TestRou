@@ -126,13 +126,13 @@ bpa_results/diagnostics/sampling_disagreement/{dataset}/probes.jsonl
 bpa_results/diagnostics/sampling_disagreement/{dataset}/problem_summary.csv
 ```
 
-Main disagreement metrics:
+Probe rows record sampled rollouts plus evidence channels used by the current router:
 
-- `operation_vote_disagreement`
-- `number_vote_disagreement`
-- `self_bleu_disagreement`
-- `char_jaccard_disagreement`
-- `structured_disagreement`
+- `boxed_answer`
+- `rhs_novel_number`
+- `equation_claim`
+- `novel_number_set`
+- `operation_intent`
 
 ## 5. LLM Oracle
 
@@ -182,13 +182,13 @@ AND LLM continuation from this boundary answers correctly
 
 ## 7. Analysis and Plotting
 
-Generate distribution plots, quantile plots, dip-test results, and AUROC:
+Generate distribution plots, quantile plots, dip-test results, and AUROC for numeric probe fields:
 
 ```bash
 python -m bpa.eval.analyze_sampling_disagreement \
   --config configs/bpa_default.json \
   --dataset math500 \
-  --metrics operation_vote_disagreement number_vote_disagreement self_bleu_disagreement char_jaccard_disagreement structured_disagreement \
+  --metrics prefix_consensus_support_count prefix_consensus_vote_fraction \
   --num-bins 10
 ```
 
@@ -202,24 +202,15 @@ bpa_results/diagnostics/sampling_analysis/math500/critical_by_quantile_{metric}.
 bpa_results/diagnostics/sampling_analysis/math500/critical_by_quantile_{metric}.png
 ```
 
-Continue this direction only if:
+## 8. Evidence Consensus Routing
 
-```text
-dip test p < 0.05 or the distribution is visually bimodal
-AUROC(disagreement -> critical) > 0.65
-P(critical | disagreement quantile) is mostly monotonic increasing
-```
-
-## 8. Top-20% Routing Sanity Check
-
-To route with the stricter 4-sample majority rule, reuse the best agreed SLM rollout instead of generating a fresh SLM step:
+Route with the evidence-consensus rule. Reuse the best agreed SLM rollout instead of generating a fresh SLM step:
 
 ```bash
 python -m bpa.eval.exp_disagreement_routing \
   --config configs/bpa_default.json \
   --dataset math500 \
   --max-problems 50 \
-  --routing-mode prefix_consensus \
   --min-agreement-count 3 \
   --probe-k 4 \
   --probe-temperature 0.7 \
@@ -227,20 +218,6 @@ python -m bpa.eval.exp_disagreement_routing \
 ```
 
 With `--probe-k 4 --min-agreement-count 3`, a 3/4 or 4/4 signature majority stays on SLM and appends the rollout in that majority group with the highest `mean_logprob`; a 2/4 split routes the step to the LLM. The initial empty assistant prefix is still generated normally; this rule applies after a reasoning boundary exists.
-
-If the phenomenon holds, run a simple top-20% disagreement routing check:
-
-```bash
-python -m bpa.eval.exp_disagreement_routing \
-  --config configs/bpa_default.json \
-  --dataset math500 \
-  --max-problems 50 \
-  --metric number_vote_disagreement \
-  --threshold-quantile 0.8 \
-  --probe-k 4 \
-  --probe-temperature 0.7 \
-  --probe-max-tokens 32
-```
 
 Outputs:
 
@@ -272,5 +249,5 @@ done
 python -m bpa.eval.exp_sampling_disagreement --config configs/bpa_default.json --dataset math500 --max-problems 100 --probe-k 4 --probe-temperature 0.7 --probe-max-tokens 32
 python -m bpa.eval.exp_llm_oracle --config configs/bpa_default.json --dataset math500 --max-problems 100
 python -m bpa.eval.exp_boundary_continuation --config configs/bpa_default.json --dataset math500 --max-problems 100 --boundaries-per-problem 5 --continuation-max-tokens 2048
-python -m bpa.eval.analyze_sampling_disagreement --config configs/bpa_default.json --dataset math500 --metrics operation_vote_disagreement number_vote_disagreement self_bleu_disagreement char_jaccard_disagreement structured_disagreement --num-bins 10
+python -m bpa.eval.exp_disagreement_routing --config configs/bpa_default.json --dataset math500 --max-problems 100 --min-agreement-count 3 --probe-k 4 --probe-temperature 0.7 --probe-max-tokens 32
 ```

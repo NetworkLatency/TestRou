@@ -7,7 +7,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 from tqdm import tqdm
 
 from bpa.config import BPAConfig
@@ -15,7 +14,7 @@ from bpa.context_budget import ContextBudgetExceeded
 from bpa.engines import init_engines
 from bpa.eval.benchmark_eval import benchmark_eval_match
 from bpa.eval.datasets import load_eval_dataset
-from bpa.eval.exp_sampling_disagreement import _max, _mean, _sample_probe_rollouts
+from bpa.eval.exp_sampling_disagreement import _sample_probe_rollouts
 from bpa.eval.sampling_disagreement import EVIDENCE_CHANNEL_PRIORITY
 from bpa.pipeline import (
     _generate_step_with_engine,
@@ -38,18 +37,12 @@ SUMMARY_FIELDS = [
     "gold_answer",
     "final_answer",
     "correct",
-    "routing_mode",
-    "metric",
-    "threshold",
-    "threshold_quantile",
     "min_agreement_count",
     "post_stop_lookahead_tokens",
     "num_boundaries",
     "num_llm_routed_steps",
     "num_slm_steps",
     "num_probe_reused_steps",
-    "max_metric_value",
-    "mean_metric_value",
     "total_wall_time",
     "slm_decode_tokens",
     "slm_prefill_tokens",
@@ -63,62 +56,9 @@ SUMMARY_FIELDS = [
     "probe_wall_time",
 ]
 
-ROUTING_MODES = {"threshold", "prefix_consensus"}
-
-
-def _read_jsonl(path: Path) -> list[dict[str, Any]]:
-    rows = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                rows.append(json.loads(line))
-    return rows
-
-
-def _default_probe_path(config: BPAConfig, dataset: str) -> Path:
-    return Path(config.output_dir) / "diagnostics" / "sampling_disagreement" / dataset / "probes.jsonl"
-
-
-def _parse_bool(value: Any) -> bool | None:
-    if value is None or value == "":
-        return None
-    text = str(value).strip().lower()
-    if value is True or text == "true":
-        return True
-    if value is False or text == "false":
-        return False
-    return None
-
-
-def _is_initial_probe(row: dict[str, Any]) -> bool:
-    parsed = _parse_bool(row.get("is_initial_probe"))
-    if parsed is not None:
-        return parsed
-    try:
-        if int(row.get("boundary_idx", 0)) < 0:
-            return True
-    except (TypeError, ValueError):
-        pass
-    try:
-        return int(row.get("prefix_char_len", 1)) == 0
-    except (TypeError, ValueError):
-        return False
-
-
-def threshold_from_probes(path: Path, metric: str, quantile: float, *, include_initial_probe: bool = False) -> float:
-    rows = _read_jsonl(path)
-    values = []
-    for row in rows:
-        if not include_initial_probe and _is_initial_probe(row):
-            continue
-        value = row.get(metric)
-        if value is None:
-            continue
-        values.append(float(value))
-    if not values:
-        raise ValueError(f"No values for metric {metric!r} in {path}")
-    return float(np.quantile(values, quantile))
+def _mean(values: list[float | int | None]) -> float | None:
+    present = [float(value) for value in values if value is not None]
+    return sum(present) / len(present) if present else None
 
 
 def _mean_logprob_sort_value(row: dict[str, Any]) -> float:
@@ -316,23 +256,16 @@ def run_disagreement_routing(
     llm,
     config: BPAConfig,
     *,
-    metric: str = "structured_disagreement",
-    threshold: float | None = None,
-    routing_mode: str = "threshold",
     min_agreement_count: int = 3,
     probe_k: int = 4,
     probe_temperature: float = 0.7,
     probe_max_tokens: int = 32,
     probe_stop: str = "\n\n",
 ) -> tuple[BPAResult, list[dict[str, Any]], dict[str, float | int]]:
-    if routing_mode not in ROUTING_MODES:
-        raise ValueError(f"routing_mode must be one of {sorted(ROUTING_MODES)!r}")
-    if routing_mode == "threshold" and threshold is None:
-        raise ValueError("threshold is required when routing_mode='threshold'")
     if min_agreement_count > probe_k:
         raise ValueError("min_agreement_count cannot exceed probe_k")
 
-    protocol = "local_prefix_consensus_routing" if routing_mode == "prefix_consensus" else "disagreement_top_quantile_routing"
+    protocol = "evidence_consensus_routing"
     state = GenerationState(problem_text=problem_text, generation_protocol=protocol)
     rep = RepetitionState()
     start_time = time.time()
@@ -443,8 +376,6 @@ def run_disagreement_routing(
                 state.stop_reason = "eos"
             continue
 
-        route_to_llm = False
-        metric_value = None
         selected_rollout = None
         try:
             probe_row, cost = _sample_probe_rollouts(
@@ -455,7 +386,6 @@ def run_disagreement_routing(
                 probe_temperature=probe_temperature,
                 probe_max_tokens=probe_max_tokens,
                 probe_stop=probe_stop,
-                include_disagreement_metrics=routing_mode == "threshold",
             )
         except ContextBudgetExceeded as exc:
             state.phase = Phase.DONE
@@ -468,16 +398,12 @@ def run_disagreement_routing(
         boundary_idx += 1
         for key in probe_cost:
             probe_cost[key] += cost[key]
-        metric_value = probe_row.get(metric) if routing_mode == "threshold" else None
         prefix_consensus = _selected_prefix_consensus_rollout(
             probe_row,
             min_agreement_count=min_agreement_count,
         )
-        if routing_mode == "prefix_consensus":
-            selected_rollout = prefix_consensus["selected_rollout"]
-            route_to_llm = selected_rollout is None
-        else:
-            route_to_llm = metric_value is not None and float(metric_value) >= float(threshold)
+        selected_rollout = prefix_consensus["selected_rollout"]
+        route_to_llm = selected_rollout is None
 
         decode_tokens_before = state.slm_decode_tokens + state.llm_decode_tokens
         selected_rollout_token_count = None
@@ -487,7 +413,7 @@ def run_disagreement_routing(
         try:
             if route_to_llm:
                 step_text, finish = _llm_generate_step(state, llm, config)
-            elif routing_mode == "prefix_consensus" and selected_rollout is not None:
+            elif selected_rollout is not None:
                 (
                     step_text,
                     finish,
@@ -508,11 +434,6 @@ def run_disagreement_routing(
         state.assistant_prefix_text += step_text_normalized
         state.step_count += 1
 
-        if routing_mode == "threshold":
-            probe_row["metric"] = metric
-            probe_row["metric_value"] = metric_value
-            probe_row["threshold"] = threshold
-        probe_row["routing_mode"] = routing_mode
         probe_row["min_agreement_count"] = min_agreement_count
         probe_row["prefix_anchor_idx"] = prefix_consensus["prefix_anchor_idx"]
         probe_row["prefix_anchor_mean_logprob"] = prefix_consensus["prefix_anchor_mean_logprob"]
@@ -523,7 +444,7 @@ def run_disagreement_routing(
         probe_row["prefix_consensus_support_by_rollout"] = prefix_consensus["prefix_consensus_support_by_rollout"]
         probe_row["prefix_consensus_group_counts"] = prefix_consensus["prefix_consensus_group_counts"]
         probe_row["routed_to_llm"] = route_to_llm
-        probe_row["reused_probe_rollout"] = routing_mode == "prefix_consensus" and selected_rollout is not None
+        probe_row["reused_probe_rollout"] = selected_rollout is not None
         probe_row["selected_rollout_idx"] = selected_rollout.get("rollout_idx") if probe_row["reused_probe_rollout"] else None
         probe_row["selected_rollout_mean_logprob"] = (
             selected_rollout.get("mean_logprob") if probe_row["reused_probe_rollout"] else None
@@ -540,7 +461,7 @@ def run_disagreement_routing(
         boundary_rows.append(probe_row)
 
         if route_to_llm:
-            decision = "llm_disagreement_route"
+            decision = "llm_consensus_fallback"
         elif probe_row["reused_probe_rollout"]:
             decision = "slm_probe_reuse"
         else:
@@ -556,10 +477,6 @@ def run_disagreement_routing(
             "continued_probe_rollout": continued_probe_rollout,
             "selected_rollout_idx": probe_row["selected_rollout_idx"],
         }
-        if routing_mode == "threshold" and metric_value is not None:
-            log_row["metric"] = metric
-            log_row["metric_value"] = metric_value
-            log_row["threshold"] = threshold
         step_logs.append(log_row)
 
         if generated_step_tokens <= 0 and not step_text_normalized.strip():
@@ -625,15 +542,10 @@ def write_outputs(out_dir: Path, summary_rows: list[dict[str, Any]], boundary_ro
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run sampling-disagreement routing as a sanity check.")
+    parser = argparse.ArgumentParser(description="Run evidence-consensus routing.")
     parser.add_argument("--config", required=True, help="Path to BPAConfig JSON.")
     parser.add_argument("--dataset", default="math500", choices=["math500", "aime24", "aime25", "gpqa", "gpqa_diamond"])
     parser.add_argument("--max-problems", type=int, default=50)
-    parser.add_argument("--routing-mode", choices=sorted(ROUTING_MODES), default="threshold")
-    parser.add_argument("--threshold-source", default=None)
-    parser.add_argument("--threshold", type=float, default=None, help="Fixed threshold for threshold routing.")
-    parser.add_argument("--threshold-quantile", type=float, default=0.8)
-    parser.add_argument("--metric", default="structured_disagreement")
     parser.add_argument("--min-agreement-count", type=int, default=3)
     parser.add_argument("--probe-k", type=int, default=4)
     parser.add_argument("--probe-temperature", type=float, default=0.7)
@@ -645,10 +557,6 @@ def main() -> None:
     config = BPAConfig.from_json(args.config)
     if args.post_stop_lookahead_tokens is not None:
         config = config.with_updates(post_stop_lookahead_tokens=args.post_stop_lookahead_tokens)
-    threshold = args.threshold
-    if args.routing_mode == "threshold" and threshold is None:
-        threshold_source = Path(args.threshold_source) if args.threshold_source else _default_probe_path(config, args.dataset)
-        threshold = threshold_from_probes(threshold_source, args.metric, args.threshold_quantile)
     problems = load_eval_dataset(args.dataset, config, max_problems=args.max_problems)
     slm, llm = init_engines(config)
 
@@ -660,9 +568,6 @@ def main() -> None:
             slm,
             llm,
             config,
-            metric=args.metric,
-            threshold=threshold,
-            routing_mode=args.routing_mode,
             min_agreement_count=args.min_agreement_count,
             probe_k=args.probe_k,
             probe_temperature=args.probe_temperature,
@@ -672,8 +577,7 @@ def main() -> None:
         if problem.gold_answer is not None:
             correct = benchmark_eval_match(result.answer, problem.gold_answer, args.dataset)
             result.correct = correct
-        real_boundary_rows = [row for row in boundary_rows if not _is_initial_probe(row)]
-        metric_values = [row.get(args.metric) for row in real_boundary_rows] if args.routing_mode == "threshold" else []
+        real_boundary_rows = list(boundary_rows)
         summary_rows.append(
             {
                 "dataset": args.dataset,
@@ -682,18 +586,12 @@ def main() -> None:
                 "gold_answer": problem.gold_answer,
                 "final_answer": result.answer,
                 "correct": correct,
-                "routing_mode": args.routing_mode,
-                "metric": args.metric if args.routing_mode == "threshold" else None,
-                "threshold": threshold if args.routing_mode == "threshold" else None,
-                "threshold_quantile": args.threshold_quantile if args.routing_mode == "threshold" and args.threshold is None else None,
                 "min_agreement_count": args.min_agreement_count,
                 "post_stop_lookahead_tokens": config.post_stop_lookahead_tokens,
                 "num_boundaries": len(real_boundary_rows),
                 "num_llm_routed_steps": sum(1 for row in real_boundary_rows if row.get("routed_to_llm")),
                 "num_slm_steps": sum(1 for row in real_boundary_rows if not row.get("routed_to_llm")),
                 "num_probe_reused_steps": sum(1 for row in real_boundary_rows if row.get("reused_probe_rollout")),
-                "max_metric_value": _max(metric_values),
-                "mean_metric_value": _mean(metric_values),
                 "total_wall_time": result.total_wall_time,
                 "slm_decode_tokens": result.state.slm_decode_tokens,
                 "slm_prefill_tokens": result.state.slm_prefill_tokens,
