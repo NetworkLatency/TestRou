@@ -189,7 +189,11 @@ class WeightedSamplingProbeEngine(SequencedEngine):
             for _ in range(k):
                 item = self.probe_outputs.pop(0)
                 text, mean_logprob, finish = item
+<<<<<<< HEAD
                 token_ids = [ord(ch) for ch in text]
+=======
+                token_ids = list(range(len(text)))
+>>>>>>> 9718723c8bbd55220b703016088c6ece52fd29a4
                 completions.append(
                     Obj(
                         text=text,
@@ -580,6 +584,7 @@ class CoreTests(unittest.TestCase):
         self.assertFalse(boundaries[2]["routed_to_llm"])
         self.assertEqual(probe_cost["probe_generate_calls"], 3)
 
+<<<<<<< HEAD
     def test_prefix_consensus_reuses_anchor_probe_prefix(self):
         slm = WeightedSamplingProbeEngine(
             outputs=[
@@ -595,6 +600,22 @@ class CoreTests(unittest.TestCase):
                 ("Let x = 1 therefore", -0.05, "length"),
                 ("Let x = 1 so", -0.3, "length"),
                 ("Try y = 2", -0.4, "length"),
+=======
+    def test_majority_routing_reuses_highest_logprob_probe(self):
+        slm = WeightedSamplingProbeEngine(
+            outputs=[
+                ("First step.\n\n", "stop"),
+            ],
+            probe_outputs=[
+                ("initial a", -0.2, "stop"),
+                ("initial a", -0.2, "stop"),
+                ("initial b", -0.2, "stop"),
+                ("initial c", -0.2, "stop"),
+                (r"low confidence \boxed{1}", -0.4, "stop"),
+                (r"chosen \boxed{1}", -0.05, "eos"),
+                (r"medium \boxed{1}", -0.2, "stop"),
+                (r"wrong \boxed{2}", -0.01, "eos"),
+>>>>>>> 9718723c8bbd55220b703016088c6ece52fd29a4
             ],
         )
         llm = SequencedEngine(fail_on_generate=True)
@@ -603,14 +624,21 @@ class CoreTests(unittest.TestCase):
             slm,
             llm,
             BPAConfig(max_total_tokens=200),
+<<<<<<< HEAD
             routing_mode="prefix_consensus",
             min_agreement_count=3,
             min_prefix_tokens=8,
+=======
+            routing_mode="majority",
+            agreement_signature_key="signature",
+            min_agreement_count=3,
+>>>>>>> 9718723c8bbd55220b703016088c6ece52fd29a4
             probe_k=4,
             probe_temperature=0.7,
             probe_max_tokens=32,
         )
         self.assertEqual(result.answer, "1")
+<<<<<<< HEAD
         self.assertTrue(boundaries[1]["reused_probe_rollout"])
         self.assertTrue(boundaries[1]["continued_probe_rollout"])
         self.assertEqual(boundaries[1]["prefix_anchor_idx"], 1)
@@ -620,12 +648,25 @@ class CoreTests(unittest.TestCase):
         self.assertIn(r"Let x = 1 therefore and final \boxed{1}", result.state.assistant_prefix_text)
 
     def test_prefix_consensus_routes_unstable_prefixes_to_llm(self):
+=======
+        self.assertEqual(len(boundaries), 2)
+        self.assertFalse(boundaries[0]["reused_probe_rollout"])
+        self.assertTrue(boundaries[1]["reused_probe_rollout"])
+        self.assertFalse(boundaries[1]["routed_to_llm"])
+        self.assertEqual(boundaries[1]["agreement_majority_count"], 3)
+        self.assertEqual(boundaries[1]["selected_rollout_idx"], 1)
+        self.assertIn(r"chosen \boxed{1}", result.state.assistant_prefix_text)
+        self.assertEqual(result.state.slm_generate_calls, 1)
+
+    def test_majority_routing_sends_two_two_split_to_llm(self):
+>>>>>>> 9718723c8bbd55220b703016088c6ece52fd29a4
         slm = WeightedSamplingProbeEngine(
             outputs=[
                 ("First step.\n\n", "stop"),
             ],
             probe_outputs=[
                 ("initial a", -0.2, "stop"),
+<<<<<<< HEAD
                 ("initial b", -0.2, "stop"),
                 ("initial c", -0.2, "stop"),
                 ("initial d", -0.2, "stop"),
@@ -633,6 +674,15 @@ class CoreTests(unittest.TestCase):
                 ("Try y = 2", -0.1, "length"),
                 ("Compute z", -0.2, "length"),
                 ("Maybe use geometry", -0.3, "length"),
+=======
+                ("initial a", -0.2, "stop"),
+                ("initial b", -0.2, "stop"),
+                ("initial c", -0.2, "stop"),
+                (r"\boxed{1}", -0.1, "stop"),
+                (r"\boxed{1}", -0.1, "stop"),
+                (r"\boxed{2}", -0.1, "stop"),
+                (r"\boxed{2}", -0.1, "stop"),
+>>>>>>> 9718723c8bbd55220b703016088c6ece52fd29a4
             ],
         )
         llm = SequencedEngine([(r"\boxed{9}", "eos")])
@@ -641,9 +691,15 @@ class CoreTests(unittest.TestCase):
             slm,
             llm,
             BPAConfig(max_total_tokens=200),
+<<<<<<< HEAD
             routing_mode="prefix_consensus",
             min_agreement_count=3,
             min_prefix_tokens=4,
+=======
+            routing_mode="majority",
+            agreement_signature_key="signature",
+            min_agreement_count=3,
+>>>>>>> 9718723c8bbd55220b703016088c6ece52fd29a4
             probe_k=4,
             probe_temperature=0.7,
             probe_max_tokens=32,
@@ -651,8 +707,12 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result.answer, "9")
         self.assertTrue(boundaries[1]["routed_to_llm"])
         self.assertFalse(boundaries[1]["reused_probe_rollout"])
+<<<<<<< HEAD
         self.assertEqual(boundaries[1]["prefix_anchor_idx"], 0)
         self.assertEqual(boundaries[1]["prefix_consensus_support_count"], 1)
+=======
+        self.assertEqual(boundaries[1]["agreement_majority_count"], 2)
+>>>>>>> 9718723c8bbd55220b703016088c6ece52fd29a4
         self.assertEqual(llm.generate_calls, 1)
 
     def test_threshold_from_probes(self):
