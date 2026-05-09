@@ -161,13 +161,41 @@ class SamplingProbeEngine(SequencedEngine):
             completions = []
             for _ in range(k):
                 text = self.probe_outputs.pop(0)
-                token_ids = list(range(len(text)))
+                token_ids = [ord(ch) for ch in text]
                 completions.append(
                     Obj(
                         text=text,
                         token_ids=token_ids,
                         finish_reason="stop",
                         logprobs=[{token_id: Obj(logprob=-0.2 - 0.01 * token_id)} for token_id in token_ids],
+                    )
+                )
+            return [Obj(outputs=completions)]
+        return super().generate(prompts, sampling_params)
+
+
+class WeightedSamplingProbeEngine(SequencedEngine):
+    def __init__(self, outputs=None, probe_outputs=None):
+        super().__init__(outputs)
+        self.probe_outputs = list(probe_outputs or [])
+
+    def generate(self, prompts, sampling_params):
+        if sampling_params.get("n"):
+            self.generate_calls += 1
+            k = int(sampling_params["n"])
+            if len(self.probe_outputs) < k:
+                raise AssertionError("no queued probe outputs")
+            completions = []
+            for _ in range(k):
+                item = self.probe_outputs.pop(0)
+                text, mean_logprob, finish = item
+                token_ids = [ord(ch) for ch in text]
+                completions.append(
+                    Obj(
+                        text=text,
+                        token_ids=token_ids,
+                        finish_reason=finish,
+                        logprobs=[{token_id: Obj(logprob=mean_logprob)} for token_id in token_ids],
                     )
                 )
             return [Obj(outputs=completions)]
@@ -551,6 +579,81 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(boundaries[1]["routed_to_llm"])
         self.assertFalse(boundaries[2]["routed_to_llm"])
         self.assertEqual(probe_cost["probe_generate_calls"], 3)
+
+    def test_prefix_consensus_reuses_anchor_probe_prefix(self):
+        slm = WeightedSamplingProbeEngine(
+            outputs=[
+                ("First step.\n\n", "stop"),
+                (r" and final \boxed{1}", "eos"),
+            ],
+            probe_outputs=[
+                ("initial a", -0.2, "stop"),
+                ("initial b", -0.2, "stop"),
+                ("initial c", -0.2, "stop"),
+                ("initial d", -0.2, "stop"),
+                ("Let x = 1 because", -0.2, "length"),
+                ("Let x = 1 therefore", -0.05, "length"),
+                ("Let x = 1 so", -0.3, "length"),
+                ("Try y = 2", -0.4, "length"),
+            ],
+        )
+        llm = SequencedEngine(fail_on_generate=True)
+        result, boundaries, _ = run_disagreement_routing(
+            "Problem: x?",
+            slm,
+            llm,
+            BPAConfig(max_total_tokens=200),
+            routing_mode="prefix_consensus",
+            min_agreement_count=3,
+            min_prefix_tokens=8,
+            probe_k=4,
+            probe_temperature=0.7,
+            probe_max_tokens=32,
+        )
+        self.assertEqual(result.answer, "1")
+        self.assertTrue(boundaries[1]["reused_probe_rollout"])
+        self.assertTrue(boundaries[1]["continued_probe_rollout"])
+        self.assertEqual(boundaries[1]["prefix_anchor_idx"], 1)
+        self.assertEqual(boundaries[1]["prefix_consensus_support_count"], 3)
+        self.assertEqual(boundaries[1]["selected_rollout_idx"], 1)
+        self.assertEqual(boundaries[1]["probe_prefix_text"], "Let x = 1 therefore")
+        self.assertIn(r"Let x = 1 therefore and final \boxed{1}", result.state.assistant_prefix_text)
+
+    def test_prefix_consensus_routes_unstable_prefixes_to_llm(self):
+        slm = WeightedSamplingProbeEngine(
+            outputs=[
+                ("First step.\n\n", "stop"),
+            ],
+            probe_outputs=[
+                ("initial a", -0.2, "stop"),
+                ("initial b", -0.2, "stop"),
+                ("initial c", -0.2, "stop"),
+                ("initial d", -0.2, "stop"),
+                ("Let x = 1", -0.05, "length"),
+                ("Try y = 2", -0.1, "length"),
+                ("Compute z", -0.2, "length"),
+                ("Maybe use geometry", -0.3, "length"),
+            ],
+        )
+        llm = SequencedEngine([(r"\boxed{9}", "eos")])
+        result, boundaries, _ = run_disagreement_routing(
+            "Problem: x?",
+            slm,
+            llm,
+            BPAConfig(max_total_tokens=200),
+            routing_mode="prefix_consensus",
+            min_agreement_count=3,
+            min_prefix_tokens=4,
+            probe_k=4,
+            probe_temperature=0.7,
+            probe_max_tokens=32,
+        )
+        self.assertEqual(result.answer, "9")
+        self.assertTrue(boundaries[1]["routed_to_llm"])
+        self.assertFalse(boundaries[1]["reused_probe_rollout"])
+        self.assertEqual(boundaries[1]["prefix_anchor_idx"], 0)
+        self.assertEqual(boundaries[1]["prefix_consensus_support_count"], 1)
+        self.assertEqual(llm.generate_calls, 1)
 
     def test_threshold_from_probes(self):
         with tempfile.TemporaryDirectory() as tmp:

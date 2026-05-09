@@ -123,8 +123,11 @@ def _sample_probe_rollouts(
         probe_decode_tokens += len(token_ids)
         rollouts.append(
             {
+                "rollout_idx": len(rollouts),
                 "text": text,
+                "token_ids": token_ids,
                 "token_count": len(token_ids),
+                "finish_reason": str(getattr(completion, "finish_reason", "") or ""),
                 "mean_logprob": mean_logprob,
                 "signature_type": signature["signature_type"],
                 "signature_value": signature["signature_value"],

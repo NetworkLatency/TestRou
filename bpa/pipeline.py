@@ -22,14 +22,28 @@ def run_cascade(state: GenerationState, slm, llm, config: BPAConfig) -> CascadeR
     return CascadeResult(decision=decision, l0=l0)
 
 
-def _generate_step_with_engine(state: GenerationState, engine, config: BPAConfig, account: str, prefix_extension: str = "") -> tuple[str, str]:
+def _generate_step_with_engine(
+    state: GenerationState,
+    engine,
+    config: BPAConfig,
+    account: str,
+    prefix_extension: str = "",
+    step_token_budget: int | None = None,
+    total_token_offset: int = 0,
+) -> tuple[str, str]:
     rendered = render_for_continuation(
         state.problem_text,
         state.assistant_prefix_text + prefix_extension,
         engine.ensure_tokenizer(),
     )
-    remaining_total_tokens = max(config.max_total_tokens - state.slm_decode_tokens - state.llm_decode_tokens, 1)
-    requested_step_tokens = min(config.max_step_tokens, remaining_total_tokens)
+    remaining_total_tokens = max(
+        config.max_total_tokens - state.slm_decode_tokens - state.llm_decode_tokens - total_token_offset,
+        1,
+    )
+    requested_step_tokens = min(
+        config.max_step_tokens if step_token_budget is None else step_token_budget,
+        remaining_total_tokens,
+    )
     max_tokens, prompt_tokens = generation_budget_for_rendered(rendered, engine, config, requested_step_tokens)
     sampling = engine.sampling_params(
         max_tokens=max_tokens,
