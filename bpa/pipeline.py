@@ -7,7 +7,14 @@ from .config import BPAConfig
 from .context_budget import ContextBudgetExceeded, generation_budget_for_rendered
 from .engines import completion, finish_reason, generated_text, generated_token_ids
 from .render import render_for_continuation
-from .safety import CLOSE_THINK_TAG, ensure_step_terminator, extract_answer, update_strict_step_repetition
+from .safety import (
+    captured_close_think_prefix,
+    ensure_step_terminator,
+    extract_answer_from_final_step,
+    extract_answer_from_steps,
+    has_close_think_tag,
+    update_strict_step_repetition,
+)
 from .state import CascadeResult, Decision, GenerationState, Phase, RepetitionState, TraceEvent
 from .trace import BPAResult
 
@@ -77,13 +84,6 @@ def _output_hit_eos(output, engine) -> bool:
     return bool(token_ids and token_ids[-1] in eos_token_ids)
 
 
-def _captured_close_think_prefix(text: str) -> str:
-    idx = text.find(CLOSE_THINK_TAG)
-    if idx < 0:
-        return ""
-    return text[: idx + len(CLOSE_THINK_TAG)]
-
-
 def _post_stop_lookahead(
     state: GenerationState,
     engine,
@@ -132,7 +132,7 @@ def _post_stop_lookahead(
     )
 
     text = generated_text(out)
-    close_think_prefix = _captured_close_think_prefix(text)
+    close_think_prefix = captured_close_think_prefix(text)
     if close_think_prefix:
         return close_think_prefix, "stop"
     if finish_reason(out) == "stop" or _output_hit_eos(out, engine):
@@ -148,6 +148,7 @@ def _generate_step_with_engine(
     prefix_extension: str = "",
     step_token_budget: int | None = None,
     total_token_offset: int = 0,
+    stop_on_step_boundary: bool = True,
 ) -> tuple[str, str]:
     rendered = render_for_continuation(
         state.problem_text,
@@ -158,18 +159,18 @@ def _generate_step_with_engine(
         config.max_total_tokens - state.slm_decode_tokens - state.llm_decode_tokens - total_token_offset,
         1,
     )
-    requested_step_tokens = min(
-        config.max_step_tokens if step_token_budget is None else step_token_budget,
-        remaining_total_tokens,
-    )
+    default_step_budget = config.max_step_tokens if stop_on_step_boundary else remaining_total_tokens
+    requested_step_tokens = min(default_step_budget if step_token_budget is None else step_token_budget, remaining_total_tokens)
     max_tokens, prompt_tokens = generation_budget_for_rendered(rendered, engine, config, requested_step_tokens)
-    sampling = engine.sampling_params(
-        max_tokens=max_tokens,
-        temperature=0.0,
-        stop=["\n\n"],
-        include_stop_str_in_output=True,
-        logprobs=1,
-    )
+    sampling_kwargs = {
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "logprobs": 1,
+    }
+    if stop_on_step_boundary:
+        sampling_kwargs["stop"] = ["\n\n"]
+        sampling_kwargs["include_stop_str_in_output"] = True
+    sampling = engine.sampling_params(**sampling_kwargs)
     generate_start = time.time()
     out = engine.generate(rendered, sampling)[0]
     generate_wall_time = time.time() - generate_start
@@ -184,7 +185,7 @@ def _generate_step_with_engine(
 
     text = generated_text(out)
     finish = finish_reason(out)
-    if finish == "stop":
+    if stop_on_step_boundary and finish == "stop":
         lookahead_text, lookahead_finish = _post_stop_lookahead(
             state,
             engine,
@@ -206,6 +207,22 @@ def _slm_generate_step(state: GenerationState, slm, config: BPAConfig) -> tuple[
 
 def _llm_generate_step(state: GenerationState, llm, config: BPAConfig) -> tuple[str, str]:
     return _generate_step_with_engine(state, llm, config, account="llm")
+
+
+def _slm_generate_final_answer(state: GenerationState, slm, config: BPAConfig) -> tuple[str, str]:
+    remaining_total_tokens = config.max_total_tokens - state.slm_decode_tokens - state.llm_decode_tokens
+    return _generate_step_with_engine(
+        state,
+        slm,
+        config,
+        account="slm",
+        step_token_budget=remaining_total_tokens,
+        stop_on_step_boundary=False,
+    )
+
+
+def _in_final_answer_phase(state: GenerationState, config: BPAConfig) -> bool:
+    return has_close_think_tag(state.assistant_prefix_text)
 
 
 def generate_one_step(state: GenerationState, slm, llm, config: BPAConfig, cascade: CascadeResult) -> tuple[str, str]:
@@ -241,13 +258,17 @@ def bpa_solve(problem_text: str, slm, llm, config: BPAConfig) -> BPAResult:
             break
 
         try:
-            cascade = run_cascade(state, slm, llm, config)
-            if state.slm_decode_tokens + state.llm_decode_tokens >= config.max_total_tokens:
-                state.trace.append(TraceEvent(state.step_count, "total_token_budget_exhausted", {}))
-                state.stop_reason = "total_token_budget"
-                break
             decode_tokens_before = state.slm_decode_tokens + state.llm_decode_tokens
-            step_text, finish = generate_one_step(state, slm, llm, config, cascade)
+            if _in_final_answer_phase(state, config):
+                cascade = None
+                step_text, finish = _slm_generate_final_answer(state, slm, config)
+            else:
+                cascade = run_cascade(state, slm, llm, config)
+                if state.slm_decode_tokens + state.llm_decode_tokens >= config.max_total_tokens:
+                    state.trace.append(TraceEvent(state.step_count, "total_token_budget_exhausted", {}))
+                    state.stop_reason = "total_token_budget"
+                    break
+                step_text, finish = generate_one_step(state, slm, llm, config, cascade)
         except ContextBudgetExceeded as exc:
             state.phase = Phase.DONE
             state.stop_reason = "context_budget"
@@ -260,8 +281,8 @@ def bpa_solve(problem_text: str, slm, llm, config: BPAConfig) -> BPAResult:
 
         log_row = {
             "step_idx": state.step_count - 1,
-            "decision": cascade.decision.value,
-            "generation_source": _generation_source(cascade),
+            "decision": "slm_final_answer" if cascade is None else cascade.decision.value,
+            "generation_source": "slm" if cascade is None else _generation_source(cascade),
             "finish_reason": finish,
             "step_text": step_text_normalized,
             "generated_step_tokens": generated_step_tokens,
@@ -287,7 +308,7 @@ def bpa_solve(problem_text: str, slm, llm, config: BPAConfig) -> BPAResult:
 
     state.trace.append(TraceEvent(state.step_count, "step_logs", {"steps": step_logs}))
     return BPAResult(
-        answer=extract_answer(state.assistant_prefix_text),
+        answer=extract_answer_from_steps(step_logs, state.assistant_prefix_text),
         state=state,
         total_wall_time=time.time() - start_time,
     )
@@ -323,4 +344,4 @@ def solve_engine_only(problem_text: str, engine, config: BPAConfig, account: str
     state.assistant_prefix_text = text
     state.phase = Phase.DONE
     state.stop_reason = finish_reason(out) or "done"
-    return BPAResult(answer=extract_answer(text), state=state, total_wall_time=time.time() - start_time)
+    return BPAResult(answer=extract_answer_from_final_step(text), state=state, total_wall_time=time.time() - start_time)

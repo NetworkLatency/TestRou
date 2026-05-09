@@ -219,8 +219,7 @@ python -m bpa.eval.exp_disagreement_routing \
   --config configs/bpa_default.json \
   --dataset math500 \
   --max-problems 50 \
-  --routing-mode majority \
-  --agreement-signature-key signature \
+  --routing-mode prefix_consensus \
   --min-agreement-count 3 \
   --probe-k 4 \
   --probe-temperature 0.7 \

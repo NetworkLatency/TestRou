@@ -3,31 +3,12 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
+from .safety import OPEN_THINK_TAG
+
 
 def render_for_continuation(problem_text: str, assistant_prefix_text: str, tokenizer: Any) -> str:
     generation_prompt = _render_generation_prompt(problem_text, tokenizer)
-    if not assistant_prefix_text:
-        return generation_prompt
-
-    messages = [
-        {"role": "user", "content": problem_text},
-        {"role": "assistant", "content": assistant_prefix_text},
-    ]
-    try:
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            continue_final_message=True,
-            add_generation_prompt=False,
-        )
-    except ValueError as exc:
-        if "continue_final_message" not in str(exc):
-            raise
-        import logging
-        logging.getLogger(__name__).debug(
-            "continue_final_message unsupported by tokenizer, falling back to generation_prompt concat: %s", exc
-        )
-        return generation_prompt + assistant_prefix_text
+    return generation_prompt + OPEN_THINK_TAG + assistant_prefix_text
 
 
 def _render_generation_prompt(problem_text: str, tokenizer: Any) -> str:

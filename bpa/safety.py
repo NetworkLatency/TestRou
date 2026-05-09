@@ -1,12 +1,25 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
+from collections.abc import Iterable
+from typing import Any, Optional
 
 from .state import RepetitionState
 
 
 CLOSE_THINK_TAG = "</think>"
+OPEN_THINK_TAG = "<think>"
+
+
+def captured_close_think_prefix(text: str) -> str:
+    idx = text.find(CLOSE_THINK_TAG)
+    if idx < 0:
+        return ""
+    return text[: idx + len(CLOSE_THINK_TAG)]
+
+
+def has_close_think_tag(text: str) -> bool:
+    return CLOSE_THINK_TAG in text
 
 
 def ensure_step_terminator(step_text: str, finish_reason: str) -> str:
@@ -144,6 +157,35 @@ def clean_latex_answer(answer: Optional[str]) -> Optional[str]:
     s = re.sub(r"\\sqrt\s*([A-Za-z0-9])(?![A-Za-z0-9])", r"\\sqrt{\1}", s)
     s = s.strip()
     return s or None
+
+
+def _after_last_close_think_tag(text: str) -> str | None:
+    idx = text.rfind(CLOSE_THINK_TAG)
+    if idx < 0:
+        return None
+    return text[idx + len(CLOSE_THINK_TAG) :]
+
+
+def extract_answer_from_final_step(final_step_text: Optional[str]) -> str | None:
+    if not isinstance(final_step_text, str) or not final_step_text.strip():
+        return None
+    boxed = extract_last_boxed(final_step_text)
+    if boxed is not None:
+        return clean_latex_answer(boxed)
+    post_think = _after_last_close_think_tag(final_step_text)
+    if post_think is not None and post_think.strip():
+        return clean_latex_answer(post_think)
+    return clean_latex_answer(final_step_text)
+
+
+def extract_answer_from_steps(
+    step_logs: Iterable[dict[str, Any]],
+    assistant_text: Optional[str] = None,
+) -> str | None:
+    steps = list(step_logs)
+    if steps:
+        return extract_answer_from_final_step(steps[-1].get("step_text"))
+    return extract_answer_from_final_step(assistant_text)
 
 
 def extract_answer(assistant_text: str) -> str | None:

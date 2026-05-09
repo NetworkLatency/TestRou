@@ -19,12 +19,13 @@ from bpa.eval.sampling_disagreement import (
     extract_novel_number_signature,
     extract_operation_signature,
     extract_rhs_number_signature,
+    extract_step_evidence,
     extract_structured_signature,
     rollout_disagreement_metrics,
 )
-from bpa.pipeline import _is_eos_finish, _slm_generate_step
+from bpa.pipeline import _in_final_answer_phase, _is_eos_finish, _slm_generate_final_answer, _slm_generate_step
 from bpa.render import render_for_continuation
-from bpa.safety import ensure_step_terminator, extract_answer, update_strict_step_repetition
+from bpa.safety import ensure_step_terminator, extract_answer_from_steps, update_strict_step_repetition
 from bpa.state import GenerationState, Phase, RepetitionState, TraceEvent
 from bpa.trace import BPAResult, json_safe
 
@@ -92,6 +93,7 @@ def _sample_probe_rollouts(
     probe_temperature: float,
     probe_max_tokens: int,
     probe_stop: str,
+    include_disagreement_metrics: bool = True,
 ) -> tuple[dict[str, Any], dict[str, float | int]]:
     tokenizer = slm.ensure_tokenizer()
     rendered = render_for_continuation(state.problem_text, state.assistant_prefix_text, tokenizer)
@@ -120,6 +122,7 @@ def _sample_probe_rollouts(
         number_signature = extract_number_signature(text)
         novel_number_signature = extract_novel_number_signature(text, context_text)
         rhs_number_signature = extract_rhs_number_signature(text, context_text)
+        step_evidence = extract_step_evidence(text, context_text)
         probe_decode_tokens += len(token_ids)
         rollouts.append(
             {
@@ -144,13 +147,20 @@ def _sample_probe_rollouts(
                 "rhs_number_signature_type": rhs_number_signature["signature_type"],
                 "rhs_number_signature_value": rhs_number_signature["signature_value"],
                 "rhs_number_signature": rhs_number_signature["signature"],
+                "step_evidence": step_evidence,
+                **{f"evidence_{key}": value for key, value in step_evidence.items() if key != "evidence_channels"},
+                "evidence_channels": step_evidence["evidence_channels"],
             }
         )
 
-    metrics = rollout_disagreement_metrics(
-        [row["text"] for row in rollouts],
-        [row["mean_logprob"] for row in rollouts],
-        context_text=context_text,
+    metrics = (
+        rollout_disagreement_metrics(
+            [row["text"] for row in rollouts],
+            [row["mean_logprob"] for row in rollouts],
+            context_text=context_text,
+        )
+        if include_disagreement_metrics
+        else {}
     )
     row = {
         "assistant_prefix_text": state.assistant_prefix_text,
@@ -210,33 +220,42 @@ def run_sampling_disagreement(
             state.stop_reason = "total_token_budget"
             break
 
+        final_answer_phase = _in_final_answer_phase(state, config)
         try:
-            probe_row, cost = _sample_probe_rollouts(
-                state,
-                slm,
-                config,
-                probe_k=probe_k,
-                probe_temperature=probe_temperature,
-                probe_max_tokens=probe_max_tokens,
-                probe_stop=probe_stop,
-            )
+            if final_answer_phase:
+                probe_row = None
+                cost = None
+            else:
+                probe_row, cost = _sample_probe_rollouts(
+                    state,
+                    slm,
+                    config,
+                    probe_k=probe_k,
+                    probe_temperature=probe_temperature,
+                    probe_max_tokens=probe_max_tokens,
+                    probe_stop=probe_stop,
+                )
         except ContextBudgetExceeded as exc:
             state.phase = Phase.DONE
             state.stop_reason = "context_budget"
             state.trace.append(TraceEvent(state.step_count, "context_budget_exhausted", exc.to_trace_data()))
             break
-        is_initial_probe = len(state.assistant_prefix_text) == 0
-        probe_row["boundary_idx"] = -1 if is_initial_probe else boundary_idx
-        probe_row["target_step_idx"] = state.step_count
-        probe_row["is_initial_probe"] = is_initial_probe
-        if not is_initial_probe:
-            boundary_idx += 1
-        for key in probe_cost:
-            probe_cost[key] += cost[key]
+        if probe_row is not None and cost is not None:
+            is_initial_probe = len(state.assistant_prefix_text) == 0
+            probe_row["boundary_idx"] = -1 if is_initial_probe else boundary_idx
+            probe_row["target_step_idx"] = state.step_count
+            probe_row["is_initial_probe"] = is_initial_probe
+            if not is_initial_probe:
+                boundary_idx += 1
+            for key in probe_cost:
+                probe_cost[key] += cost[key]
 
         decode_tokens_before = state.slm_decode_tokens
         try:
-            step_text, finish = _slm_generate_step(state, slm, config)
+            if final_answer_phase:
+                step_text, finish = _slm_generate_final_answer(state, slm, config)
+            else:
+                step_text, finish = _slm_generate_step(state, slm, config)
         except ContextBudgetExceeded as exc:
             state.phase = Phase.DONE
             state.stop_reason = "context_budget"
@@ -247,13 +266,14 @@ def run_sampling_disagreement(
         state.assistant_prefix_text += step_text_normalized
         state.step_count += 1
 
-        probe_row["main_step_text"] = step_text_normalized
-        probe_row["main_step_finish_reason"] = finish
-        probe_rows.append(probe_row)
+        if probe_row is not None:
+            probe_row["main_step_text"] = step_text_normalized
+            probe_row["main_step_finish_reason"] = finish
+            probe_rows.append(probe_row)
 
         log_row = {
             "step_idx": state.step_count - 1,
-            "decision": "slm_sampling_probe",
+            "decision": "slm_final_answer" if final_answer_phase else "slm_sampling_probe",
             "generation_source": "slm",
             "finish_reason": finish,
             "step_text": step_text_normalized,
@@ -280,7 +300,7 @@ def run_sampling_disagreement(
 
     state.trace.append(TraceEvent(state.step_count, "step_logs", {"steps": step_logs}))
     result = BPAResult(
-        answer=extract_answer(state.assistant_prefix_text),
+        answer=extract_answer_from_steps(step_logs, state.assistant_prefix_text),
         state=state,
         total_wall_time=time.time() - start_time,
     )

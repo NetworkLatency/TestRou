@@ -12,6 +12,8 @@ from bpa.safety import clean_latex_answer, extract_last_boxed
 OPERATOR_KEYWORDS = (
     "let",
     "substitute",
+    "plug",
+    "replace",
     "solve",
     "equate",
     "simplify",
@@ -23,6 +25,26 @@ OPERATOR_KEYWORDS = (
     "differentiate",
     "integrate",
 )
+
+EVIDENCE_CHANNEL_PRIORITY = (
+    "boxed_answer",
+    "rhs_novel_number",
+    "equation_claim",
+    "novel_number_set",
+    "operation_intent",
+)
+
+INTENT_KEYWORDS = {
+    "backtrack": ("wait", "mistake", "wrong", "not right", "recheck"),
+    "finalization": ("therefore", "hence", "answer", "boxed", "final"),
+    "case_split": ("case", "suppose", "assume", "consider", "if "),
+    "substitution": ("substitute", "plug", "replace"),
+    "solve_equation": ("solve", "quadratic", "factor", "equation", "root"),
+    "counting": ("count", "choose", "combination", "permutation", "arrangement", "number of"),
+    "geometry": ("angle", "arc", "circle", "triangle", "radius", "area", "perimeter", "parallel"),
+    "calculation": ("compute", "calculate", "simplify", "expand", "evaluate"),
+    "verification": ("check", "verify"),
+}
 
 _LATEX_NUMBER_PATTERNS = (
     re.compile(r"\\(?:d?frac)\s*\{[^{}]+\}\s*\{[^{}]+\}"),
@@ -65,6 +87,13 @@ def _extract_equation(text: str) -> str | None:
     return None
 
 
+def _normalize_equation_claim(equation: str) -> str:
+    normalized = clean_latex_answer(_normalize_signature_value(equation))
+    normalized = normalized.replace(r"\left", "").replace(r"\right", "")
+    normalized = re.sub(r"\s+", "", normalized)
+    return normalized
+
+
 def _extract_first_number(text: str) -> str | None:
     matches: list[re.Match[str]] = []
     for pattern in _LATEX_NUMBER_PATTERNS:
@@ -95,6 +124,21 @@ def _context_number_values(context_text: str) -> set[str]:
     return {_normalize_number_value(value) for _, value in _number_matches(context_text)}
 
 
+def _extract_novel_numbers(text: str, context_text: str = "", limit: int = 3) -> list[str]:
+    context_numbers = _context_number_values(context_text)
+    novel: list[str] = []
+    seen: set[str] = set()
+    for _, value in _number_matches(text):
+        normalized = _normalize_number_value(value)
+        if normalized in context_numbers or normalized in seen:
+            continue
+        seen.add(normalized)
+        novel.append(normalized)
+        if len(novel) >= limit:
+            break
+    return novel
+
+
 def _extract_first_novel_number(text: str, context_text: str = "") -> str | None:
     context_numbers = _context_number_values(context_text)
     for _, value in _number_matches(text):
@@ -120,6 +164,18 @@ def _extract_first_operator(text: str) -> str | None:
     return operator.group(1).lower() if operator is not None else None
 
 
+def _extract_operation_intent(text: str) -> str | None:
+    lowered = f" {text.lower()} "
+    for intent, keywords in INTENT_KEYWORDS.items():
+        for keyword in keywords:
+            if keyword.startswith(" ") or keyword.endswith(" "):
+                if keyword in lowered:
+                    return intent
+            elif re.search(r"\b" + re.escape(keyword) + r"\b", lowered):
+                return intent
+    return None
+
+
 def extract_structured_signature(text: str) -> dict[str, str]:
     boxed = extract_last_boxed(text)
     if boxed is not None:
@@ -138,6 +194,48 @@ def extract_structured_signature(text: str) -> dict[str, str]:
         return _signature("operator", operator)
 
     return _signature("none", "")
+
+
+def extract_step_evidence(text: str, context_text: str = "") -> dict[str, Any]:
+    boxed = extract_last_boxed(text)
+    equation = _extract_equation(text)
+    rhs_number = _extract_first_rhs_number(text, context_text)
+    novel_numbers = _extract_novel_numbers(text, context_text)
+    operation_intent = _extract_operation_intent(text)
+
+    boxed_answer = None
+    if boxed is not None:
+        cleaned = clean_latex_answer(boxed)
+        if cleaned:
+            boxed_answer = f"boxed_answer:{_normalize_number_value(cleaned)}"
+
+    rhs_novel_number = None
+    if rhs_number is not None:
+        rhs_novel_number = f"rhs_novel_number:{_normalize_number_value(rhs_number)}"
+
+    equation_claim = None
+    if equation is not None:
+        normalized_equation = _normalize_equation_claim(equation)
+        if normalized_equation:
+            equation_claim = f"equation_claim:{normalized_equation}"
+
+    novel_number_set = None
+    if novel_numbers:
+        novel_number_set = "novel_number_set:" + "|".join(novel_numbers)
+
+    evidence = {
+        "boxed_answer": boxed_answer,
+        "rhs_novel_number": rhs_novel_number,
+        "equation_claim": equation_claim,
+        "novel_number_set": novel_number_set,
+        "operation_intent": f"operation_intent:{operation_intent}" if operation_intent else None,
+    }
+    evidence["evidence_channels"] = [
+        channel
+        for channel in EVIDENCE_CHANNEL_PRIORITY
+        if evidence.get(channel) is not None
+    ]
+    return evidence
 
 
 def extract_number_signature(text: str) -> dict[str, str]:

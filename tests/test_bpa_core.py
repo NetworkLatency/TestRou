@@ -36,6 +36,7 @@ from bpa.eval.sampling_disagreement import (
     extract_number_signature,
     extract_operation_signature,
     extract_rhs_number_signature,
+    extract_step_evidence,
     extract_structured_signature,
     novel_number_vote_disagreement,
     number_vote_disagreement,
@@ -48,7 +49,14 @@ from bpa.eval.sampling_disagreement import (
 from bpa.engines import ModelEngine, completion_logprobs, generated_text, generated_token_ids
 from bpa.pipeline import bpa_solve
 from bpa.render import render_for_continuation
-from bpa.safety import clean_latex_answer, ensure_step_terminator, extract_answer, update_repetition, update_strict_step_repetition
+from bpa.safety import (
+    clean_latex_answer,
+    ensure_step_terminator,
+    extract_answer,
+    extract_answer_from_steps,
+    update_repetition,
+    update_strict_step_repetition,
+)
 from bpa.state import GenerationState, RepetitionState
 
 
@@ -215,8 +223,8 @@ class EmptyAssistantRejectingTokenizer(FakeTokenizer):
 class CoreTests(unittest.TestCase):
     def test_render_empty_prefix_uses_generation_prompt(self):
         tok = EmptyAssistantRejectingTokenizer()
-        self.assertEqual(render_for_continuation("p", "", tok), "USER:p\nASSISTANT:")
-        self.assertEqual(render_for_continuation("p", "bad", tok), "USER:p\nASSISTANT:bad")
+        self.assertEqual(render_for_continuation("p", "", tok), "USER:p\nASSISTANT:<think>")
+        self.assertEqual(render_for_continuation("p", "bad", tok), "USER:p\nASSISTANT:<think>bad")
 
     def test_step_terminator_and_repetition(self):
         self.assertEqual(ensure_step_terminator("abc", "stop"), "abc\n\n")
@@ -317,6 +325,16 @@ class CoreTests(unittest.TestCase):
         self.assertIn("rhs_number_vote_disagreement", metrics)
         self.assertIn("self_bleu_disagreement", metrics)
 
+    def test_step_evidence_splits_numbers_and_intent(self):
+        evidence = extract_step_evidence("Now solve x = 3/4.\n\n", "Problem mentions 100.")
+        self.assertEqual(evidence["rhs_novel_number"], "rhs_novel_number:3/4")
+        self.assertEqual(evidence["equation_claim"], "equation_claim:Nowsolvex=3/4")
+        self.assertEqual(evidence["operation_intent"], "operation_intent:solve_equation")
+        self.assertIn("rhs_novel_number", evidence["evidence_channels"])
+
+        generic = extract_step_evidence("Now we continue.\n\n", "Problem mentions 100.")
+        self.assertEqual(generic["evidence_channels"], [])
+
     def test_score_variance(self):
         self.assertAlmostEqual(score_variance([-1.0, -2.0, None]), 0.25)
         self.assertIsNone(score_variance([None, -1.0]))
@@ -337,6 +355,15 @@ class CoreTests(unittest.TestCase):
     def test_extract_answer_cleans_latex_only(self):
         self.assertEqual(extract_answer(r"done \boxed{\dfrac{3}{56}}"), r"\frac{3}{56}")
         self.assertEqual(extract_answer(r"reasoning</think> $11\sqrt2$"), r"11\sqrt{2}")
+
+    def test_extract_answer_from_steps_uses_only_final_step(self):
+        steps = [
+            {"step_text": r"tentative \boxed{999}\n\n"},
+            {"step_text": r"corrected final \boxed{\dfrac{3}{56}}"},
+        ]
+        self.assertEqual(extract_answer_from_steps(steps, r"fallback \boxed{0}"), r"\frac{3}{56}")
+        self.assertEqual(extract_answer_from_steps([{"step_text": "No boxed final."}], r"\boxed{0}"), "No boxed final.")
+        self.assertIsNone(extract_answer_from_steps([{"step_text": r"old \boxed{9}"}, {"step_text": ""}], r"\boxed{0}"))
 
     def test_summary_metrics(self):
         rows = [
@@ -441,19 +468,18 @@ class CoreTests(unittest.TestCase):
             probe_max_tokens=32,
         )
         self.assertEqual(result.answer, "1")
-        self.assertEqual(len(probes), 3)
+        self.assertEqual(len(probes), 2)
         self.assertEqual(probes[0]["boundary_idx"], -1)
         self.assertTrue(probes[0]["is_initial_probe"])
         self.assertEqual(probes[0]["prefix_char_len"], 0)
         self.assertEqual(probes[1]["boundary_idx"], 0)
         self.assertFalse(probes[1]["is_initial_probe"])
-        self.assertEqual(probes[2]["boundary_idx"], 1)
         self.assertAlmostEqual(probes[0]["structured_disagreement"], 0.25)
-        self.assertEqual(probe_cost["probe_generate_calls"], 3)
+        self.assertEqual(probe_cost["probe_generate_calls"], 2)
 
         problem = EvalProblem(problem_id=1, question_id="q1", problem_text="Problem: x?", raw={}, gold_answer="1")
         summary = build_problem_summary(problem, result, probes, probe_cost, "math500")
-        self.assertEqual(summary["num_boundaries"], 2)
+        self.assertEqual(summary["num_boundaries"], 1)
         self.assertEqual(summary["num_initial_probes"], 1)
         self.assertNotIn("num_thinking_boundaries", summary)
         self.assertNotIn("num_final_answer_boundaries", summary)
@@ -463,7 +489,7 @@ class CoreTests(unittest.TestCase):
             write_sampling_outputs(out_dir, enriched, [summary])
             self.assertTrue((out_dir / "probes.jsonl").exists())
             self.assertTrue((out_dir / "problem_summary.csv").exists())
-            self.assertEqual(len((out_dir / "probes.jsonl").read_text(encoding="utf-8").splitlines()), 3)
+            self.assertEqual(len((out_dir / "probes.jsonl").read_text(encoding="utf-8").splitlines()), 2)
 
     def test_boundary_label_helpers(self):
         rows = [{"boundary_idx": -1, "is_initial_probe": True}] + [{"boundary_idx": idx} for idx in range(10)]
@@ -543,24 +569,15 @@ class CoreTests(unittest.TestCase):
         slm = SamplingProbeEngine(
             outputs=[
                 ("Let x = 0.\n\n", "stop"),
-                (r"\boxed{1}", "eos"),
             ],
             probe_outputs=[
-                "x = 1",
-                "x = 1",
-                "x = 1",
-                "x = 1",
                 "x = 1",
                 "x = 2",
                 "x = 3",
                 "x = 4",
-                "answer = 1",
-                "answer = 1",
-                "answer = 1",
-                "answer = 1",
             ],
         )
-        llm = SequencedEngine([("</think>\n\n", "stop")])
+        llm = SequencedEngine([(r"\boxed{9}", "eos")])
         result, boundaries, probe_cost = run_disagreement_routing(
             "Problem: x?",
             slm,
@@ -572,13 +589,11 @@ class CoreTests(unittest.TestCase):
             probe_temperature=0.7,
             probe_max_tokens=32,
         )
-        self.assertEqual(result.answer, "1")
-        self.assertEqual(len(boundaries), 3)
-        self.assertEqual(boundaries[0]["boundary_idx"], -1)
-        self.assertFalse(boundaries[0]["routed_to_llm"])
-        self.assertTrue(boundaries[1]["routed_to_llm"])
-        self.assertFalse(boundaries[2]["routed_to_llm"])
-        self.assertEqual(probe_cost["probe_generate_calls"], 3)
+        self.assertEqual(result.answer, "9")
+        self.assertEqual(len(boundaries), 1)
+        self.assertEqual(boundaries[0]["boundary_idx"], 0)
+        self.assertTrue(boundaries[0]["routed_to_llm"])
+        self.assertEqual(probe_cost["probe_generate_calls"], 1)
 
     def test_prefix_consensus_reuses_anchor_probe_prefix(self):
         slm = WeightedSamplingProbeEngine(
@@ -587,13 +602,9 @@ class CoreTests(unittest.TestCase):
                 (r" and final \boxed{1}", "eos"),
             ],
             probe_outputs=[
-                ("initial a", -0.2, "stop"),
-                ("initial b", -0.2, "stop"),
-                ("initial c", -0.2, "stop"),
-                ("initial d", -0.2, "stop"),
-                ("Let x = 1 because", -0.2, "length"),
-                ("Let x = 1 therefore", -0.05, "length"),
-                ("Let x = 1 so", -0.3, "length"),
+                ("x = 1", -0.2, "length"),
+                ("x = 1", -0.05, "length"),
+                ("x = 1", -0.3, "length"),
                 ("Try y = 2", -0.4, "length"),
             ],
         )
@@ -605,19 +616,21 @@ class CoreTests(unittest.TestCase):
             BPAConfig(max_total_tokens=200),
             routing_mode="prefix_consensus",
             min_agreement_count=3,
-            min_prefix_tokens=8,
             probe_k=4,
             probe_temperature=0.7,
             probe_max_tokens=32,
         )
         self.assertEqual(result.answer, "1")
-        self.assertTrue(boundaries[1]["reused_probe_rollout"])
-        self.assertTrue(boundaries[1]["continued_probe_rollout"])
-        self.assertEqual(boundaries[1]["prefix_anchor_idx"], 1)
-        self.assertEqual(boundaries[1]["prefix_consensus_support_count"], 3)
-        self.assertEqual(boundaries[1]["selected_rollout_idx"], 1)
-        self.assertEqual(boundaries[1]["probe_prefix_text"], "Let x = 1 therefore")
-        self.assertIn(r"Let x = 1 therefore and final \boxed{1}", result.state.assistant_prefix_text)
+        self.assertEqual(len(boundaries), 1)
+        self.assertTrue(boundaries[0]["reused_probe_rollout"])
+        self.assertTrue(boundaries[0]["continued_probe_rollout"])
+        self.assertEqual(boundaries[0]["prefix_anchor_idx"], 1)
+        self.assertEqual(boundaries[0]["prefix_consensus_channel"], "rhs_novel_number")
+        self.assertEqual(boundaries[0]["prefix_consensus_value"], "rhs_novel_number:1")
+        self.assertEqual(boundaries[0]["prefix_consensus_support_count"], 3)
+        self.assertEqual(boundaries[0]["selected_rollout_idx"], 1)
+        self.assertEqual(boundaries[0]["probe_prefix_text"], "x = 1")
+        self.assertIn(r"x = 1 and final \boxed{1}", result.state.assistant_prefix_text)
 
     def test_prefix_consensus_routes_unstable_prefixes_to_llm(self):
         slm = WeightedSamplingProbeEngine(
@@ -625,10 +638,6 @@ class CoreTests(unittest.TestCase):
                 ("First step.\n\n", "stop"),
             ],
             probe_outputs=[
-                ("initial a", -0.2, "stop"),
-                ("initial b", -0.2, "stop"),
-                ("initial c", -0.2, "stop"),
-                ("initial d", -0.2, "stop"),
                 ("Let x = 1", -0.05, "length"),
                 ("Try y = 2", -0.1, "length"),
                 ("Compute z", -0.2, "length"),
@@ -643,16 +652,16 @@ class CoreTests(unittest.TestCase):
             BPAConfig(max_total_tokens=200),
             routing_mode="prefix_consensus",
             min_agreement_count=3,
-            min_prefix_tokens=4,
             probe_k=4,
             probe_temperature=0.7,
             probe_max_tokens=32,
         )
         self.assertEqual(result.answer, "9")
-        self.assertTrue(boundaries[1]["routed_to_llm"])
-        self.assertFalse(boundaries[1]["reused_probe_rollout"])
-        self.assertEqual(boundaries[1]["prefix_anchor_idx"], 0)
-        self.assertEqual(boundaries[1]["prefix_consensus_support_count"], 1)
+        self.assertEqual(len(boundaries), 1)
+        self.assertTrue(boundaries[0]["routed_to_llm"])
+        self.assertFalse(boundaries[0]["reused_probe_rollout"])
+        self.assertIsNone(boundaries[0]["prefix_anchor_idx"])
+        self.assertEqual(boundaries[0]["prefix_consensus_support_count"], 1)
         self.assertEqual(llm.generate_calls, 1)
 
     def test_prefix_consensus_selected_stop_probe_uses_eos_lookahead(self):
@@ -662,10 +671,6 @@ class CoreTests(unittest.TestCase):
                 ("", "eos"),
             ],
             probe_outputs=[
-                ("initial a", -0.2, "stop"),
-                ("initial b", -0.2, "stop"),
-                ("initial c", -0.2, "stop"),
-                ("initial d", -0.2, "stop"),
                 (r"Final \boxed{1}\n\n", -0.05, "stop"),
                 (r"Final \boxed{1}\n\n", -0.1, "stop"),
                 (r"Final \boxed{1}\n\n", -0.2, "stop"),
@@ -680,16 +685,15 @@ class CoreTests(unittest.TestCase):
             BPAConfig(max_total_tokens=200, post_stop_lookahead_tokens=4),
             routing_mode="prefix_consensus",
             min_agreement_count=3,
-            min_prefix_tokens=8,
             probe_k=4,
             probe_temperature=0.7,
             probe_max_tokens=32,
         )
         self.assertEqual(result.answer, "1")
         self.assertEqual(result.state.stop_reason, "eos")
-        self.assertEqual(len(boundaries), 2)
-        self.assertTrue(boundaries[1]["reused_probe_rollout"])
-        self.assertEqual(boundaries[1]["main_step_finish_reason"], "eos")
+        self.assertEqual(len(boundaries), 1)
+        self.assertTrue(boundaries[0]["reused_probe_rollout"])
+        self.assertEqual(boundaries[0]["main_step_finish_reason"], "eos")
 
     def test_threshold_from_probes(self):
         with tempfile.TemporaryDirectory() as tmp:
