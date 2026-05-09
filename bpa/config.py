@@ -36,6 +36,7 @@ class BPAConfig:
 
     max_step_tokens: int = 1024
     max_total_tokens: int = 14336
+    post_stop_lookahead_tokens: int = 0
 
     # Runtime switches used by baselines and diagnostic runs.
     reset_prefix_cache_after_problem: bool = True
@@ -45,6 +46,8 @@ class BPAConfig:
             raise ValueError("max_total_tokens must be >= 1")
         if self.max_step_tokens < 1:
             raise ValueError("max_step_tokens must be >= 1")
+        if self.post_stop_lookahead_tokens < 0:
+            raise ValueError("post_stop_lookahead_tokens must be >= 0")
         for name in ("slm_backend", "llm_backend"):
             backend = getattr(self, name)
             if backend not in {"vllm", "openai"}:

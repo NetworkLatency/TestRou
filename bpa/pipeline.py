@@ -5,9 +5,9 @@ import time
 from .cascade.l0 import l0_filter
 from .config import BPAConfig
 from .context_budget import ContextBudgetExceeded, generation_budget_for_rendered
-from .engines import finish_reason, generated_text, generated_token_ids
+from .engines import completion, finish_reason, generated_text, generated_token_ids
 from .render import render_for_continuation
-from .safety import ensure_step_terminator, extract_answer, update_strict_step_repetition
+from .safety import CLOSE_THINK_TAG, ensure_step_terminator, extract_answer, update_strict_step_repetition
 from .state import CascadeResult, Decision, GenerationState, Phase, RepetitionState, TraceEvent
 from .trace import BPAResult
 
@@ -20,6 +20,124 @@ def run_cascade(state: GenerationState, slm, llm, config: BPAConfig) -> CascadeR
     state.trace.append(TraceEvent(state.step_count, "l0", l0.to_dict()))
     decision = Decision.LLM_FULL if l0.passed else Decision.SLM_DIRECT
     return CascadeResult(decision=decision, l0=l0)
+
+
+def _account_generation_cost(
+    state: GenerationState,
+    account: str,
+    *,
+    wall_time: float,
+    token_count: int,
+    prompt_tokens: int,
+) -> None:
+    if account == "slm":
+        state.slm_generate_calls += 1
+        state.slm_wall_time += wall_time
+        state.slm_decode_tokens += token_count
+        state.slm_prefill_tokens += prompt_tokens
+    else:
+        state.llm_generation_wall_time += wall_time
+        state.llm_decode_tokens += token_count
+        state.llm_prefill_tokens += prompt_tokens
+        state.llm_full_calls += 1
+
+
+def _tokenizer_eos_token_ids(engine) -> set[int]:
+    tokenizer = engine.ensure_tokenizer()
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is None:
+        return set()
+    if isinstance(eos_token_id, int):
+        return {eos_token_id}
+    try:
+        return {int(token_id) for token_id in eos_token_id if token_id is not None}
+    except TypeError:
+        return set()
+
+
+def _output_hit_eos(output, engine) -> bool:
+    if finish_reason(output) in EOS_FINISH_REASONS:
+        return True
+
+    eos_token_ids = _tokenizer_eos_token_ids(engine)
+    if not eos_token_ids:
+        return False
+
+    stop_reason = getattr(completion(output), "stop_reason", None)
+    if isinstance(stop_reason, int) and stop_reason in eos_token_ids:
+        return True
+    if isinstance(stop_reason, str):
+        try:
+            if int(stop_reason) in eos_token_ids:
+                return True
+        except ValueError:
+            pass
+
+    token_ids = generated_token_ids(output)
+    return bool(token_ids and token_ids[-1] in eos_token_ids)
+
+
+def _captured_close_think_prefix(text: str) -> str:
+    idx = text.find(CLOSE_THINK_TAG)
+    if idx < 0:
+        return ""
+    return text[: idx + len(CLOSE_THINK_TAG)]
+
+
+def _post_stop_lookahead(
+    state: GenerationState,
+    engine,
+    config: BPAConfig,
+    *,
+    account: str,
+    step_text: str,
+    prefix_extension: str = "",
+    total_token_offset: int = 0,
+) -> tuple[str, str]:
+    lookahead_tokens = int(config.post_stop_lookahead_tokens or 0)
+    if lookahead_tokens <= 0:
+        return "", "stop"
+
+    remaining_total_tokens = config.max_total_tokens - state.slm_decode_tokens - state.llm_decode_tokens - total_token_offset
+    if remaining_total_tokens <= 0:
+        return "", "stop"
+
+    lookahead_prefix = prefix_extension + ensure_step_terminator(step_text, "stop")
+    rendered = render_for_continuation(
+        state.problem_text,
+        state.assistant_prefix_text + lookahead_prefix,
+        engine.ensure_tokenizer(),
+    )
+    max_tokens, prompt_tokens = generation_budget_for_rendered(
+        rendered,
+        engine,
+        config,
+        min(lookahead_tokens, remaining_total_tokens),
+    )
+    sampling = engine.sampling_params(
+        max_tokens=max_tokens,
+        temperature=0.0,
+        logprobs=1,
+    )
+    generate_start = time.time()
+    out = engine.generate(rendered, sampling)[0]
+    generate_wall_time = time.time() - generate_start
+    token_count = len(generated_token_ids(out))
+    _account_generation_cost(
+        state,
+        account,
+        wall_time=generate_wall_time,
+        token_count=token_count,
+        prompt_tokens=prompt_tokens,
+    )
+
+    text = generated_text(out)
+    close_think_prefix = _captured_close_think_prefix(text)
+    if close_think_prefix:
+        return close_think_prefix, "stop"
+    if finish_reason(out) == "stop" or _output_hit_eos(out, engine):
+        return text, "eos"
+    return "", "stop"
 
 
 def _generate_step_with_engine(
@@ -56,17 +174,30 @@ def _generate_step_with_engine(
     out = engine.generate(rendered, sampling)[0]
     generate_wall_time = time.time() - generate_start
     token_count = len(generated_token_ids(out))
-    if account == "slm":
-        state.slm_generate_calls += 1
-        state.slm_wall_time += generate_wall_time
-        state.slm_decode_tokens += token_count
-        state.slm_prefill_tokens += prompt_tokens
-    else:
-        state.llm_generation_wall_time += generate_wall_time
-        state.llm_decode_tokens += token_count
-        state.llm_prefill_tokens += prompt_tokens
-        state.llm_full_calls += 1
-    return generated_text(out), finish_reason(out)
+    _account_generation_cost(
+        state,
+        account,
+        wall_time=generate_wall_time,
+        token_count=token_count,
+        prompt_tokens=prompt_tokens,
+    )
+
+    text = generated_text(out)
+    finish = finish_reason(out)
+    if finish == "stop":
+        lookahead_text, lookahead_finish = _post_stop_lookahead(
+            state,
+            engine,
+            config,
+            account=account,
+            step_text=text,
+            prefix_extension=prefix_extension,
+            total_token_offset=total_token_offset,
+        )
+        if lookahead_text or lookahead_finish == "eos":
+            text += lookahead_text
+            finish = lookahead_finish
+    return text, finish
 
 
 def _slm_generate_step(state: GenerationState, slm, config: BPAConfig) -> tuple[str, str]:

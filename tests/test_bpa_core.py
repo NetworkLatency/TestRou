@@ -655,6 +655,42 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(boundaries[1]["prefix_consensus_support_count"], 1)
         self.assertEqual(llm.generate_calls, 1)
 
+    def test_prefix_consensus_selected_stop_probe_uses_eos_lookahead(self):
+        slm = WeightedSamplingProbeEngine(
+            outputs=[
+                ("First step.\n\n", "length"),
+                ("", "eos"),
+            ],
+            probe_outputs=[
+                ("initial a", -0.2, "stop"),
+                ("initial b", -0.2, "stop"),
+                ("initial c", -0.2, "stop"),
+                ("initial d", -0.2, "stop"),
+                (r"Final \boxed{1}\n\n", -0.05, "stop"),
+                (r"Final \boxed{1}\n\n", -0.1, "stop"),
+                (r"Final \boxed{1}\n\n", -0.2, "stop"),
+                ("Try something else", -0.3, "stop"),
+            ],
+        )
+        llm = SequencedEngine(fail_on_generate=True)
+        result, boundaries, _ = run_disagreement_routing(
+            "Problem: x?",
+            slm,
+            llm,
+            BPAConfig(max_total_tokens=200, post_stop_lookahead_tokens=4),
+            routing_mode="prefix_consensus",
+            min_agreement_count=3,
+            min_prefix_tokens=8,
+            probe_k=4,
+            probe_temperature=0.7,
+            probe_max_tokens=32,
+        )
+        self.assertEqual(result.answer, "1")
+        self.assertEqual(result.state.stop_reason, "eos")
+        self.assertEqual(len(boundaries), 2)
+        self.assertTrue(boundaries[1]["reused_probe_rollout"])
+        self.assertEqual(boundaries[1]["main_step_finish_reason"], "eos")
+
     def test_threshold_from_probes(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "probes.jsonl"
@@ -677,6 +713,22 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result.state.stop_reason, "eos")
         self.assertEqual(llm.generate_calls, 0)
         self.assertIn("The answer is 42.", result.state.assistant_prefix_text)
+
+    def test_post_stop_lookahead_stops_on_eos(self):
+        slm = SequencedEngine([(r"Final answer: \boxed{2}\n\n", "stop"), ("", "stop")])
+        llm = SequencedEngine(fail_on_generate=True)
+        result = bpa_solve("p", slm, llm, BPAConfig(max_total_tokens=200, post_stop_lookahead_tokens=4))
+        self.assertEqual(result.answer, "2")
+        self.assertEqual(result.state.stop_reason, "eos")
+        self.assertEqual(result.state.step_count, 1)
+
+    def test_post_stop_lookahead_captures_close_think(self):
+        slm = SequencedEngine([("reasoning\n\n", "stop"), ("</think>", "length"), (r"Final \boxed{2}", "eos")])
+        llm = SequencedEngine(fail_on_generate=True)
+        result = bpa_solve("p", slm, llm, BPAConfig(max_total_tokens=200, post_stop_lookahead_tokens=8))
+        self.assertEqual(result.answer, "2")
+        self.assertIn("</think>", result.state.assistant_prefix_text)
+        self.assertEqual(result.state.stop_reason, "eos")
 
     def test_unified_does_not_stop_on_internal_ngram_repetition(self):
         repeated_phrase = "alpha alpha alpha alpha alpha alpha alpha alpha.\n\n"

@@ -16,7 +16,7 @@ from bpa.engines import init_engines
 from bpa.eval.benchmark_eval import benchmark_eval_match
 from bpa.eval.datasets import load_eval_dataset
 from bpa.eval.exp_sampling_disagreement import _max, _mean, _sample_probe_rollouts
-from bpa.pipeline import _generate_step_with_engine, _is_eos_finish, _llm_generate_step, _slm_generate_step
+from bpa.pipeline import _generate_step_with_engine, _is_eos_finish, _llm_generate_step, _post_stop_lookahead, _slm_generate_step
 from bpa.safety import ensure_step_terminator, extract_answer, update_strict_step_repetition
 from bpa.state import GenerationState, Phase, RepetitionState, TraceEvent
 from bpa.trace import BPAResult, json_safe
@@ -35,6 +35,7 @@ SUMMARY_FIELDS = [
     "threshold_quantile",
     "min_agreement_count",
     "min_prefix_tokens",
+    "post_stop_lookahead_tokens",
     "num_boundaries",
     "num_llm_routed_steps",
     "num_slm_steps",
@@ -228,6 +229,23 @@ def _selected_probe_prefix_step(
 
     if prefix_finish in {"stop", "eos"}:
         state.slm_decode_tokens += prefix_token_count
+        if prefix_finish == "stop":
+            lookahead_text, lookahead_finish = _post_stop_lookahead(
+                state,
+                slm,
+                config,
+                account="slm",
+                step_text=prefix_text,
+            )
+            if lookahead_text or lookahead_finish == "eos":
+                return (
+                    prefix_text + lookahead_text,
+                    lookahead_finish,
+                    prefix_token_count,
+                    False,
+                    prefix_text,
+                    "",
+                )
         return prefix_text, prefix_finish, prefix_token_count, False, prefix_text, ""
 
     current_decode_tokens = state.slm_decode_tokens + state.llm_decode_tokens
@@ -495,9 +513,13 @@ def main() -> None:
     parser.add_argument("--probe-k", type=int, default=4)
     parser.add_argument("--probe-temperature", type=float, default=0.7)
     parser.add_argument("--probe-max-tokens", type=int, default=32)
+    parser.add_argument("--post-stop-lookahead-tokens", type=int, default=None)
+    parser.add_argument("--output-name", default=None, help="Optional diagnostics output folder name under disagreement_routing/.")
     args = parser.parse_args()
 
     config = BPAConfig.from_json(args.config)
+    if args.post_stop_lookahead_tokens is not None:
+        config = config.with_updates(post_stop_lookahead_tokens=args.post_stop_lookahead_tokens)
     threshold = args.threshold
     if args.routing_mode == "threshold" and threshold is None:
         threshold_source = Path(args.threshold_source) if args.threshold_source else _default_probe_path(config, args.dataset)
@@ -542,6 +564,7 @@ def main() -> None:
                 "threshold_quantile": args.threshold_quantile if args.routing_mode == "threshold" and args.threshold is None else None,
                 "min_agreement_count": args.min_agreement_count,
                 "min_prefix_tokens": args.min_prefix_tokens,
+                "post_stop_lookahead_tokens": config.post_stop_lookahead_tokens,
                 "num_boundaries": len(real_boundary_rows),
                 "num_llm_routed_steps": sum(1 for row in real_boundary_rows if row.get("routed_to_llm")),
                 "num_slm_steps": sum(1 for row in real_boundary_rows if not row.get("routed_to_llm")),
@@ -564,7 +587,7 @@ def main() -> None:
             slm.clear_runtime_cache()
             llm.clear_runtime_cache()
 
-    out_dir = Path(config.output_dir) / "diagnostics" / "disagreement_routing" / args.dataset
+    out_dir = Path(config.output_dir) / "diagnostics" / "disagreement_routing" / (args.output_name or args.dataset)
     write_outputs(out_dir, summary_rows, all_boundary_rows)
     print(f"Wrote {out_dir / 'summary.csv'}")
     print(f"Wrote {out_dir / 'routing_boundaries.jsonl'}")
