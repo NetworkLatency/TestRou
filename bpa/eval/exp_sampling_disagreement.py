@@ -15,7 +15,13 @@ from bpa.engines import init_engines, logprob_value
 from bpa.eval.benchmark_eval import benchmark_eval_match
 from bpa.eval.datasets import EvalProblem, load_eval_dataset
 from bpa.eval.sampling_disagreement import extract_step_evidence
-from bpa.pipeline import _in_final_answer_phase, _is_eos_finish, _slm_generate_final_answer, _slm_generate_step
+from bpa.pipeline import (
+    _final_answer_stop_reason,
+    _in_final_answer_phase,
+    _is_eos_finish,
+    _slm_generate_final_answer,
+    _slm_generate_step,
+)
 from bpa.render import render_for_continuation
 from bpa.safety import ensure_step_terminator, extract_answer_from_steps, update_strict_step_repetition
 from bpa.state import GenerationState, Phase, RepetitionState, TraceEvent
@@ -220,6 +226,11 @@ def run_sampling_disagreement(
             state.phase = Phase.DONE
             state.stop_reason = "empty_step"
             state.trace.append(TraceEvent(state.step_count, "empty_step", {}))
+            break
+
+        if final_answer_phase:
+            state.phase = Phase.DONE
+            state.stop_reason = _final_answer_stop_reason(finish)
             break
 
         trigger = update_strict_step_repetition(rep, step_text_normalized)

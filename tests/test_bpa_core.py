@@ -714,6 +714,39 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(llm.generate_calls, 0)
         self.assertIn("The answer is 42.", result.state.assistant_prefix_text)
 
+    def test_unified_final_answer_phase_runs_once_on_stop(self):
+        slm = SequencedEngine([("</think>\n\n", "stop"), ("The answer is 42.\n\n", "stop")])
+        llm = SequencedEngine(fail_on_generate=True)
+        result = bpa_solve("p", slm, llm, BPAConfig(max_total_tokens=200))
+        self.assertEqual(result.answer, "42")
+        self.assertEqual(result.state.stop_reason, "final_answer_stop")
+        self.assertEqual(result.state.slm_generate_calls, 3)
+        self.assertEqual(result.state.step_count, 2)
+
+    def test_disagreement_routing_final_answer_phase_runs_once_on_stop(self):
+        slm = SamplingProbeEngine(
+            outputs=[
+                ("</think>\n\n", "stop"),
+                ("The answer is 42.\n\n", "stop"),
+            ],
+            probe_outputs=[],
+        )
+        llm = SequencedEngine(fail_on_generate=True)
+        result, boundaries, _ = run_disagreement_routing(
+            "Problem: x?",
+            slm,
+            llm,
+            BPAConfig(max_total_tokens=200),
+            probe_k=4,
+            probe_temperature=0.7,
+            probe_max_tokens=32,
+        )
+        self.assertEqual(result.answer, "42")
+        self.assertEqual(result.state.stop_reason, "final_answer_stop")
+        self.assertEqual(slm.generate_calls, 2)
+        self.assertEqual(result.state.step_count, 2)
+        self.assertEqual(boundaries, [])
+
     def test_post_stop_lookahead_stops_on_eos(self):
         slm = SequencedEngine([(r"Final answer: \boxed{2}\n\n", "stop"), ("", "stop")])
         llm = SequencedEngine(fail_on_generate=True)

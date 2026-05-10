@@ -239,6 +239,14 @@ def _is_eos_finish(finish: str) -> bool:
     return finish in EOS_FINISH_REASONS
 
 
+def _final_answer_stop_reason(finish: str) -> str:
+    if _is_eos_finish(finish):
+        return "eos"
+    if finish:
+        return f"final_answer_{finish}"
+    return "final_answer_done"
+
+
 def _generation_source(cascade: CascadeResult) -> str:
     if cascade.decision == Decision.LLM_FULL:
         return "llm"
@@ -293,6 +301,11 @@ def bpa_solve(problem_text: str, slm, llm, config: BPAConfig) -> BPAResult:
             state.phase = Phase.DONE
             state.stop_reason = "empty_step"
             state.trace.append(TraceEvent(state.step_count, "empty_step", {}))
+            break
+
+        if cascade is None:
+            state.phase = Phase.DONE
+            state.stop_reason = _final_answer_stop_reason(finish)
             break
 
         trigger = update_strict_step_repetition(rep, step_text_normalized)

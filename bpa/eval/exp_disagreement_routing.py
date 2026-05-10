@@ -19,6 +19,7 @@ from bpa.eval.exp_sampling_disagreement import _sample_probe_rollouts
 from bpa.eval.sampling_disagreement import EVIDENCE_CHANNEL_PRIORITY
 from bpa.pipeline import (
     _generate_step_with_engine,
+    _final_answer_stop_reason,
     _in_final_answer_phase,
     _is_eos_finish,
     _llm_generate_step,
@@ -376,16 +377,8 @@ def run_disagreement_routing(
                 state.trace.append(TraceEvent(state.step_count, "empty_step", {}))
                 break
 
-            trigger = update_strict_step_repetition(rep, step_text_normalized)
-            if trigger is not None:
-                state.phase = Phase.DONE
-                state.stop_reason = trigger
-                state.trace.append(TraceEvent(state.step_count, "step_repetition_stop", {"trigger_reason": trigger}))
-                break
-
-            if _is_eos_finish(finish):
-                state.phase = Phase.DONE
-                state.stop_reason = "eos"
+            state.phase = Phase.DONE
+            state.stop_reason = _final_answer_stop_reason(finish)
             continue
 
         selected_rollout = None
