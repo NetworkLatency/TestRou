@@ -16,6 +16,9 @@ from bpa.eval.benchmark_eval import benchmark_eval_match
 from bpa.eval.datasets import EvalProblem, load_eval_dataset
 from bpa.eval.sampling_disagreement import extract_step_evidence
 from bpa.pipeline import (
+    THINKING_RECOVERY_STOP_REASONS,
+    _append_forced_close_think,
+    _can_force_final_answer_from_thinking,
     _final_answer_stop_reason,
     _in_final_answer_phase,
     _is_eos_finish,
@@ -235,9 +238,12 @@ def run_sampling_disagreement(
 
         trigger = update_strict_step_repetition(rep, step_text_normalized)
         if trigger is not None:
+            state.trace.append(TraceEvent(state.step_count, "step_repetition_stop", {"trigger_reason": trigger}))
+            if trigger in THINKING_RECOVERY_STOP_REASONS and _can_force_final_answer_from_thinking(state, config):
+                _append_forced_close_think(state)
+                continue
             state.phase = Phase.DONE
             state.stop_reason = trigger
-            state.trace.append(TraceEvent(state.step_count, "step_repetition_stop", {"trigger_reason": trigger}))
             break
 
         if _is_eos_finish(finish):

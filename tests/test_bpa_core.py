@@ -676,6 +676,35 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(boundaries[0]["prefix_consensus_support_count"], 1)
         self.assertEqual(llm.generate_calls, 1)
 
+    def test_operation_intent_is_diagnostic_not_routing_evidence(self):
+        slm = WeightedSamplingProbeEngine(
+            outputs=[
+                ("First step.\n\n", "stop"),
+            ],
+            probe_outputs=[
+                ("So, solve the equation.\n\n", -0.1, "stop"),
+                ("Now solve this equation.\n\n", -0.2, "stop"),
+                ("We solve the equation.\n\n", -0.3, "stop"),
+                ("Let us solve the equation.\n\n", -0.4, "stop"),
+            ],
+        )
+        llm = SequencedEngine([(r"\boxed{9}", "eos")])
+        result, boundaries, _ = run_disagreement_routing(
+            "Problem: x?",
+            slm,
+            llm,
+            BPAConfig(max_total_tokens=200),
+            min_agreement_count=3,
+            probe_k=4,
+            probe_temperature=0.7,
+            probe_max_tokens=32,
+        )
+        self.assertEqual(result.answer, "9")
+        self.assertTrue(boundaries[0]["routed_to_llm"])
+        self.assertFalse(boundaries[0]["reused_probe_rollout"])
+        self.assertIsNone(boundaries[0]["prefix_consensus_channel"])
+        self.assertEqual(boundaries[0]["rollouts"][0]["evidence_operation_intent"], "operation_intent:solve_equation")
+
     def test_prefix_consensus_selected_stop_probe_uses_eos_lookahead(self):
         slm = WeightedSamplingProbeEngine(
             outputs=[
@@ -777,17 +806,72 @@ class CoreTests(unittest.TestCase):
         self.assertIn("Different final step.", result.state.assistant_prefix_text)
         self.assertFalse(any(event.event == "step_repetition_stop" for event in result.state.trace))
 
-    def test_unified_stops_on_duplicate_step(self):
+    def test_unified_recovers_from_duplicate_step(self):
         slm = SequencedEngine(
             [
                 ("Same final step.\n\n", "stop"),
                 ("Same final step.", "stop"),
+                ("The answer is 42.", "eos"),
             ]
         )
         llm = SequencedEngine(fail_on_generate=True)
         result = bpa_solve("p", slm, llm, BPAConfig(max_total_tokens=300))
-        self.assertEqual(result.state.stop_reason, "duplicate_step")
+        self.assertEqual(result.answer, "42")
+        self.assertEqual(result.state.stop_reason, "eos")
         self.assertTrue(any(event.event == "step_repetition_stop" for event in result.state.trace))
+        self.assertTrue(any(event.event == "forced_close_think_for_final_answer" for event in result.state.trace))
+
+    def test_unified_forces_final_answer_after_thinking_duplicate(self):
+        slm = SequencedEngine(
+            [
+                ("Same thinking step.\n\n", "stop"),
+                ("Same thinking step.\n\n", "stop"),
+                ("The answer is 42.\n\n", "stop"),
+            ]
+        )
+        llm = SequencedEngine(fail_on_generate=True)
+        result = bpa_solve("p", slm, llm, BPAConfig(max_total_tokens=300))
+        self.assertEqual(result.answer, "42")
+        self.assertEqual(result.state.stop_reason, "final_answer_stop")
+        self.assertIn("</think>", result.state.assistant_prefix_text)
+        self.assertTrue(any(event.event == "forced_close_think_for_final_answer" for event in result.state.trace))
+
+    def test_disagreement_routing_forces_final_answer_after_thinking_duplicate(self):
+        slm = SamplingProbeEngine(
+            outputs=[
+                ("First step.\n\n", "stop"),
+                ("The answer is 42.\n\n", "stop"),
+            ],
+            probe_outputs=[
+                "alpha",
+                "beta",
+                "gamma",
+                "delta",
+                "alpha",
+                "beta",
+                "gamma",
+                "delta",
+            ],
+        )
+        llm = SequencedEngine(
+            [
+                ("Repeated thinking step.\n\n", "stop"),
+                ("Repeated thinking step.\n\n", "stop"),
+            ]
+        )
+        result, boundaries, _ = run_disagreement_routing(
+            "Problem: x?",
+            slm,
+            llm,
+            BPAConfig(max_total_tokens=300),
+            probe_k=4,
+            probe_temperature=0.7,
+            probe_max_tokens=32,
+        )
+        self.assertEqual(result.answer, "42")
+        self.assertEqual(result.state.stop_reason, "final_answer_stop")
+        self.assertEqual(len(boundaries), 2)
+        self.assertTrue(any(event.event == "forced_close_think_for_final_answer" for event in result.state.trace))
 
     def test_unified_context_budget_stops_before_generation(self):
         slm = SequencedEngine(fail_on_generate=True)

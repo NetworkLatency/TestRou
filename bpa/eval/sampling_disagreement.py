@@ -14,6 +14,13 @@ EVIDENCE_CHANNEL_PRIORITY = (
     "operation_intent",
 )
 
+ROUTING_EVIDENCE_CHANNEL_PRIORITY = (
+    "boxed_answer",
+    "rhs_novel_number",
+    "equation_claim",
+    "novel_number_set",
+)
+
 INTENT_KEYWORDS = {
     "backtrack": ("wait", "mistake", "wrong", "not right", "recheck"),
     "finalization": ("therefore", "hence", "answer", "boxed", "final"),

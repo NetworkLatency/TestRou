@@ -8,6 +8,7 @@ from .context_budget import ContextBudgetExceeded, generation_budget_for_rendere
 from .engines import completion, finish_reason, generated_text, generated_token_ids
 from .render import render_for_continuation
 from .safety import (
+    CLOSE_THINK_TAG,
     captured_close_think_prefix,
     ensure_step_terminator,
     extract_answer_from_final_step,
@@ -247,6 +248,28 @@ def _final_answer_stop_reason(finish: str) -> str:
     return "final_answer_done"
 
 
+THINKING_RECOVERY_STOP_REASONS = {"duplicate_step", "alternating_step", "ngram_repeat"}
+
+
+def _can_force_final_answer_from_thinking(state: GenerationState, config: BPAConfig) -> bool:
+    if has_close_think_tag(state.assistant_prefix_text):
+        return False
+    return state.slm_decode_tokens + state.llm_decode_tokens < config.max_total_tokens
+
+
+def _append_forced_close_think(state: GenerationState) -> str:
+    close_text = f"\n{CLOSE_THINK_TAG}\n"
+    state.assistant_prefix_text += close_text
+    state.trace.append(
+        TraceEvent(
+            state.step_count,
+            "forced_close_think_for_final_answer",
+            {"text": close_text},
+        )
+    )
+    return close_text
+
+
 def _generation_source(cascade: CascadeResult) -> str:
     if cascade.decision == Decision.LLM_FULL:
         return "llm"
@@ -310,9 +333,12 @@ def bpa_solve(problem_text: str, slm, llm, config: BPAConfig) -> BPAResult:
 
         trigger = update_strict_step_repetition(rep, step_text_normalized)
         if trigger is not None:
+            state.trace.append(TraceEvent(state.step_count, "step_repetition_stop", {"trigger_reason": trigger}))
+            if trigger in THINKING_RECOVERY_STOP_REASONS and _can_force_final_answer_from_thinking(state, config):
+                _append_forced_close_think(state)
+                continue
             state.phase = Phase.DONE
             state.stop_reason = trigger
-            state.trace.append(TraceEvent(state.step_count, "step_repetition_stop", {"trigger_reason": trigger}))
             break
 
         if _is_eos_finish(finish):

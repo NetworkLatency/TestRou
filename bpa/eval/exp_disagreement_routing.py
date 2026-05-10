@@ -16,10 +16,13 @@ from bpa.engines import init_engines
 from bpa.eval.benchmark_eval import benchmark_eval_match
 from bpa.eval.datasets import load_eval_dataset
 from bpa.eval.exp_sampling_disagreement import _sample_probe_rollouts
-from bpa.eval.sampling_disagreement import EVIDENCE_CHANNEL_PRIORITY
+from bpa.eval.sampling_disagreement import ROUTING_EVIDENCE_CHANNEL_PRIORITY
 from bpa.pipeline import (
+    THINKING_RECOVERY_STOP_REASONS,
     _generate_step_with_engine,
     _final_answer_stop_reason,
+    _append_forced_close_think,
+    _can_force_final_answer_from_thinking,
     _in_final_answer_phase,
     _is_eos_finish,
     _llm_generate_step,
@@ -142,7 +145,7 @@ def _selected_prefix_consensus_rollout(
     best_value = None
     best_group: list[dict[str, Any]] = []
     best_group_counts: dict[str, int] = {}
-    for channel in EVIDENCE_CHANNEL_PRIORITY:
+    for channel in ROUTING_EVIDENCE_CHANNEL_PRIORITY:
         groups: dict[str, list[dict[str, Any]]] = {}
         for rollout in rollouts:
             value = _rollout_evidence_value(rollout, channel)
@@ -334,9 +337,12 @@ def run_disagreement_routing(
 
             trigger = update_strict_step_repetition(rep, step_text_normalized)
             if trigger is not None:
+                state.trace.append(TraceEvent(state.step_count, "step_repetition_stop", {"trigger_reason": trigger}))
+                if trigger in THINKING_RECOVERY_STOP_REASONS and _can_force_final_answer_from_thinking(state, config):
+                    _append_forced_close_think(state)
+                    continue
                 state.phase = Phase.DONE
                 state.stop_reason = trigger
-                state.trace.append(TraceEvent(state.step_count, "step_repetition_stop", {"trigger_reason": trigger}))
                 break
 
             if _is_eos_finish(finish):
@@ -492,9 +498,12 @@ def run_disagreement_routing(
 
         trigger = update_strict_step_repetition(rep, step_text_normalized)
         if trigger is not None:
+            state.trace.append(TraceEvent(state.step_count, "step_repetition_stop", {"trigger_reason": trigger}))
+            if trigger in THINKING_RECOVERY_STOP_REASONS and _can_force_final_answer_from_thinking(state, config):
+                _append_forced_close_think(state)
+                continue
             state.phase = Phase.DONE
             state.stop_reason = trigger
-            state.trace.append(TraceEvent(state.step_count, "step_repetition_stop", {"trigger_reason": trigger}))
             break
 
         if _is_eos_finish(finish):
