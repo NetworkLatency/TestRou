@@ -16,7 +16,14 @@ from bpa.eval.exp_boundary_continuation import (
     make_boundary_label,
     select_evenly_spaced,
 )
-from bpa.eval.exp_disagreement_routing import run_disagreement_routing
+from bpa.eval.exp_disagreement_routing import (
+    build_problem_summary as build_routing_problem_summary,
+    compact_boundary_row,
+    existing_problem_summary as existing_routing_problem_summary,
+    has_complete_problem_outputs as has_complete_routing_problem_outputs,
+    run_disagreement_routing,
+    write_problem_outputs as write_routing_problem_outputs,
+)
 from bpa.eval.exp_sampling_disagreement import (
     build_problem_summary,
     enrich_probe_rows,
@@ -39,6 +46,7 @@ from bpa.safety import (
     clean_latex_answer,
     ensure_step_terminator,
     extract_answer,
+    extract_answer_from_final_step,
     extract_answer_from_steps,
     update_repetition,
     update_strict_step_repetition,
@@ -308,6 +316,15 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(extract_answer_from_steps([{"step_text": "No boxed final."}], r"\boxed{0}"), "No boxed final.")
         self.assertIsNone(extract_answer_from_steps([{"step_text": r"old \boxed{9}"}, {"step_text": ""}], r"\boxed{0}"))
 
+    def test_extract_answer_from_final_step_reads_labeled_answer(self):
+        self.assertEqual(extract_answer_from_final_step("The final answer is 16."), "16")
+        self.assertEqual(extract_answer_from_final_step(r"Answer: \frac{3}{4}."), r"\frac{3}{4}")
+        self.assertEqual(extract_answer_from_final_step(r"Final answer: \boxed{16"), "16")
+        self.assertEqual(
+            extract_answer_from_final_step(r"scratch \boxed{9}</think> The final answer is 16."),
+            "16",
+        )
+
     def test_summary_metrics(self):
         rows = [
             {"correct": True, "total_wall_time": 1.0, "problem_wall_time": 2.0},
@@ -527,6 +544,70 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(boundaries[0]["boundary_idx"], 0)
         self.assertTrue(boundaries[0]["routed_to_llm"])
         self.assertEqual(probe_cost["probe_generate_calls"], 1)
+
+    def test_routing_problem_outputs_are_resumable_and_compact(self):
+        slm = SamplingProbeEngine(
+            outputs=[
+                ("Let x = 0.\n\n", "stop"),
+            ],
+            probe_outputs=[
+                "x = 1",
+                "x = 2",
+                "x = 3",
+                "x = 4",
+            ],
+        )
+        llm = SequencedEngine([(r"\boxed{9}", "eos")])
+        problem = EvalProblem(
+            problem_id=11,
+            question_id="q11",
+            problem_text="Problem: x?",
+            raw={"id": 11},
+            gold_answer="9",
+        )
+        config = BPAConfig(max_total_tokens=200)
+        result, boundaries, probe_cost = run_disagreement_routing(
+            problem.problem_text,
+            slm,
+            llm,
+            config,
+            probe_k=4,
+            probe_temperature=0.7,
+            probe_max_tokens=32,
+        )
+        summary = build_routing_problem_summary(
+            dataset="aime25",
+            problem=problem,
+            result=result,
+            boundary_rows=boundaries,
+            probe_cost=probe_cost,
+            min_agreement_count=3,
+            config=config,
+            problem_wall_time=1.25,
+        )
+        compact = compact_boundary_row({"assistant_prefix_text": "old", "rollouts": [{"token_ids": [1], "text": "x=1"}]})
+        self.assertNotIn("assistant_prefix_text", compact)
+        self.assertNotIn("token_ids", compact["rollouts"][0])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "routing"
+            write_routing_problem_outputs(
+                out_dir,
+                dataset="aime25",
+                problem=problem,
+                result=result,
+                boundary_rows=boundaries,
+                probe_cost=probe_cost,
+                summary_row=summary,
+            )
+            self.assertTrue(has_complete_routing_problem_outputs(out_dir, problem.problem_id))
+            boundary_text = (out_dir / "11" / "11.boundaries.jsonl").read_text(encoding="utf-8")
+            self.assertNotIn("assistant_prefix_text", boundary_text)
+            self.assertNotIn("token_ids", boundary_text)
+            resumed = existing_routing_problem_summary(out_dir, problem, "aime25")
+            self.assertEqual(resumed["final_answer"], "9")
+            self.assertTrue(resumed["correct"])
+            self.assertEqual(float(resumed["problem_wall_time"]), 1.25)
 
     def test_prefix_consensus_reuses_anchor_probe_prefix(self):
         slm = WeightedSamplingProbeEngine(
