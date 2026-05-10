@@ -99,7 +99,7 @@ Collect pure-SLM boundary-level K-rollout disagreement on MATH500:
 
 ```bash
 python -m bpa.eval.exp_sampling_disagreement \
-  --config configs/bpa_default.json \
+  --config configs/bpa_14b_remote.json \
   --dataset math500 \
   --max-problems 100 \
   --probe-k 4 \
@@ -111,8 +111,8 @@ For AIME24:
 
 ```bash
 python -m bpa.eval.exp_sampling_disagreement \
-  --config configs/bpa_default.json \
-  --dataset aime24 \
+  --config configs/bpa_14b_remote.json \
+  --dataset aime25 \
   --max-problems 30 \
   --probe-k 4 \
   --probe-temperature 0.7 \
@@ -158,7 +158,7 @@ For each problem, select evenly spaced SLM boundaries and let the LLM continue f
 
 ```bash
 python -m bpa.eval.exp_boundary_continuation \
-  --config configs/bpa_default.json \
+  --config configs/bpa_14b_remote.json \
   --dataset math500 \
   --max-problems 100 \
   --boundaries-per-problem 5 \
@@ -186,7 +186,7 @@ Generate distribution plots, quantile plots, dip-test results, and AUROC:
 
 ```bash
 python -m bpa.eval.analyze_sampling_disagreement \
-  --config configs/bpa_default.json \
+  --config configs/bpa_14b_remote.json \
   --dataset math500 \
   --metrics operation_vote_disagreement number_vote_disagreement self_bleu_disagreement char_jaccard_disagreement structured_disagreement \
   --num-bins 10

@@ -1,0 +1,124 @@
+[
+  {
+    "root": "diagnostics1",
+    "dataset": "math500",
+    "n_rows": 500,
+    "n_xrd": 500,
+    "critical_auroc": {
+      "n": 500,
+      "positives": 74,
+      "auroc": 0.49990483441187666
+    },
+    "recovery_auroc_slm_wrong": {
+      "n": 195,
+      "positives": 74,
+      "auroc": 0.47889211525575165
+    },
+    "recovery_auroc_slm_wrong_oracle_correct": {
+      "n": 150,
+      "positives": 74,
+      "auroc": 0.40629445234708395
+    },
+    "pearson_xrd_char_jaccard": {
+      "n": 500,
+      "r": -0.4513061562617171,
+      "p": 1.8471236228411878e-26
+    },
+    "pearson_xrd_internal_confidence": {
+      "n": 500,
+      "r": 0.4971338632989096,
+      "p": 1.4307711549665134e-32
+    },
+    "logit_critical_xrd_control_boundary_idx": {
+      "n": 500,
+      "positives": 74,
+      "coef": 0.03850690894726874,
+      "se": 0.13704811587695603,
+      "z": 0.2809736471082963,
+      "p": 0.7787306125062332,
+      "position_key": "boundary_idx",
+      "converged": true
+    },
+    "logit_recovery_xrd_control_boundary_idx_slm_wrong": {
+      "n": 195,
+      "positives": 74,
+      "coef": -0.07651114484352596,
+      "se": 0.15420133238364198,
+      "z": -0.4961769373896956,
+      "p": 0.6197695809590973,
+      "position_key": "boundary_idx",
+      "converged": true
+    },
+    "logit_critical_xrd_control_prefix_token_len": {
+      "n": 500,
+      "positives": 74,
+      "coef": 0.035852224173757136,
+      "se": 0.14013777605946628,
+      "z": 0.25583554400451985,
+      "p": 0.7980778268551434,
+      "position_key": "prefix_token_len",
+      "converged": true
+    }
+  },
+  {
+    "root": "POOLED",
+    "dataset": "math500",
+    "n_rows": 500,
+    "n_xrd": 500,
+    "critical_auroc": {
+      "n": 500,
+      "positives": 74,
+      "auroc": 0.49990483441187666
+    },
+    "recovery_auroc_slm_wrong": {
+      "n": 195,
+      "positives": 74,
+      "auroc": 0.47889211525575165
+    },
+    "recovery_auroc_slm_wrong_oracle_correct": {
+      "n": 150,
+      "positives": 74,
+      "auroc": 0.40629445234708395
+    },
+    "pearson_xrd_char_jaccard": {
+      "n": 500,
+      "r": -0.4513061562617171,
+      "p": 1.8471236228411878e-26
+    },
+    "pearson_xrd_internal_confidence": {
+      "n": 500,
+      "r": 0.4971338632989096,
+      "p": 1.4307711549665134e-32
+    },
+    "logit_critical_xrd_control_boundary_idx": {
+      "n": 500,
+      "positives": 74,
+      "coef": 0.03850690894726874,
+      "se": 0.13704811587695603,
+      "z": 0.2809736471082963,
+      "p": 0.7787306125062332,
+      "position_key": "boundary_idx",
+      "converged": true
+    },
+    "logit_recovery_xrd_control_boundary_idx_slm_wrong": {
+      "n": 195,
+      "positives": 74,
+      "coef": -0.07651114484352596,
+      "se": 0.15420133238364198,
+      "z": -0.4961769373896956,
+      "p": 0.6197695809590973,
+      "position_key": "boundary_idx",
+      "converged": true
+    },
+    "logit_critical_xrd_control_prefix_token_len": {
+      "n": 500,
+      "positives": 74,
+      "coef": 0.035852224173757136,
+      "se": 0.14013777605946628,
+      "z": 0.25583554400451985,
+      "p": 0.7980778268551434,
+      "position_key": "prefix_token_len",
+      "converged": true
+    }
+  }
+]

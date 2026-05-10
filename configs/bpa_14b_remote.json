@@ -1,5 +1,5 @@
 {
-  "slm_model_path": "/home/lhyang/Documents/code/reasoning_boundary/models/deepseek-aiDeepSeek-R1-Distill-Qwen-1.5B",
+  "slm_model_path": "/home/lhyang/Documents/code/reasoning_boundary/models/qwen3-4B",
   "llm_model_path": "Qwen3-14B",
   "slm_tokenizer_path": null,
   "llm_tokenizer_path": "/home/lhyang/Documents/code/reasoning_boundary/models/qwen3-14B/",
@@ -21,17 +21,11 @@
     "humaneval": "data/HumanEval.jsonl"
   },
   "slm_engine_kwargs": {
-    "gpu_memory_utilization": 0.4,
-    "tensor_parallel_size": 2
+    "gpu_memory_utilization": 0.4
   },
-  "llm_engine_kwargs": {
-    "gpu_memory_utilization": 0.4,
-    "tensor_parallel_size": 2
-  },
-  "slm_device": "0,1",
-  "llm_device": "1",
+  "slm_device": "1",
   "trust_remote_code": true,
-  "max_model_len": 20000,
+  "max_model_len": 32768,
   "enable_prefix_caching": true,
   "max_step_tokens": 1024,
   "max_total_tokens": 16384,
