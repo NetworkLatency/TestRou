@@ -98,6 +98,7 @@ class SequencedEngine:
         self.outputs = list(outputs or [])
         self.fail_on_generate = fail_on_generate
         self.generate_calls = 0
+        self.sampling_history = []
 
     def ensure_tokenizer(self):
         return self.tokenizer
@@ -116,6 +117,7 @@ class SequencedEngine:
 
     def generate(self, prompts, sampling_params):
         self.generate_calls += 1
+        self.sampling_history.append(dict(sampling_params))
         if self.fail_on_generate:
             raise AssertionError("generate should not have been called")
         if sampling_params.get("max_tokens") == 1 and sampling_params.get("logprobs") is not None:
@@ -752,6 +754,14 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result.state.slm_generate_calls, 3)
         self.assertEqual(result.state.step_count, 2)
 
+    def test_final_answer_budget_matches_thinking_decode_tokens(self):
+        slm = SequencedEngine([("</think>\n\n", "stop"), ("The answer is 42.\n\n", "stop")])
+        llm = SequencedEngine(fail_on_generate=True)
+        result = bpa_solve("p", slm, llm, BPAConfig(max_total_tokens=200))
+        self.assertEqual(result.answer, "42")
+        # L0 probe uses one token, then the close-think step uses its text length.
+        self.assertEqual(slm.sampling_history[-1]["max_tokens"], 11)
+
     def test_disagreement_routing_final_answer_phase_runs_once_on_stop(self):
         slm = SamplingProbeEngine(
             outputs=[
@@ -834,6 +844,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result.answer, "42")
         self.assertEqual(result.state.stop_reason, "final_answer_stop")
         self.assertIn("</think>", result.state.assistant_prefix_text)
+        self.assertIn("Do not restart the solution after </think>.", result.state.assistant_prefix_text)
         self.assertTrue(any(event.event == "forced_close_think_for_final_answer" for event in result.state.trace))
 
     def test_disagreement_routing_forces_final_answer_after_thinking_duplicate(self):

@@ -210,14 +210,19 @@ def _llm_generate_step(state: GenerationState, llm, config: BPAConfig) -> tuple[
     return _generate_step_with_engine(state, llm, config, account="llm")
 
 
-def _slm_generate_final_answer(state: GenerationState, slm, config: BPAConfig) -> tuple[str, str]:
+def _final_answer_token_budget(state: GenerationState, config: BPAConfig) -> int:
     remaining_total_tokens = config.max_total_tokens - state.slm_decode_tokens - state.llm_decode_tokens
+    thinking_decode_tokens = max(state.slm_decode_tokens + state.llm_decode_tokens, 1)
+    return max(1, min(remaining_total_tokens, thinking_decode_tokens))
+
+
+def _slm_generate_final_answer(state: GenerationState, slm, config: BPAConfig) -> tuple[str, str]:
     return _generate_step_with_engine(
         state,
         slm,
         config,
         account="slm",
-        step_token_budget=remaining_total_tokens,
+        step_token_budget=_final_answer_token_budget(state, config),
         stop_on_step_boundary=False,
     )
 
@@ -249,6 +254,11 @@ def _final_answer_stop_reason(finish: str) -> str:
 
 
 THINKING_RECOVERY_STOP_REASONS = {"duplicate_step", "alternating_step", "ngram_repeat"}
+FORCED_CLOSE_THINK_BRIDGE = (
+    "\nWe are out of reliable reasoning budget. Stop reasoning now. Do not restart the solution after </think>. "
+    "After </think>, give only the final answer in \\boxed{} using the strongest conclusion above; "
+    "if uncertain, make the best concise guess.\n"
+)
 
 
 def _can_force_final_answer_from_thinking(state: GenerationState, config: BPAConfig) -> bool:
@@ -258,7 +268,7 @@ def _can_force_final_answer_from_thinking(state: GenerationState, config: BPACon
 
 
 def _append_forced_close_think(state: GenerationState) -> str:
-    close_text = f"\n{CLOSE_THINK_TAG}\n"
+    close_text = f"{FORCED_CLOSE_THINK_BRIDGE}{CLOSE_THINK_TAG}\n"
     state.assistant_prefix_text += close_text
     state.trace.append(
         TraceEvent(
