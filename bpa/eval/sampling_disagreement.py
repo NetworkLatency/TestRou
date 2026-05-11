@@ -21,6 +21,105 @@ ROUTING_EVIDENCE_CHANNEL_PRIORITY = (
     "novel_number_set",
 )
 
+CONTENT_ANCHOR_CHANNEL = "content_anchor"
+
+_GENERIC_ANCHOR_WORDS = {
+    "about",
+    "above",
+    "after",
+    "again",
+    "answer",
+    "because",
+    "before",
+    "being",
+    "calculate",
+    "calculation",
+    "check",
+    "clearly",
+    "compute",
+    "consider",
+    "continue",
+    "could",
+    "does",
+    "done",
+    "equation",
+    "expression",
+    "final",
+    "find",
+    "first",
+    "from",
+    "given",
+    "have",
+    "hence",
+    "into",
+    "just",
+    "know",
+    "maybe",
+    "must",
+    "need",
+    "next",
+    "note",
+    "now",
+    "obvious",
+    "only",
+    "problem",
+    "recheck",
+    "right",
+    "same",
+    "show",
+    "simplify",
+    "since",
+    "solve",
+    "step",
+    "still",
+    "suppose",
+    "that",
+    "then",
+    "therefore",
+    "this",
+    "thus",
+    "using",
+    "wait",
+    "want",
+    "where",
+    "which",
+    "with",
+    "wrong",
+}
+_GENERIC_ANCHOR_PHRASES = (
+    "let us",
+    "let's",
+    "we need",
+    "we have",
+    "we can",
+    "we get",
+    "the answer is not obvious",
+)
+_CODE_KEYWORDS = {
+    "assert",
+    "break",
+    "class",
+    "continue",
+    "def",
+    "elif",
+    "else",
+    "except",
+    "for",
+    "if",
+    "import",
+    "lambda",
+    "raise",
+    "return",
+    "try",
+    "while",
+    "yield",
+}
+_IDENTIFIER_PATTERN = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+_CHOICE_PATTERN = re.compile(r"(?i)(?:\b(?:option|choice|answer)\s*[:\-]?\s*([A-E])\b|\(([A-E])\))")
+_SYMBOLIC_FRAGMENT_PATTERN = re.compile(
+    r"(?<!\w)(?:[A-Za-z_]\w*|\d+)\s*(?:[+\-*/^]|\\(?:mid|mod|equiv|leq|geq)|[<>|])\s*(?:[A-Za-z_]\w*|\d+)(?!\w)"
+)
+
 INTENT_KEYWORDS = {
     "backtrack": ("wait", "mistake", "wrong", "not right", "recheck"),
     "finalization": ("therefore", "hence", "answer", "boxed", "final"),
@@ -197,6 +296,58 @@ def _extract_operation_intent(text: str) -> str | None:
     return None
 
 
+def _strip_generic_anchor_phrases(text: str) -> str:
+    stripped = text
+    for phrase in _GENERIC_ANCHOR_PHRASES:
+        stripped = re.sub(r"\b" + re.escape(phrase) + r"\b", " ", stripped, flags=re.IGNORECASE)
+    return stripped
+
+
+def _normalize_anchor(value: str) -> str:
+    value = clean_latex_answer(_normalize_signature_value(value)).lower()
+    value = value.replace(r"\left", "").replace(r"\right", "")
+    value = value.replace(r"\dfrac", r"\frac").replace(r"\tfrac", r"\frac")
+    value = re.sub(r"\s+", "", value) if re.search(r"[+\-*/^<>=|\\]", value) else re.sub(r"\s+", " ", value)
+    return value.strip(" .,:;$")
+
+
+def extract_content_anchors(text: str, *, limit: int = 24) -> list[str]:
+    """Extract task-agnostic content anchors for conservative text consensus."""
+    normalized_text = _strip_generic_anchor_phrases(text)
+    anchors: list[str] = []
+    seen: set[str] = set()
+
+    def add(anchor: str) -> None:
+        anchor = _normalize_anchor(anchor)
+        if not anchor or anchor in seen:
+            return
+        if len(anchor) < 3 and not anchor.startswith(("choice:", "kw:", "expr:")):
+            return
+        seen.add(anchor)
+        anchors.append(anchor)
+
+    for match in _CHOICE_PATTERN.finditer(normalized_text):
+        choice = match.group(1) or match.group(2)
+        add(f"choice:{choice.upper()}")
+
+    for match in _SYMBOLIC_FRAGMENT_PATTERN.finditer(normalized_text):
+        add(f"expr:{match.group(0)}")
+
+    for match in _IDENTIFIER_PATTERN.finditer(normalized_text):
+        word = match.group(0)
+        lowered = word.lower()
+        if lowered in _CODE_KEYWORDS:
+            add(f"kw:{lowered}")
+            continue
+        if lowered in _GENERIC_ANCHOR_WORDS:
+            continue
+        if len(lowered) < 3:
+            continue
+        add(lowered)
+
+    return anchors[:limit]
+
+
 def extract_step_evidence(text: str, context_text: str = "") -> dict[str, Any]:
     boxed = extract_last_boxed(text)
     equation = _extract_equation(text)
@@ -230,6 +381,7 @@ def extract_step_evidence(text: str, context_text: str = "") -> dict[str, Any]:
         "equation_claim": equation_claim,
         "novel_number_set": novel_number_set,
         "operation_intent": f"operation_intent:{operation_intent}" if operation_intent else None,
+        "content_anchors": extract_content_anchors(text),
     }
     evidence["evidence_channels"] = [
         channel for channel in EVIDENCE_CHANNEL_PRIORITY if evidence.get(channel) is not None

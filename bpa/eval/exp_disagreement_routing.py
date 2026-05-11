@@ -16,7 +16,11 @@ from bpa.engines import init_engines
 from bpa.eval.benchmark_eval import benchmark_eval_match
 from bpa.eval.datasets import load_eval_dataset
 from bpa.eval.exp_sampling_disagreement import _sample_probe_rollouts
-from bpa.eval.sampling_disagreement import ROUTING_EVIDENCE_CHANNEL_PRIORITY
+from bpa.eval.sampling_disagreement import (
+    CONTENT_ANCHOR_CHANNEL,
+    ROUTING_EVIDENCE_CHANNEL_PRIORITY,
+    extract_content_anchors,
+)
 from bpa.pipeline import (
     THINKING_RECOVERY_STOP_REASONS,
     _generate_step_with_engine,
@@ -63,6 +67,25 @@ SUMMARY_FIELDS = [
     "probe_generate_calls",
     "probe_wall_time",
 ]
+
+TEXT_ANCHOR_CLUSTER_SIMILARITY = 0.5
+TEXT_ANCHOR_MIN_INTER_AGREEMENT = 0.45
+TEXT_ANCHOR_MIN_RESIDUAL_AGREEMENT = 0.18
+TEXT_ANCHOR_MIN_COUNT = 2
+TEXT_ANCHOR_MIN_NEW_COUNT = 1
+TEXT_ANCHOR_MIN_STRONG_NEW_COUNT = 1
+PREFIX_ANCHOR_WINDOW_STEPS = 3
+WEAK_TEXT_ANCHORS = {
+    "apply",
+    "case",
+    "cases",
+    "compare",
+    "derive",
+    "prove",
+    "split",
+    "substitute",
+    "use",
+}
 
 def _mean(values: list[float | int | None]) -> float | None:
     present = [float(value) for value in values if value is not None]
@@ -115,6 +138,208 @@ def _best_rollout(rollouts: list[dict[str, Any]]) -> dict[str, Any]:
     )
 
 
+def _empty_prefix_consensus() -> dict[str, Any]:
+    return {
+        "prefix_anchor_idx": None,
+        "prefix_anchor_mean_logprob": None,
+        "prefix_consensus_channel": None,
+        "prefix_consensus_value": None,
+        "prefix_consensus_support_count": 0,
+        "prefix_consensus_vote_fraction": None,
+        "prefix_consensus_support_by_rollout": {},
+        "prefix_consensus_group_counts": {},
+        "prefix_hard_conflict": False,
+        "content_anchor_inter_agreement": None,
+        "content_anchor_prefix_agreement": None,
+        "content_anchor_residual_agreement": None,
+        "content_anchor_count": 0,
+        "content_anchor_new_count": 0,
+        "content_anchor_strong_new_count": 0,
+        "content_anchor_prefix_count": 0,
+        "selected_rollout": None,
+    }
+
+
+def _anchor_similarity(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def _mean_pairwise_anchor_similarity(anchor_sets: list[set[str]]) -> float:
+    if len(anchor_sets) < 2:
+        return 0.0
+    values = [
+        _anchor_similarity(anchor_sets[i], anchor_sets[j])
+        for i in range(len(anchor_sets))
+        for j in range(i + 1, len(anchor_sets))
+    ]
+    return sum(values) / len(values) if values else 0.0
+
+
+def _recent_prefix_anchor_sets(prefix_text: str) -> list[set[str]]:
+    steps = [step.strip() for step in prefix_text.split("\n\n") if step.strip()]
+    recent_steps = steps[-PREFIX_ANCHOR_WINDOW_STEPS:]
+    return [set(extract_content_anchors(step)) for step in recent_steps if step]
+
+
+def _prefix_anchor_agreement(group_anchor_sets: list[set[str]], prefix_anchor_sets: list[set[str]]) -> float:
+    if not group_anchor_sets or not prefix_anchor_sets:
+        return 0.0
+    values = [
+        max(_anchor_similarity(anchor_set, prefix_anchor_set) for prefix_anchor_set in prefix_anchor_sets)
+        for anchor_set in group_anchor_sets
+    ]
+    return sum(values) / len(values) if values else 0.0
+
+
+def _hard_conflict_detected(rollouts: list[dict[str, Any]]) -> bool:
+    boxed_values = {
+        value
+        for rollout in rollouts
+        if (value := _rollout_evidence_value(rollout, "boxed_answer")) is not None
+    }
+    if len(boxed_values) > 1:
+        return True
+
+    equation_by_lhs: dict[str, set[str]] = {}
+    for rollout in rollouts:
+        equation = _rollout_evidence_value(rollout, "equation_claim")
+        if equation is None or "=" not in equation:
+            continue
+        body = equation.split(":", 1)[-1]
+        lhs, rhs = body.split("=", 1)
+        equation_by_lhs.setdefault(lhs, set()).add(rhs)
+    return any(len(rhs_values) > 1 for rhs_values in equation_by_lhs.values())
+
+
+def _rollout_content_anchor_set(rollout: dict[str, Any]) -> set[str]:
+    anchors = rollout.get("content_anchors")
+    if anchors is None:
+        evidence = rollout.get("step_evidence")
+        if isinstance(evidence, dict):
+            anchors = evidence.get("content_anchors")
+    if anchors is None:
+        anchors = extract_content_anchors(str(rollout.get("text") or ""))
+    return {str(anchor) for anchor in anchors or []}
+
+
+def _selected_text_anchor_rollout(
+    rollouts: list[dict[str, Any]],
+    *,
+    prefix_text: str,
+    min_agreement_count: int,
+) -> dict[str, Any]:
+    prefix_anchor_sets = _recent_prefix_anchor_sets(prefix_text)
+    prefix_anchor_union = set().union(*prefix_anchor_sets) if prefix_anchor_sets else set()
+    rollout_anchor_sets = {id(rollout): _rollout_content_anchor_set(rollout) for rollout in rollouts}
+    for rollout in rollouts:
+        rollout["content_anchors"] = sorted(rollout_anchor_sets[id(rollout)])
+
+    candidate_groups: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+    for seed in rollouts:
+        seed_anchors = rollout_anchor_sets[id(seed)]
+        if len(seed_anchors) < TEXT_ANCHOR_MIN_COUNT:
+            continue
+        group = [
+            rollout
+            for rollout in rollouts
+            if _anchor_similarity(seed_anchors, rollout_anchor_sets[id(rollout)]) >= TEXT_ANCHOR_CLUSTER_SIMILARITY
+        ]
+        if len(group) >= min_agreement_count:
+            candidate_groups.append((seed, group))
+
+    if not candidate_groups:
+        return {
+            "selected_rollout": None,
+            "channel": CONTENT_ANCHOR_CHANNEL,
+            "value": None,
+            "support_count": 0,
+            "group_counts": {},
+            "support_by_rollout": {str(_rollout_idx_sort_value(rollout)): False for rollout in rollouts},
+            "inter_agreement": None,
+            "prefix_agreement": None,
+            "residual_agreement": None,
+            "anchor_count": 0,
+            "new_anchor_count": 0,
+            "strong_new_anchor_count": 0,
+            "prefix_anchor_count": len(prefix_anchor_union),
+        }
+
+    best: dict[str, Any] | None = None
+    for seed, group in candidate_groups:
+        group_anchor_sets = [rollout_anchor_sets[id(rollout)] for rollout in group]
+        group_anchor_union = set().union(*group_anchor_sets) if group_anchor_sets else set()
+        new_anchor_count = len(group_anchor_union - prefix_anchor_union)
+        strong_new_anchor_count = len(
+            {
+                anchor
+                for anchor in group_anchor_union - prefix_anchor_union
+                if anchor not in WEAK_TEXT_ANCHORS
+            }
+        )
+        inter_agreement = _mean_pairwise_anchor_similarity(group_anchor_sets)
+        prefix_agreement = _prefix_anchor_agreement(group_anchor_sets, prefix_anchor_sets)
+        residual_agreement = inter_agreement - prefix_agreement
+        selected = _best_rollout(group)
+        diagnostics = {
+            "seed": seed,
+            "group": group,
+            "selected_rollout": selected,
+            "inter_agreement": inter_agreement,
+            "prefix_agreement": prefix_agreement,
+            "residual_agreement": residual_agreement,
+            "anchor_count": len(group_anchor_union),
+            "new_anchor_count": new_anchor_count,
+            "strong_new_anchor_count": strong_new_anchor_count,
+            "group_anchor_union": group_anchor_union,
+        }
+        if best is None or (
+            len(group),
+            inter_agreement,
+            residual_agreement,
+            _mean_logprob_sort_value(selected),
+        ) > (
+            len(best["group"]),
+            best["inter_agreement"],
+            best["residual_agreement"],
+            _mean_logprob_sort_value(best["selected_rollout"]),
+        ):
+            best = diagnostics
+
+    assert best is not None
+    accepted = (
+        len(best["group"]) >= min_agreement_count
+        and best["inter_agreement"] >= TEXT_ANCHOR_MIN_INTER_AGREEMENT
+        and best["residual_agreement"] >= TEXT_ANCHOR_MIN_RESIDUAL_AGREEMENT
+        and best["anchor_count"] >= TEXT_ANCHOR_MIN_COUNT
+        and best["new_anchor_count"] >= TEXT_ANCHOR_MIN_NEW_COUNT
+        and best["strong_new_anchor_count"] >= TEXT_ANCHOR_MIN_STRONG_NEW_COUNT
+    )
+    selected_rollout = best["selected_rollout"] if accepted else None
+    support_by_rollout = {
+        str(_rollout_idx_sort_value(rollout)): bool(accepted and rollout in best["group"])
+        for rollout in rollouts
+    }
+    value_anchors = sorted(best["group_anchor_union"] - prefix_anchor_union) or sorted(best["group_anchor_union"])
+    value = f"{CONTENT_ANCHOR_CHANNEL}:" + "|".join(value_anchors[:8])
+    return {
+        "selected_rollout": selected_rollout,
+        "channel": CONTENT_ANCHOR_CHANNEL,
+        "value": value if accepted else None,
+        "support_count": len(best["group"]),
+        "group_counts": {value: len(best["group"])},
+        "support_by_rollout": support_by_rollout,
+        "inter_agreement": best["inter_agreement"],
+        "prefix_agreement": best["prefix_agreement"],
+        "residual_agreement": best["residual_agreement"],
+        "anchor_count": best["anchor_count"],
+        "new_anchor_count": best["new_anchor_count"],
+        "strong_new_anchor_count": best["strong_new_anchor_count"],
+        "prefix_anchor_count": len(prefix_anchor_union),
+    }
+
+
 def _selected_prefix_consensus_rollout(
     probe_row: dict[str, Any],
     *,
@@ -125,17 +350,7 @@ def _selected_prefix_consensus_rollout(
 
     rollouts = list(probe_row.get("rollouts") or [])
     if not rollouts:
-        return {
-            "prefix_anchor_idx": None,
-            "prefix_anchor_mean_logprob": None,
-            "prefix_consensus_channel": None,
-            "prefix_consensus_value": None,
-            "prefix_consensus_support_count": 0,
-            "prefix_consensus_vote_fraction": None,
-            "prefix_consensus_support_by_rollout": {},
-            "prefix_consensus_group_counts": {},
-            "selected_rollout": None,
-        }
+        return _empty_prefix_consensus()
 
     for idx, rollout in enumerate(rollouts):
         if "rollout_idx" not in rollout:
@@ -174,7 +389,36 @@ def _selected_prefix_consensus_rollout(
             best_group = channel_group
             best_group_counts = {value: len(group) for value, group in sorted(groups.items())}
 
+    hard_conflict = _hard_conflict_detected(rollouts)
     selected_rollout = _best_rollout(best_group) if len(best_group) >= min_agreement_count else None
+    if selected_rollout is None and not hard_conflict:
+        text_consensus = _selected_text_anchor_rollout(
+            rollouts,
+            prefix_text=str(probe_row.get("assistant_prefix_text") or ""),
+            min_agreement_count=min_agreement_count,
+        )
+        if text_consensus["selected_rollout"] is not None:
+            selected_rollout = text_consensus["selected_rollout"]
+            best_channel = text_consensus["channel"]
+            best_value = text_consensus["value"]
+            best_group = [
+                rollout
+                for rollout in rollouts
+                if text_consensus["support_by_rollout"].get(str(_rollout_idx_sort_value(rollout)))
+            ]
+            best_group_counts = text_consensus["group_counts"]
+        else:
+            text_consensus = text_consensus
+    else:
+        text_consensus = {
+            "inter_agreement": None,
+            "prefix_agreement": None,
+            "residual_agreement": None,
+            "anchor_count": 0,
+            "new_anchor_count": 0,
+            "strong_new_anchor_count": 0,
+            "prefix_anchor_count": 0,
+        }
     support_by_rollout: dict[str, bool] = {}
     for rollout in rollouts:
         rollout_idx = _rollout_idx_sort_value(rollout)
@@ -191,6 +435,14 @@ def _selected_prefix_consensus_rollout(
         "prefix_consensus_vote_fraction": support_count / len(rollouts) if rollouts else None,
         "prefix_consensus_support_by_rollout": support_by_rollout,
         "prefix_consensus_group_counts": best_group_counts,
+        "prefix_hard_conflict": hard_conflict,
+        "content_anchor_inter_agreement": text_consensus["inter_agreement"],
+        "content_anchor_prefix_agreement": text_consensus["prefix_agreement"],
+        "content_anchor_residual_agreement": text_consensus["residual_agreement"],
+        "content_anchor_count": text_consensus["anchor_count"],
+        "content_anchor_new_count": text_consensus["new_anchor_count"],
+        "content_anchor_strong_new_count": text_consensus["strong_new_anchor_count"],
+        "content_anchor_prefix_count": text_consensus["prefix_anchor_count"],
         "selected_rollout": selected_rollout,
     }
 
@@ -454,6 +706,14 @@ def run_disagreement_routing(
         probe_row["prefix_consensus_vote_fraction"] = prefix_consensus["prefix_consensus_vote_fraction"]
         probe_row["prefix_consensus_support_by_rollout"] = prefix_consensus["prefix_consensus_support_by_rollout"]
         probe_row["prefix_consensus_group_counts"] = prefix_consensus["prefix_consensus_group_counts"]
+        probe_row["prefix_hard_conflict"] = prefix_consensus["prefix_hard_conflict"]
+        probe_row["content_anchor_inter_agreement"] = prefix_consensus["content_anchor_inter_agreement"]
+        probe_row["content_anchor_prefix_agreement"] = prefix_consensus["content_anchor_prefix_agreement"]
+        probe_row["content_anchor_residual_agreement"] = prefix_consensus["content_anchor_residual_agreement"]
+        probe_row["content_anchor_count"] = prefix_consensus["content_anchor_count"]
+        probe_row["content_anchor_new_count"] = prefix_consensus["content_anchor_new_count"]
+        probe_row["content_anchor_strong_new_count"] = prefix_consensus["content_anchor_strong_new_count"]
+        probe_row["content_anchor_prefix_count"] = prefix_consensus["content_anchor_prefix_count"]
         probe_row["routed_to_llm"] = route_to_llm
         probe_row["reused_probe_rollout"] = selected_rollout is not None
         probe_row["selected_rollout_idx"] = selected_rollout.get("rollout_idx") if probe_row["reused_probe_rollout"] else None
