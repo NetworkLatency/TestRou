@@ -11,16 +11,12 @@ from typing import Any
 from tqdm import tqdm
 
 from bpa.config import BPAConfig
-from bpa.context_budget import ContextBudgetExceeded
+from bpa.context_budget import ContextBudgetExceeded, generation_budget_for_rendered
 from bpa.engines import init_engines
 from bpa.eval.benchmark_eval import benchmark_eval_match
 from bpa.eval.datasets import load_eval_dataset
-from bpa.eval.exp_sampling_disagreement import _sample_probe_rollouts
-from bpa.eval.sampling_disagreement import (
-    CONTENT_ANCHOR_CHANNEL,
-    ROUTING_EVIDENCE_CHANNEL_PRIORITY,
-    extract_content_anchors,
-)
+from bpa.eval.exp_sampling_disagreement import _completion_mean_logprob, _sample_probe_rollouts
+from bpa.eval.sampling_disagreement import ROUTING_EVIDENCE_CHANNEL_PRIORITY, extract_step_evidence
 from bpa.pipeline import (
     THINKING_RECOVERY_STOP_REASONS,
     _generate_step_with_engine,
@@ -34,6 +30,7 @@ from bpa.pipeline import (
     _slm_generate_final_answer,
     _slm_generate_step,
 )
+from bpa.render import render_for_continuation
 from bpa.safety import ensure_step_terminator, extract_answer_from_steps, update_strict_step_repetition
 from bpa.state import GenerationState, Phase, RepetitionState, TraceEvent
 from bpa.trace import BPAResult, json_safe, result_summary, write_json, write_jsonl
@@ -66,26 +63,13 @@ SUMMARY_FIELDS = [
     "probe_prefill_tokens",
     "probe_generate_calls",
     "probe_wall_time",
+    "stage2_probe_decode_tokens",
+    "stage2_probe_prefill_tokens",
+    "stage2_probe_generate_calls",
+    "stage2_probe_wall_time",
+    "num_stage2_triggered",
+    "num_stage2_accepted",
 ]
-
-TEXT_ANCHOR_CLUSTER_SIMILARITY = 0.5
-TEXT_ANCHOR_MIN_INTER_AGREEMENT = 0.45
-TEXT_ANCHOR_MIN_RESIDUAL_AGREEMENT = 0.18
-TEXT_ANCHOR_MIN_COUNT = 2
-TEXT_ANCHOR_MIN_NEW_COUNT = 1
-TEXT_ANCHOR_MIN_STRONG_NEW_COUNT = 1
-PREFIX_ANCHOR_WINDOW_STEPS = 3
-WEAK_TEXT_ANCHORS = {
-    "apply",
-    "case",
-    "cases",
-    "compare",
-    "derive",
-    "prove",
-    "split",
-    "substitute",
-    "use",
-}
 
 def _mean(values: list[float | int | None]) -> float | None:
     present = [float(value) for value in values if value is not None]
@@ -148,196 +132,279 @@ def _empty_prefix_consensus() -> dict[str, Any]:
         "prefix_consensus_vote_fraction": None,
         "prefix_consensus_support_by_rollout": {},
         "prefix_consensus_group_counts": {},
-        "prefix_hard_conflict": False,
-        "content_anchor_inter_agreement": None,
-        "content_anchor_prefix_agreement": None,
-        "content_anchor_residual_agreement": None,
-        "content_anchor_count": 0,
-        "content_anchor_new_count": 0,
-        "content_anchor_strong_new_count": 0,
-        "content_anchor_prefix_count": 0,
+        "prefix_consensus_stage": None,
+        "stage1_case": "empty",
+        "stage2_triggered": False,
+        "stage2_case": None,
+        "stage2_min_agreement_count": None,
+        "stage2_consensus_channel": None,
+        "stage2_consensus_value": None,
+        "stage2_consensus_support_count": 0,
+        "stage2_consensus_vote_fraction": None,
+        "stage2_consensus_group_counts": {},
+        "stage2_consensus_support_by_rollout": {},
+        "stage2_target_rollout_idxs": [],
+        "stage2_ambiguous_count": 0,
+        "stage2_conflict": False,
+        "stage2_would_accept_m2": False,
+        "stage2_would_accept_m3": False,
+        "stage2_would_accept_m4": False,
         "selected_rollout": None,
     }
 
 
-def _anchor_similarity(left: set[str], right: set[str]) -> float:
-    if not left or not right:
-        return 0.0
-    return len(left & right) / len(left | right)
+def _primary_signature(rollout: dict[str, Any], *, stage2: bool = False) -> tuple[str, str] | None:
+    evidence_key = "stage2_step_evidence" if stage2 else "step_evidence"
+    field_prefix = "stage2_evidence_" if stage2 else "evidence_"
+    for channel in ROUTING_EVIDENCE_CHANNEL_PRIORITY:
+        value = rollout.get(f"{field_prefix}{channel}")
+        if value is None:
+            evidence = rollout.get(evidence_key)
+            if isinstance(evidence, dict):
+                value = evidence.get(channel)
+        if value not in (None, ""):
+            return channel, str(value)
+    return None
 
 
-def _mean_pairwise_anchor_similarity(anchor_sets: list[set[str]]) -> float:
-    if len(anchor_sets) < 2:
-        return 0.0
-    values = [
-        _anchor_similarity(anchor_sets[i], anchor_sets[j])
-        for i in range(len(anchor_sets))
-        for j in range(i + 1, len(anchor_sets))
-    ]
-    return sum(values) / len(values) if values else 0.0
+def _evidence_primary_signature(evidence: dict[str, Any] | None) -> tuple[str, str] | None:
+    if not isinstance(evidence, dict):
+        return None
+    for channel in ROUTING_EVIDENCE_CHANNEL_PRIORITY:
+        value = evidence.get(channel)
+        if value not in (None, ""):
+            return channel, str(value)
+    return None
 
 
-def _recent_prefix_anchor_sets(prefix_text: str) -> list[set[str]]:
-    steps = [step.strip() for step in prefix_text.split("\n\n") if step.strip()]
-    recent_steps = steps[-PREFIX_ANCHOR_WINDOW_STEPS:]
-    return [set(extract_content_anchors(step)) for step in recent_steps if step]
+def _signature_key(signature: tuple[str, str] | None) -> str | None:
+    if signature is None:
+        return None
+    channel, value = signature
+    return f"{channel}\t{value}"
 
 
-def _prefix_anchor_agreement(group_anchor_sets: list[set[str]], prefix_anchor_sets: list[set[str]]) -> float:
-    if not group_anchor_sets or not prefix_anchor_sets:
-        return 0.0
-    values = [
-        max(_anchor_similarity(anchor_set, prefix_anchor_set) for prefix_anchor_set in prefix_anchor_sets)
-        for anchor_set in group_anchor_sets
-    ]
-    return sum(values) / len(values) if values else 0.0
+def _split_signature_key(key: str | None) -> tuple[str | None, str | None]:
+    if key is None:
+        return None, None
+    channel, value = key.split("\t", 1)
+    return channel, value
 
 
-def _hard_conflict_detected(rollouts: list[dict[str, Any]]) -> bool:
-    boxed_values = {
-        value
-        for rollout in rollouts
-        if (value := _rollout_evidence_value(rollout, "boxed_answer")) is not None
-    }
-    if len(boxed_values) > 1:
-        return True
-
-    equation_by_lhs: dict[str, set[str]] = {}
-    for rollout in rollouts:
-        equation = _rollout_evidence_value(rollout, "equation_claim")
-        if equation is None or "=" not in equation:
-            continue
-        body = equation.split(":", 1)[-1]
-        lhs, rhs = body.split("=", 1)
-        equation_by_lhs.setdefault(lhs, set()).add(rhs)
-    return any(len(rhs_values) > 1 for rhs_values in equation_by_lhs.values())
+def _stage1_groups(rollouts: list[dict[str, Any]]) -> tuple[str | None, dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    for channel in ROUTING_EVIDENCE_CHANNEL_PRIORITY:
+        groups: dict[str, list[dict[str, Any]]] = {}
+        none_rollouts: list[dict[str, Any]] = []
+        for rollout in rollouts:
+            value = _rollout_evidence_value(rollout, channel)
+            if value is None:
+                none_rollouts.append(rollout)
+                continue
+            groups.setdefault(value, []).append(rollout)
+        if groups:
+            return channel, groups, none_rollouts
+    return None, {}, list(rollouts)
 
 
-def _rollout_content_anchor_set(rollout: dict[str, Any]) -> set[str]:
-    anchors = rollout.get("content_anchors")
-    if anchors is None:
-        evidence = rollout.get("step_evidence")
-        if isinstance(evidence, dict):
-            anchors = evidence.get("content_anchors")
-    if anchors is None:
-        anchors = extract_content_anchors(str(rollout.get("text") or ""))
-    return {str(anchor) for anchor in anchors or []}
-
-
-def _selected_text_anchor_rollout(
+def _stage1_case(
     rollouts: list[dict[str, Any]],
     *,
-    prefix_text: str,
     min_agreement_count: int,
 ) -> dict[str, Any]:
-    prefix_anchor_sets = _recent_prefix_anchor_sets(prefix_text)
-    prefix_anchor_union = set().union(*prefix_anchor_sets) if prefix_anchor_sets else set()
-    rollout_anchor_sets = {id(rollout): _rollout_content_anchor_set(rollout) for rollout in rollouts}
-    for rollout in rollouts:
-        rollout["content_anchors"] = sorted(rollout_anchor_sets[id(rollout)])
-
-    candidate_groups: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
-    for seed in rollouts:
-        seed_anchors = rollout_anchor_sets[id(seed)]
-        if len(seed_anchors) < TEXT_ANCHOR_MIN_COUNT:
-            continue
-        group = [
-            rollout
-            for rollout in rollouts
-            if _anchor_similarity(seed_anchors, rollout_anchor_sets[id(rollout)]) >= TEXT_ANCHOR_CLUSTER_SIMILARITY
-        ]
-        if len(group) >= min_agreement_count:
-            candidate_groups.append((seed, group))
-
-    if not candidate_groups:
+    channel, groups, none_rollouts = _stage1_groups(rollouts)
+    if channel is None:
         return {
-            "selected_rollout": None,
-            "channel": CONTENT_ANCHOR_CHANNEL,
+            "case": "all_none",
+            "channel": None,
             "value": None,
-            "support_count": 0,
+            "group": [],
+            "none_rollouts": none_rollouts,
             "group_counts": {},
-            "support_by_rollout": {str(_rollout_idx_sort_value(rollout)): False for rollout in rollouts},
-            "inter_agreement": None,
-            "prefix_agreement": None,
-            "residual_agreement": None,
-            "anchor_count": 0,
-            "new_anchor_count": 0,
-            "strong_new_anchor_count": 0,
-            "prefix_anchor_count": len(prefix_anchor_union),
         }
 
-    best: dict[str, Any] | None = None
-    for seed, group in candidate_groups:
-        group_anchor_sets = [rollout_anchor_sets[id(rollout)] for rollout in group]
-        group_anchor_union = set().union(*group_anchor_sets) if group_anchor_sets else set()
-        new_anchor_count = len(group_anchor_union - prefix_anchor_union)
-        strong_new_anchor_count = len(
+    value, group = max(
+        groups.items(),
+        key=lambda item: (
+            len(item[1]),
+            _mean_logprob_sort_value(_best_rollout(item[1])),
+            item[0],
+        ),
+    )
+    group_counts = {group_value: len(group_rows) for group_value, group_rows in sorted(groups.items())}
+    if len(group) >= min_agreement_count:
+        case = "accepted"
+    elif len(groups) == 1:
+        case = "partial"
+    else:
+        case = "conflict"
+    return {
+        "case": case,
+        "channel": channel,
+        "value": value,
+        "group": group,
+        "none_rollouts": none_rollouts,
+        "group_counts": group_counts,
+    }
+
+
+def _stage2_signature_for_rollout(rollout: dict[str, Any]) -> tuple[str, str] | None:
+    first = _primary_signature(rollout, stage2=False)
+    final = _primary_signature(rollout, stage2=True)
+    suffix = _evidence_primary_signature(rollout.get("stage2_suffix_evidence"))
+    if final is None:
+        return first
+    if first is None:
+        return suffix or final
+    if suffix is not None and suffix != first:
+        rollout["stage2_ambiguous_signature"] = True
+        return None
+    if first == final or suffix == first:
+        return final
+    rollout["stage2_ambiguous_signature"] = True
+    return None
+
+
+def _stage2_vote(
+    rollouts: list[dict[str, Any]],
+    *,
+    min_agreement_count: int,
+) -> dict[str, Any]:
+    voting_rollouts: list[dict[str, Any]] = []
+    ambiguous_count = 0
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for rollout in rollouts:
+        if rollout.get("stage2_ambiguous_signature"):
+            ambiguous_count += 1
+            continue
+        signature = _stage2_signature_for_rollout(rollout)
+        if rollout.get("stage2_ambiguous_signature"):
+            ambiguous_count += 1
+            continue
+        key = _signature_key(signature)
+        if key is None:
+            continue
+        voting_rollouts.append(rollout)
+        groups.setdefault(key, []).append(rollout)
+
+    group_counts: dict[str, int] = {}
+    for key, group in sorted(groups.items()):
+        channel, value = _split_signature_key(key)
+        group_counts[f"{channel}:{value}"] = len(group)
+
+    best_key = None
+    best_group: list[dict[str, Any]] = []
+    if groups:
+        best_key, best_group = max(
+            groups.items(),
+            key=lambda item: (
+                len(item[1]),
+                _mean_logprob_sort_value(_best_rollout(item[1])),
+                item[0],
+            ),
+        )
+
+    support_count = len(best_group)
+    support_by_rollout: dict[str, bool] = {}
+    for rollout in rollouts:
+        rollout_idx = _rollout_idx_sort_value(rollout)
+        support_by_rollout[str(rollout_idx)] = best_group and rollout in best_group
+    channel, value = _split_signature_key(best_key)
+    return {
+        "channel": channel,
+        "value": value,
+        "group": best_group,
+        "group_counts": group_counts,
+        "support_count": support_count,
+        "vote_fraction": support_count / len(voting_rollouts) if voting_rollouts else None,
+        "support_by_rollout": support_by_rollout,
+        "ambiguous_count": ambiguous_count,
+        "voting_rollout_count": len(voting_rollouts),
+        "would_accept_m2": support_count >= 2,
+        "would_accept_m3": support_count >= 3,
+        "would_accept_m4": support_count >= 4,
+        "accepted": support_count >= min_agreement_count,
+        "selected_rollout": _best_rollout(best_group) if support_count >= min_agreement_count else None,
+    }
+
+
+def _zero_stage2_cost() -> dict[str, float | int]:
+    return {
+        "probe_decode_tokens": 0,
+        "probe_prefill_tokens": 0,
+        "probe_generate_calls": 0,
+        "probe_wall_time": 0.0,
+        "stage2_probe_decode_tokens": 0,
+        "stage2_probe_prefill_tokens": 0,
+        "stage2_probe_generate_calls": 0,
+        "stage2_probe_wall_time": 0.0,
+    }
+
+
+def _add_probe_cost(total: dict[str, float | int], delta: dict[str, float | int]) -> None:
+    for key, value in delta.items():
+        total[key] = total.get(key, 0) + value
+
+
+def _stage2_continue_rollouts(
+    state: GenerationState,
+    slm,
+    config: BPAConfig,
+    rollouts: list[dict[str, Any]],
+    *,
+    probe_temperature: float,
+    probe_max_tokens: int,
+    probe_stop: str,
+) -> dict[str, float | int]:
+    if not rollouts:
+        return _zero_stage2_cost()
+    tokenizer = slm.ensure_tokenizer()
+    context_text = f"{state.problem_text}\n{state.assistant_prefix_text}"
+    cost = _zero_stage2_cost()
+    for rollout in rollouts:
+        prefix_text = str(rollout.get("text") or "")
+        rendered = render_for_continuation(state.problem_text, state.assistant_prefix_text + prefix_text, tokenizer)
+        max_tokens, prompt_tokens = generation_budget_for_rendered(rendered, slm, config, probe_max_tokens)
+        sampling = slm.sampling_params(
+            max_tokens=max_tokens,
+            temperature=probe_temperature,
+            stop=[probe_stop],
+            include_stop_str_in_output=True,
+            logprobs=1,
+            n=1,
+        )
+        generate_start = time.time()
+        out = slm.generate(rendered, sampling)[0]
+        cost["probe_wall_time"] += time.time() - generate_start
+        completion = (getattr(out, "outputs", []) or [None])[0]
+        continuation_text = getattr(completion, "text", "") if completion is not None else ""
+        token_ids = list(getattr(completion, "token_ids", []) or []) if completion is not None else []
+        finish = str(getattr(completion, "finish_reason", "") or "") if completion is not None else ""
+        combined_text = prefix_text + (continuation_text or "")
+        step_evidence = extract_step_evidence(combined_text, context_text)
+        suffix_evidence = extract_step_evidence(continuation_text or "", context_text + "\n" + prefix_text)
+        extension_mean_logprob = _completion_mean_logprob(completion) if completion is not None else None
+        rollout.update(
             {
-                anchor
-                for anchor in group_anchor_union - prefix_anchor_union
-                if anchor not in WEAK_TEXT_ANCHORS
+                "stage2_text": combined_text,
+                "stage2_continuation_text": continuation_text,
+                "stage2_token_count": int(rollout.get("token_count") or 0) + len(token_ids),
+                "stage2_extension_token_count": len(token_ids),
+                "stage2_finish_reason": finish or rollout.get("finish_reason"),
+                "stage2_extension_mean_logprob": extension_mean_logprob,
+                "stage2_step_evidence": step_evidence,
+                "stage2_suffix_evidence": suffix_evidence,
+                **{f"stage2_evidence_{key}": value for key, value in step_evidence.items() if key != "evidence_channels"},
+                "stage2_evidence_channels": step_evidence["evidence_channels"],
             }
         )
-        inter_agreement = _mean_pairwise_anchor_similarity(group_anchor_sets)
-        prefix_agreement = _prefix_anchor_agreement(group_anchor_sets, prefix_anchor_sets)
-        residual_agreement = inter_agreement - prefix_agreement
-        selected = _best_rollout(group)
-        diagnostics = {
-            "seed": seed,
-            "group": group,
-            "selected_rollout": selected,
-            "inter_agreement": inter_agreement,
-            "prefix_agreement": prefix_agreement,
-            "residual_agreement": residual_agreement,
-            "anchor_count": len(group_anchor_union),
-            "new_anchor_count": new_anchor_count,
-            "strong_new_anchor_count": strong_new_anchor_count,
-            "group_anchor_union": group_anchor_union,
-        }
-        if best is None or (
-            len(group),
-            inter_agreement,
-            residual_agreement,
-            _mean_logprob_sort_value(selected),
-        ) > (
-            len(best["group"]),
-            best["inter_agreement"],
-            best["residual_agreement"],
-            _mean_logprob_sort_value(best["selected_rollout"]),
-        ):
-            best = diagnostics
-
-    assert best is not None
-    accepted = (
-        len(best["group"]) >= min_agreement_count
-        and best["inter_agreement"] >= TEXT_ANCHOR_MIN_INTER_AGREEMENT
-        and best["residual_agreement"] >= TEXT_ANCHOR_MIN_RESIDUAL_AGREEMENT
-        and best["anchor_count"] >= TEXT_ANCHOR_MIN_COUNT
-        and best["new_anchor_count"] >= TEXT_ANCHOR_MIN_NEW_COUNT
-        and best["strong_new_anchor_count"] >= TEXT_ANCHOR_MIN_STRONG_NEW_COUNT
-    )
-    selected_rollout = best["selected_rollout"] if accepted else None
-    support_by_rollout = {
-        str(_rollout_idx_sort_value(rollout)): bool(accepted and rollout in best["group"])
-        for rollout in rollouts
-    }
-    value_anchors = sorted(best["group_anchor_union"] - prefix_anchor_union) or sorted(best["group_anchor_union"])
-    value = f"{CONTENT_ANCHOR_CHANNEL}:" + "|".join(value_anchors[:8])
-    return {
-        "selected_rollout": selected_rollout,
-        "channel": CONTENT_ANCHOR_CHANNEL,
-        "value": value if accepted else None,
-        "support_count": len(best["group"]),
-        "group_counts": {value: len(best["group"])},
-        "support_by_rollout": support_by_rollout,
-        "inter_agreement": best["inter_agreement"],
-        "prefix_agreement": best["prefix_agreement"],
-        "residual_agreement": best["residual_agreement"],
-        "anchor_count": best["anchor_count"],
-        "new_anchor_count": best["new_anchor_count"],
-        "strong_new_anchor_count": best["strong_new_anchor_count"],
-        "prefix_anchor_count": len(prefix_anchor_union),
-    }
+        cost["probe_decode_tokens"] += len(token_ids)
+        cost["probe_prefill_tokens"] += prompt_tokens
+        cost["probe_generate_calls"] += 1
+        cost["stage2_probe_decode_tokens"] += len(token_ids)
+        cost["stage2_probe_prefill_tokens"] += prompt_tokens
+        cost["stage2_probe_generate_calls"] += 1
+        cost["stage2_probe_wall_time"] = cost["probe_wall_time"]
+    return cost
 
 
 def _selected_prefix_consensus_rollout(
@@ -356,69 +423,12 @@ def _selected_prefix_consensus_rollout(
         if "rollout_idx" not in rollout:
             rollout["rollout_idx"] = idx
 
-    best_channel = None
-    best_value = None
-    best_group: list[dict[str, Any]] = []
-    best_group_counts: dict[str, int] = {}
-    for channel in ROUTING_EVIDENCE_CHANNEL_PRIORITY:
-        groups: dict[str, list[dict[str, Any]]] = {}
-        for rollout in rollouts:
-            value = _rollout_evidence_value(rollout, channel)
-            if value is None:
-                continue
-            groups.setdefault(value, []).append(rollout)
-        if not groups:
-            continue
-        channel_value, channel_group = max(
-            groups.items(),
-            key=lambda item: (
-                len(item[1]),
-                _mean_logprob_sort_value(_best_rollout(item[1])),
-                item[0],
-            ),
-        )
-        if len(channel_group) >= min_agreement_count:
-            best_channel = channel
-            best_value = channel_value
-            best_group = channel_group
-            best_group_counts = {value: len(group) for value, group in sorted(groups.items())}
-            break
-        if not best_group:
-            best_channel = channel
-            best_value = channel_value
-            best_group = channel_group
-            best_group_counts = {value: len(group) for value, group in sorted(groups.items())}
-
-    hard_conflict = _hard_conflict_detected(rollouts)
-    selected_rollout = _best_rollout(best_group) if len(best_group) >= min_agreement_count else None
-    if selected_rollout is None and not hard_conflict:
-        text_consensus = _selected_text_anchor_rollout(
-            rollouts,
-            prefix_text=str(probe_row.get("assistant_prefix_text") or ""),
-            min_agreement_count=min_agreement_count,
-        )
-        if text_consensus["selected_rollout"] is not None:
-            selected_rollout = text_consensus["selected_rollout"]
-            best_channel = text_consensus["channel"]
-            best_value = text_consensus["value"]
-            best_group = [
-                rollout
-                for rollout in rollouts
-                if text_consensus["support_by_rollout"].get(str(_rollout_idx_sort_value(rollout)))
-            ]
-            best_group_counts = text_consensus["group_counts"]
-        else:
-            text_consensus = text_consensus
-    else:
-        text_consensus = {
-            "inter_agreement": None,
-            "prefix_agreement": None,
-            "residual_agreement": None,
-            "anchor_count": 0,
-            "new_anchor_count": 0,
-            "strong_new_anchor_count": 0,
-            "prefix_anchor_count": 0,
-        }
+    stage1 = _stage1_case(rollouts, min_agreement_count=min_agreement_count)
+    best_channel = stage1["channel"]
+    best_value = stage1["value"]
+    best_group = list(stage1["group"])
+    best_group_counts = dict(stage1["group_counts"])
+    selected_rollout = _best_rollout(best_group) if stage1["case"] == "accepted" else None
     support_by_rollout: dict[str, bool] = {}
     for rollout in rollouts:
         rollout_idx = _rollout_idx_sort_value(rollout)
@@ -435,16 +445,161 @@ def _selected_prefix_consensus_rollout(
         "prefix_consensus_vote_fraction": support_count / len(rollouts) if rollouts else None,
         "prefix_consensus_support_by_rollout": support_by_rollout,
         "prefix_consensus_group_counts": best_group_counts,
-        "prefix_hard_conflict": hard_conflict,
-        "content_anchor_inter_agreement": text_consensus["inter_agreement"],
-        "content_anchor_prefix_agreement": text_consensus["prefix_agreement"],
-        "content_anchor_residual_agreement": text_consensus["residual_agreement"],
-        "content_anchor_count": text_consensus["anchor_count"],
-        "content_anchor_new_count": text_consensus["new_anchor_count"],
-        "content_anchor_strong_new_count": text_consensus["strong_new_anchor_count"],
-        "content_anchor_prefix_count": text_consensus["prefix_anchor_count"],
+        "prefix_consensus_stage": 1 if selected_rollout else None,
+        "stage1_case": stage1["case"],
+        "stage2_triggered": False,
+        "stage2_case": None,
+        "stage2_min_agreement_count": None,
+        "stage2_consensus_channel": None,
+        "stage2_consensus_value": None,
+        "stage2_consensus_support_count": 0,
+        "stage2_consensus_vote_fraction": None,
+        "stage2_consensus_group_counts": {},
+        "stage2_consensus_support_by_rollout": {},
+        "stage2_target_rollout_idxs": [],
+        "stage2_ambiguous_count": 0,
+        "stage2_conflict": stage1["case"] == "conflict",
+        "stage2_would_accept_m2": False,
+        "stage2_would_accept_m3": False,
+        "stage2_would_accept_m4": False,
         "selected_rollout": selected_rollout,
     }
+
+
+def _maybe_apply_stage2_consensus(
+    state: GenerationState,
+    slm,
+    config: BPAConfig,
+    probe_row: dict[str, Any],
+    prefix_consensus: dict[str, Any],
+    *,
+    min_agreement_count: int,
+    stage2_min_agreement_count: int,
+    probe_temperature: float,
+    probe_max_tokens: int,
+    probe_stop: str,
+) -> tuple[dict[str, Any], dict[str, float | int]]:
+    if prefix_consensus.get("selected_rollout") is not None:
+        return prefix_consensus, _zero_stage2_cost()
+
+    rollouts = list(probe_row.get("rollouts") or [])
+    stage1 = _stage1_case(rollouts, min_agreement_count=min_agreement_count)
+    if stage1["case"] == "conflict":
+        prefix_consensus["stage2_case"] = "conflict"
+        prefix_consensus["stage2_conflict"] = True
+        return prefix_consensus, _zero_stage2_cost()
+
+    original_signature: tuple[str, str] | None = None
+    target_rollouts: list[dict[str, Any]]
+    if stage1["case"] == "partial":
+        original_signature = (str(stage1["channel"]), str(stage1["value"]))
+        target_rollouts = list(stage1["none_rollouts"])
+        stage2_case = "partial"
+    elif stage1["case"] == "all_none":
+        target_rollouts = rollouts
+        stage2_case = "all_none"
+    else:
+        return prefix_consensus, _zero_stage2_cost()
+
+    prefix_consensus["stage2_case"] = stage2_case
+    prefix_consensus["stage2_triggered"] = True
+    prefix_consensus["stage2_min_agreement_count"] = stage2_min_agreement_count
+    prefix_consensus["stage2_target_rollout_idxs"] = [_rollout_idx_sort_value(rollout) for rollout in target_rollouts]
+    cost = _stage2_continue_rollouts(
+        state,
+        slm,
+        config,
+        target_rollouts,
+        probe_temperature=probe_temperature,
+        probe_max_tokens=probe_max_tokens,
+        probe_stop=probe_stop,
+    )
+
+    if stage2_case == "partial":
+        original_channel, original_value = original_signature or (None, None)
+        stage2_other_signature = False
+        support_group = list(stage1["group"])
+        for rollout in target_rollouts:
+            signature = _stage2_signature_for_rollout(rollout)
+            if rollout.get("stage2_ambiguous_signature"):
+                continue
+            if signature is None:
+                continue
+            if signature == original_signature:
+                support_group.append(rollout)
+            else:
+                stage2_other_signature = True
+                rollout["stage2_conflict_signature"] = _signature_key(signature)
+        support_count = len(support_group)
+        support_by_rollout = {
+            str(_rollout_idx_sort_value(rollout)): rollout in support_group
+            for rollout in rollouts
+        }
+        prefix_consensus.update(
+            {
+                "stage2_consensus_channel": original_channel,
+                "stage2_consensus_value": original_value,
+                "stage2_consensus_support_count": support_count,
+                "stage2_consensus_vote_fraction": support_count / len(rollouts) if rollouts else None,
+                "stage2_consensus_group_counts": {str(original_value): support_count} if original_value else {},
+                "stage2_consensus_support_by_rollout": support_by_rollout,
+                "stage2_ambiguous_count": sum(1 for rollout in target_rollouts if rollout.get("stage2_ambiguous_signature")),
+                "stage2_conflict": stage2_other_signature,
+                "stage2_would_accept_m2": support_count >= 2 and not stage2_other_signature,
+                "stage2_would_accept_m3": support_count >= 3 and not stage2_other_signature,
+                "stage2_would_accept_m4": support_count >= 4 and not stage2_other_signature,
+            }
+        )
+        if not stage2_other_signature and support_count >= stage2_min_agreement_count:
+            selected_rollout = _best_rollout(support_group)
+            prefix_consensus.update(
+                {
+                    "prefix_anchor_idx": selected_rollout.get("rollout_idx"),
+                    "prefix_anchor_mean_logprob": selected_rollout.get("mean_logprob"),
+                    "prefix_consensus_channel": original_channel,
+                    "prefix_consensus_value": original_value,
+                    "prefix_consensus_support_count": support_count,
+                    "prefix_consensus_vote_fraction": support_count / len(rollouts) if rollouts else None,
+                    "prefix_consensus_support_by_rollout": support_by_rollout,
+                    "prefix_consensus_group_counts": {str(original_value): support_count} if original_value else {},
+                    "prefix_consensus_stage": 2,
+                    "selected_rollout": selected_rollout,
+                }
+            )
+        return prefix_consensus, cost
+
+    vote = _stage2_vote(rollouts, min_agreement_count=stage2_min_agreement_count)
+    prefix_consensus.update(
+        {
+            "stage2_consensus_channel": vote["channel"],
+            "stage2_consensus_value": vote["value"],
+            "stage2_consensus_support_count": vote["support_count"],
+            "stage2_consensus_vote_fraction": vote["vote_fraction"],
+            "stage2_consensus_group_counts": vote["group_counts"],
+            "stage2_consensus_support_by_rollout": vote["support_by_rollout"],
+            "stage2_ambiguous_count": vote["ambiguous_count"],
+            "stage2_would_accept_m2": vote["would_accept_m2"],
+            "stage2_would_accept_m3": vote["would_accept_m3"],
+            "stage2_would_accept_m4": vote["would_accept_m4"],
+        }
+    )
+    if vote["accepted"]:
+        selected_rollout = vote["selected_rollout"]
+        prefix_consensus.update(
+            {
+                "prefix_anchor_idx": selected_rollout.get("rollout_idx") if selected_rollout else None,
+                "prefix_anchor_mean_logprob": selected_rollout.get("mean_logprob") if selected_rollout else None,
+                "prefix_consensus_channel": vote["channel"],
+                "prefix_consensus_value": vote["value"],
+                "prefix_consensus_support_count": vote["support_count"],
+                "prefix_consensus_vote_fraction": vote["vote_fraction"],
+                "prefix_consensus_support_by_rollout": vote["support_by_rollout"],
+                "prefix_consensus_group_counts": vote["group_counts"],
+                "prefix_consensus_stage": 2,
+                "selected_rollout": selected_rollout,
+            }
+        )
+    return prefix_consensus, cost
 
 
 def _probe_step_token_count(rollout: dict[str, Any], slm) -> int:
@@ -465,9 +620,18 @@ def _selected_probe_prefix_step(
     config: BPAConfig,
     selected_rollout: dict[str, Any],
 ) -> tuple[str, str, int, bool, str, str]:
-    prefix_text = str(selected_rollout.get("text") or "")
-    prefix_finish = str(selected_rollout.get("finish_reason") or "")
-    prefix_token_count = _probe_step_token_count(selected_rollout, slm)
+    is_stage2 = "stage2_text" in selected_rollout and selected_rollout.get("prefix_consensus_stage") != 1
+    prefix_text = str(selected_rollout.get("stage2_text") if is_stage2 else selected_rollout.get("text") or "")
+    prefix_finish = str(selected_rollout.get("stage2_finish_reason") if is_stage2 else selected_rollout.get("finish_reason") or "")
+    if is_stage2:
+        try:
+            prefix_token_count = int(selected_rollout.get("stage2_token_count") or 0)
+        except (TypeError, ValueError):
+            prefix_token_count = 0
+        if prefix_token_count <= 0:
+            prefix_token_count = len(slm.encode(prefix_text)) if prefix_text else 0
+    else:
+        prefix_token_count = _probe_step_token_count(selected_rollout, slm)
 
     if prefix_finish in {"stop", "eos"}:
         state.slm_decode_tokens += prefix_token_count
@@ -488,7 +652,14 @@ def _selected_probe_prefix_step(
                     prefix_text,
                     "",
                 )
-        return prefix_text, prefix_finish, prefix_token_count, False, prefix_text, ""
+        return (
+            prefix_text,
+            prefix_finish,
+            prefix_token_count,
+            bool(is_stage2 and selected_rollout.get("stage2_continuation_text")),
+            prefix_text,
+            str(selected_rollout.get("stage2_continuation_text") or "") if is_stage2 else "",
+        )
 
     current_decode_tokens = state.slm_decode_tokens + state.llm_decode_tokens
     remaining_step_tokens = config.max_step_tokens - prefix_token_count
@@ -529,9 +700,21 @@ def run_disagreement_routing(
     probe_temperature: float = 0.7,
     probe_max_tokens: int = 32,
     probe_stop: str = "\n\n",
+    stage2_min_agreement_count: int | None = None,
+    stage2_probe_max_tokens: int | None = None,
 ) -> tuple[BPAResult, list[dict[str, Any]], dict[str, float | int]]:
     if min_agreement_count > probe_k:
         raise ValueError("min_agreement_count cannot exceed probe_k")
+    if stage2_min_agreement_count is None:
+        stage2_min_agreement_count = probe_k
+    if stage2_min_agreement_count < 1:
+        raise ValueError("stage2_min_agreement_count must be >= 1")
+    if stage2_min_agreement_count > probe_k:
+        raise ValueError("stage2_min_agreement_count cannot exceed probe_k")
+    if stage2_probe_max_tokens is None:
+        stage2_probe_max_tokens = probe_max_tokens
+    if stage2_probe_max_tokens < 1:
+        raise ValueError("stage2_probe_max_tokens must be >= 1")
 
     protocol = "evidence_consensus_routing"
     state = GenerationState(problem_text=problem_text, generation_protocol=protocol)
@@ -544,6 +727,10 @@ def run_disagreement_routing(
         "probe_prefill_tokens": 0,
         "probe_generate_calls": 0,
         "probe_wall_time": 0.0,
+        "stage2_probe_decode_tokens": 0,
+        "stage2_probe_prefill_tokens": 0,
+        "stage2_probe_generate_calls": 0,
+        "stage2_probe_wall_time": 0.0,
     }
     boundary_idx = 0
 
@@ -659,12 +846,30 @@ def run_disagreement_routing(
         probe_row["target_step_idx"] = state.step_count
         probe_row["is_initial_probe"] = False
         boundary_idx += 1
-        for key in probe_cost:
-            probe_cost[key] += cost[key]
+        _add_probe_cost(probe_cost, cost)
         prefix_consensus = _selected_prefix_consensus_rollout(
             probe_row,
             min_agreement_count=min_agreement_count,
         )
+        try:
+            prefix_consensus, stage2_cost = _maybe_apply_stage2_consensus(
+                state,
+                slm,
+                config,
+                probe_row,
+                prefix_consensus,
+                min_agreement_count=min_agreement_count,
+                stage2_min_agreement_count=stage2_min_agreement_count,
+                probe_temperature=probe_temperature,
+                probe_max_tokens=stage2_probe_max_tokens,
+                probe_stop=probe_stop,
+            )
+            _add_probe_cost(probe_cost, stage2_cost)
+        except ContextBudgetExceeded as exc:
+            state.phase = Phase.DONE
+            state.stop_reason = "context_budget"
+            state.trace.append(TraceEvent(state.step_count, "context_budget_exhausted", exc.to_trace_data()))
+            break
         selected_rollout = prefix_consensus["selected_rollout"]
         route_to_llm = selected_rollout is None
 
@@ -706,14 +911,23 @@ def run_disagreement_routing(
         probe_row["prefix_consensus_vote_fraction"] = prefix_consensus["prefix_consensus_vote_fraction"]
         probe_row["prefix_consensus_support_by_rollout"] = prefix_consensus["prefix_consensus_support_by_rollout"]
         probe_row["prefix_consensus_group_counts"] = prefix_consensus["prefix_consensus_group_counts"]
-        probe_row["prefix_hard_conflict"] = prefix_consensus["prefix_hard_conflict"]
-        probe_row["content_anchor_inter_agreement"] = prefix_consensus["content_anchor_inter_agreement"]
-        probe_row["content_anchor_prefix_agreement"] = prefix_consensus["content_anchor_prefix_agreement"]
-        probe_row["content_anchor_residual_agreement"] = prefix_consensus["content_anchor_residual_agreement"]
-        probe_row["content_anchor_count"] = prefix_consensus["content_anchor_count"]
-        probe_row["content_anchor_new_count"] = prefix_consensus["content_anchor_new_count"]
-        probe_row["content_anchor_strong_new_count"] = prefix_consensus["content_anchor_strong_new_count"]
-        probe_row["content_anchor_prefix_count"] = prefix_consensus["content_anchor_prefix_count"]
+        probe_row["prefix_consensus_stage"] = prefix_consensus["prefix_consensus_stage"]
+        probe_row["stage1_case"] = prefix_consensus["stage1_case"]
+        probe_row["stage2_triggered"] = prefix_consensus["stage2_triggered"]
+        probe_row["stage2_case"] = prefix_consensus["stage2_case"]
+        probe_row["stage2_min_agreement_count"] = prefix_consensus["stage2_min_agreement_count"]
+        probe_row["stage2_consensus_channel"] = prefix_consensus["stage2_consensus_channel"]
+        probe_row["stage2_consensus_value"] = prefix_consensus["stage2_consensus_value"]
+        probe_row["stage2_consensus_support_count"] = prefix_consensus["stage2_consensus_support_count"]
+        probe_row["stage2_consensus_vote_fraction"] = prefix_consensus["stage2_consensus_vote_fraction"]
+        probe_row["stage2_consensus_group_counts"] = prefix_consensus["stage2_consensus_group_counts"]
+        probe_row["stage2_consensus_support_by_rollout"] = prefix_consensus["stage2_consensus_support_by_rollout"]
+        probe_row["stage2_target_rollout_idxs"] = prefix_consensus["stage2_target_rollout_idxs"]
+        probe_row["stage2_ambiguous_count"] = prefix_consensus["stage2_ambiguous_count"]
+        probe_row["stage2_conflict"] = prefix_consensus["stage2_conflict"]
+        probe_row["stage2_would_accept_m2"] = prefix_consensus["stage2_would_accept_m2"]
+        probe_row["stage2_would_accept_m3"] = prefix_consensus["stage2_would_accept_m3"]
+        probe_row["stage2_would_accept_m4"] = prefix_consensus["stage2_would_accept_m4"]
         probe_row["routed_to_llm"] = route_to_llm
         probe_row["reused_probe_rollout"] = selected_rollout is not None
         probe_row["selected_rollout_idx"] = selected_rollout.get("rollout_idx") if probe_row["reused_probe_rollout"] else None
@@ -721,7 +935,9 @@ def run_disagreement_routing(
             selected_rollout.get("mean_logprob") if probe_row["reused_probe_rollout"] else None
         )
         probe_row["selected_rollout_finish_reason"] = (
-            selected_rollout.get("finish_reason") if probe_row["reused_probe_rollout"] else None
+            selected_rollout.get("stage2_finish_reason") or selected_rollout.get("finish_reason")
+            if probe_row["reused_probe_rollout"]
+            else None
         )
         probe_row["selected_rollout_token_count"] = selected_rollout_token_count if probe_row["reused_probe_rollout"] else None
         probe_row["continued_probe_rollout"] = continued_probe_rollout
@@ -810,6 +1026,8 @@ def build_problem_summary(
         "num_llm_routed_steps": sum(1 for row in real_boundary_rows if row.get("routed_to_llm")),
         "num_slm_steps": sum(1 for row in real_boundary_rows if not row.get("routed_to_llm")),
         "num_probe_reused_steps": sum(1 for row in real_boundary_rows if row.get("reused_probe_rollout")),
+        "num_stage2_triggered": sum(1 for row in real_boundary_rows if row.get("stage2_triggered")),
+        "num_stage2_accepted": sum(1 for row in real_boundary_rows if row.get("prefix_consensus_stage") == 2),
         "total_wall_time": result.total_wall_time,
         "problem_wall_time": problem_wall_time if problem_wall_time is not None else result.total_wall_time,
         "slm_decode_tokens": result.state.slm_decode_tokens,
@@ -836,6 +1054,8 @@ def _summary_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_problem_wall_time": _mean([row.get("problem_wall_time") for row in rows]),
         "avg_num_llm_routed_steps": _mean([row.get("num_llm_routed_steps") for row in rows]),
         "avg_num_probe_reused_steps": _mean([row.get("num_probe_reused_steps") for row in rows]),
+        "avg_num_stage2_triggered": _mean([row.get("num_stage2_triggered") for row in rows]),
+        "avg_num_stage2_accepted": _mean([row.get("num_stage2_accepted") for row in rows]),
         "avg_main_decode_tokens": _mean([row.get("main_decode_tokens") for row in rows]),
         "avg_total_decode_tokens_including_probe": _mean(
             [row.get("total_decode_tokens_including_probe") for row in rows]
@@ -844,6 +1064,7 @@ def _summary_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "total_llm_prefill_tokens": sum(float(row.get("llm_prefill_tokens") or 0.0) for row in rows),
         "total_slm_decode_tokens": sum(float(row.get("slm_decode_tokens") or 0.0) for row in rows),
         "total_probe_decode_tokens": sum(float(row.get("probe_decode_tokens") or 0.0) for row in rows),
+        "total_stage2_probe_decode_tokens": sum(float(row.get("stage2_probe_decode_tokens") or 0.0) for row in rows),
         "total_main_decode_tokens": sum(float(row.get("main_decode_tokens") or 0.0) for row in rows),
         "total_decode_tokens_including_probe": sum(
             float(row.get("total_decode_tokens_including_probe") or 0.0) for row in rows
@@ -998,6 +1219,8 @@ def main() -> None:
     parser.add_argument("--probe-k", type=int, default=4)
     parser.add_argument("--probe-temperature", type=float, default=0.7)
     parser.add_argument("--probe-max-tokens", type=int, default=32)
+    parser.add_argument("--stage2-min-agreement-count", type=int, default=None)
+    parser.add_argument("--stage2-probe-max-tokens", type=int, default=None)
     parser.add_argument("--post-stop-lookahead-tokens", type=int, default=None)
     parser.add_argument("--output-name", default=None, help="Optional diagnostics output folder name under disagreement_routing/.")
     parser.add_argument("--resume", action="store_true", help="Skip problems that already have complete per-problem outputs.")
@@ -1043,6 +1266,8 @@ def main() -> None:
             probe_k=args.probe_k,
             probe_temperature=args.probe_temperature,
             probe_max_tokens=args.probe_max_tokens,
+            stage2_min_agreement_count=args.stage2_min_agreement_count,
+            stage2_probe_max_tokens=args.stage2_probe_max_tokens,
         )
         summary = build_problem_summary(
             dataset=args.dataset,

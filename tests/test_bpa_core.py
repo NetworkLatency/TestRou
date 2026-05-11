@@ -17,7 +17,6 @@ from bpa.eval.exp_boundary_continuation import (
     select_evenly_spaced,
 )
 from bpa.eval.exp_disagreement_routing import (
-    _selected_prefix_consensus_rollout,
     build_problem_summary as build_routing_problem_summary,
     compact_boundary_row,
     existing_problem_summary as existing_routing_problem_summary,
@@ -38,7 +37,6 @@ from bpa.eval.main_benchmark import (
     write_summary_files,
 )
 from bpa.eval.sampling_disagreement import (
-    extract_content_anchors,
     extract_step_evidence,
 )
 from bpa.engines import ModelEngine, completion_logprobs, generated_text, generated_token_ids
@@ -293,65 +291,6 @@ class CoreTests(unittest.TestCase):
 
         generic = extract_step_evidence("Now we continue.\n\n", "Problem mentions 100.")
         self.assertEqual(generic["evidence_channels"], [])
-
-    def test_content_anchors_drop_generic_templates(self):
-        self.assertEqual(extract_content_anchors("Now we need to solve this problem."), [])
-        anchors = extract_content_anchors("Split into even and odd cases for the remaining values.")
-        self.assertIn("split", anchors)
-        self.assertIn("even", anchors)
-        self.assertIn("odd", anchors)
-        self.assertIn("cases", anchors)
-
-    def test_text_anchor_consensus_accepts_new_shared_content(self):
-        probe_row = {
-            "assistant_prefix_text": "Let n be an integer.\n\n",
-            "rollouts": [
-                {"rollout_idx": 0, "text": "Split into even and odd cases.", "mean_logprob": -0.2},
-                {"rollout_idx": 1, "text": "We split into even and odd cases next.", "mean_logprob": -0.1},
-                {"rollout_idx": 2, "text": "Now split the problem into odd and even cases.", "mean_logprob": -0.3},
-                {"rollout_idx": 3, "text": "Use a geometric diagram.", "mean_logprob": -0.4},
-            ],
-        }
-        selected = _selected_prefix_consensus_rollout(probe_row, min_agreement_count=3)
-        self.assertEqual(selected["prefix_consensus_channel"], "content_anchor")
-        self.assertEqual(selected["prefix_consensus_support_count"], 3)
-        self.assertEqual(selected["prefix_anchor_idx"], 1)
-        self.assertGreater(selected["content_anchor_residual_agreement"], 0.0)
-
-    def test_text_anchor_consensus_rejects_prefix_repetition(self):
-        probe_row = {
-            "assistant_prefix_text": "Split into even and odd cases.\n\n",
-            "rollouts": [
-                {"rollout_idx": 0, "text": "Split into even and odd cases.", "mean_logprob": -0.1},
-                {"rollout_idx": 1, "text": "We split into even and odd cases.", "mean_logprob": -0.2},
-                {"rollout_idx": 2, "text": "Split into odd and even cases.", "mean_logprob": -0.3},
-                {"rollout_idx": 3, "text": "Split into even and odd cases.", "mean_logprob": -0.4},
-            ],
-        }
-        selected = _selected_prefix_consensus_rollout(probe_row, min_agreement_count=3)
-        self.assertIsNone(selected["selected_rollout"])
-        self.assertIsNone(selected["prefix_consensus_channel"])
-        self.assertLessEqual(selected["content_anchor_residual_agreement"], 0.0)
-
-    def test_explicit_hard_conflict_skips_text_fallback(self):
-        probe_row = {
-            "assistant_prefix_text": "Let x be unknown.\n\n",
-            "rollouts": [
-                {"rollout_idx": 0, "text": r"Final \boxed{1}. Then split into cases.", "mean_logprob": -0.1},
-                {"rollout_idx": 1, "text": r"Final \boxed{2}. Then split into cases.", "mean_logprob": -0.2},
-                {"rollout_idx": 2, "text": "Then split into cases.", "mean_logprob": -0.3},
-                {"rollout_idx": 3, "text": "Then split into cases.", "mean_logprob": -0.4},
-            ],
-        }
-        for rollout in probe_row["rollouts"]:
-            rollout["step_evidence"] = extract_step_evidence(rollout["text"], "")
-            for key, value in rollout["step_evidence"].items():
-                if key != "evidence_channels":
-                    rollout[f"evidence_{key}"] = value
-        selected = _selected_prefix_consensus_rollout(probe_row, min_agreement_count=3)
-        self.assertTrue(selected["prefix_hard_conflict"])
-        self.assertIsNone(selected["selected_rollout"])
-        self.assertIsNone(selected["content_anchor_inter_agreement"])
 
     def test_answer_eval(self):
         self.assertEqual(normalize_math_expr(r"\frac{4}{2}"), "2")
@@ -739,6 +678,113 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(boundaries[0]["prefix_consensus_support_count"], 1)
         self.assertEqual(llm.generate_calls, 1)
 
+    def test_stage2_partial_commitment_extends_none_rollouts(self):
+        slm = WeightedSamplingProbeEngine(
+            outputs=[
+                ("First step.\n\n", "stop"),
+            ],
+            probe_outputs=[
+                (r"Final \boxed{1}", -0.5, "length"),
+                ("Compute the result:", -0.2, "stop"),
+                ("Compute the result:", -0.3, "stop"),
+                ("Still working", -0.4, "stop"),
+                (r" Final \boxed{1}", -0.1, "eos"),
+                (r" Final \boxed{1}", -0.1, "eos"),
+                (" no result", -0.1, "stop"),
+            ],
+        )
+        llm = SequencedEngine(fail_on_generate=True)
+        result, boundaries, probe_cost = run_disagreement_routing(
+            "Problem: x?",
+            slm,
+            llm,
+            BPAConfig(max_total_tokens=300),
+            min_agreement_count=3,
+            probe_k=4,
+            probe_temperature=0.7,
+            probe_max_tokens=32,
+            stage2_min_agreement_count=3,
+            stage2_probe_max_tokens=32,
+        )
+        self.assertEqual(result.answer, "1")
+        self.assertEqual(result.state.stop_reason, "eos")
+        self.assertEqual(len(boundaries), 1)
+        self.assertEqual(boundaries[0]["stage1_case"], "partial")
+        self.assertTrue(boundaries[0]["stage2_triggered"])
+        self.assertEqual(boundaries[0]["prefix_consensus_stage"], 2)
+        self.assertEqual(boundaries[0]["stage2_consensus_support_count"], 3)
+        self.assertTrue(boundaries[0]["stage2_would_accept_m3"])
+        self.assertFalse(boundaries[0]["routed_to_llm"])
+        self.assertGreater(probe_cost["stage2_probe_generate_calls"], 0)
+
+    def test_stage2_all_none_extends_all_rollouts(self):
+        slm = WeightedSamplingProbeEngine(
+            outputs=[
+                ("First step.\n\n", "stop"),
+            ],
+            probe_outputs=[
+                ("Compute the result:", -0.2, "stop"),
+                ("Compute the result:", -0.3, "stop"),
+                ("Compute the result:", -0.4, "stop"),
+                ("Compute the result:", -0.5, "stop"),
+                (r" x = 1", -0.1, "eos"),
+                (r" x = 1", -0.1, "eos"),
+                (r" x = 1", -0.1, "eos"),
+                (r" x = 1", -0.1, "eos"),
+            ],
+        )
+        llm = SequencedEngine(fail_on_generate=True)
+        result, boundaries, _ = run_disagreement_routing(
+            "Problem: x?",
+            slm,
+            llm,
+            BPAConfig(max_total_tokens=300),
+            min_agreement_count=3,
+            probe_k=4,
+            probe_temperature=0.7,
+            probe_max_tokens=32,
+            stage2_min_agreement_count=4,
+            stage2_probe_max_tokens=32,
+        )
+        self.assertEqual(result.state.stop_reason, "eos")
+        self.assertEqual(len(boundaries), 1)
+        self.assertEqual(boundaries[0]["stage1_case"], "all_none")
+        self.assertTrue(boundaries[0]["stage2_triggered"])
+        self.assertEqual(boundaries[0]["prefix_consensus_stage"], 2)
+        self.assertEqual(boundaries[0]["stage2_consensus_support_count"], 4)
+        self.assertTrue(boundaries[0]["stage2_would_accept_m4"])
+
+    def test_stage2_skips_conflicting_stage1_signatures(self):
+        slm = WeightedSamplingProbeEngine(
+            outputs=[
+                ("First step.\n\n", "stop"),
+            ],
+            probe_outputs=[
+                (r"Final \boxed{1}", -0.1, "stop"),
+                (r"Final \boxed{2}", -0.2, "stop"),
+                ("Compute something", -0.3, "stop"),
+                ("Compute something else", -0.4, "stop"),
+            ],
+        )
+        llm = SequencedEngine([(r"\boxed{9}", "eos")])
+        result, boundaries, probe_cost = run_disagreement_routing(
+            "Problem: x?",
+            slm,
+            llm,
+            BPAConfig(max_total_tokens=300),
+            min_agreement_count=3,
+            probe_k=4,
+            probe_temperature=0.7,
+            probe_max_tokens=32,
+            stage2_min_agreement_count=3,
+            stage2_probe_max_tokens=32,
+        )
+        self.assertEqual(result.answer, "9")
+        self.assertEqual(boundaries[0]["stage1_case"], "conflict")
+        self.assertEqual(boundaries[0]["stage2_case"], "conflict")
+        self.assertFalse(boundaries[0]["stage2_triggered"])
+        self.assertEqual(probe_cost["stage2_probe_generate_calls"], 0)
+
     def test_operation_intent_is_diagnostic_not_routing_evidence(self):
         slm = WeightedSamplingProbeEngine(
             outputs=[
@@ -749,6 +795,10 @@ class CoreTests(unittest.TestCase):
                 ("Now solve this equation.\n\n", -0.2, "stop"),
                 ("We solve the equation.\n\n", -0.3, "stop"),
                 ("Let us solve the equation.\n\n", -0.4, "stop"),
+                ("No concrete result.\n\n", -0.1, "stop"),
+                ("Still no concrete result.\n\n", -0.2, "stop"),
+                ("No value yet.\n\n", -0.3, "stop"),
+                ("No equation result.\n\n", -0.4, "stop"),
             ],
         )
         llm = SequencedEngine([(r"\boxed{9}", "eos")])
@@ -919,10 +969,18 @@ class CoreTests(unittest.TestCase):
                 "beta",
                 "gamma",
                 "delta",
+                "no evidence",
+                "no evidence",
+                "no evidence",
+                "no evidence",
                 "alpha",
                 "beta",
                 "gamma",
                 "delta",
+                "no evidence",
+                "no evidence",
+                "no evidence",
+                "no evidence",
             ],
         )
         llm = SequencedEngine(
