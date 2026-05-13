@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,10 @@ SUMMARY_FIELDS = [
     "num_llm_colon_continuation_steps",
     "num_slm_steps",
     "num_probe_reused_steps",
+    "num_step_type_reused_steps",
+    "step_type_routing_enabled",
+    "step_type_min_agreement_count",
+    "max_consecutive_step_type_exec",
     "total_wall_time",
     "problem_wall_time",
     "slm_decode_tokens",
@@ -64,17 +69,27 @@ SUMMARY_FIELDS = [
     "probe_prefill_tokens",
     "probe_generate_calls",
     "probe_wall_time",
-    "text_bridge_decode_tokens",
-    "text_bridge_prefill_tokens",
-    "text_bridge_generate_calls",
-    "text_bridge_wall_time",
-    "text_bridge_verify_decode_tokens",
-    "text_bridge_verify_prefill_tokens",
-    "text_bridge_verify_generate_calls",
-    "text_bridge_verify_wall_time",
-    "num_text_bridge_triggered",
-    "num_text_bridge_accepted",
 ]
+
+
+STEP_TYPE_EXECUTION = "execution"
+STEP_TYPE_REFLECTION_TRANSITION = "reflection_transition"
+STEP_TYPE_UNKNOWN = "unknown"
+
+_STEP_TYPE_REFLECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("wait", re.compile(r"^\s*(?:wait|hmm|uh|oh|oops)\b", re.IGNORECASE)),
+    ("correction", re.compile(r"^\s*(?:actually|but|however|although|nevertheless)\b", re.IGNORECASE)),
+    ("transition", re.compile(r"^\s*(?:alternatively|instead|another|otherwise|or)\b", re.IGNORECASE)),
+    ("self_directed", re.compile(r"^\s*(?:let\s+me|let\s+us|let's|lets|try|maybe|perhaps|i\s+think|i\s+should|we\s+should)\b", re.IGNORECASE)),
+    ("new_setup", re.compile(r"^\s*(?:let|suppose|assume|consider)\b", re.IGNORECASE)),
+)
+
+_STEP_TYPE_EXECUTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("math_symbol", re.compile(r"^\s*(?:[=+\-*/^()\[\]{}]|\d|\\(?:frac|sqrt|cdot|times|begin))", re.IGNORECASE)),
+    ("derivation_marker", re.compile(r"^\s*(?:so|therefore|thus|hence|then)\b", re.IGNORECASE)),
+    ("mechanical_verb", re.compile(r"^\s*(?:substituting|plugging|computing|calculating|expanding|simplifying|factoring|multiplying|dividing|adding|subtracting|combining|solving|rearranging|reducing|evaluating)\b", re.IGNORECASE)),
+    ("result_phrase", re.compile(r"^\s*(?:we\s+(?:get|obtain|have|find|see)|this\s+(?:gives|means|implies|becomes|is)|which\s+(?:gives|means|implies)|it\s+(?:follows|is))\b", re.IGNORECASE)),
+)
 
 def _mean(values: list[float | int | None]) -> float | None:
     present = [float(value) for value in values if value is not None]
@@ -117,6 +132,33 @@ def _rollout_evidence_value(rollout: dict[str, Any], channel: str) -> str | None
     return str(value)
 
 
+def _step_type_head(text: Any, *, max_tokens: int = 4) -> str:
+    normalized = re.sub(r"\s+", " ", str(text or "").strip())
+    if not normalized:
+        return ""
+    pieces = re.findall(r"\\[A-Za-z]+|[A-Za-z]+|\d+|[^\w\s]", normalized)
+    return " ".join(pieces[:max_tokens])
+
+
+def _classify_step_type(text: Any) -> dict[str, str]:
+    normalized = re.sub(r"\s+", " ", str(text or "").strip())
+    head = _step_type_head(normalized)
+    if not normalized:
+        return {"step_type": STEP_TYPE_UNKNOWN, "step_type_signal": "empty", "step_type_head": head}
+
+    for signal, pattern in _STEP_TYPE_REFLECTION_PATTERNS:
+        if pattern.search(normalized):
+            return {
+                "step_type": STEP_TYPE_REFLECTION_TRANSITION,
+                "step_type_signal": signal,
+                "step_type_head": head,
+            }
+    for signal, pattern in _STEP_TYPE_EXECUTION_PATTERNS:
+        if pattern.search(normalized):
+            return {"step_type": STEP_TYPE_EXECUTION, "step_type_signal": signal, "step_type_head": head}
+    return {"step_type": STEP_TYPE_UNKNOWN, "step_type_signal": "no_match", "step_type_head": head}
+
+
 def _best_rollout(rollouts: list[dict[str, Any]]) -> dict[str, Any]:
     return max(
         rollouts,
@@ -140,6 +182,20 @@ def _empty_prefix_consensus() -> dict[str, Any]:
         "prefix_consensus_stage": None,
         "stage1_case": "empty",
         "selected_rollout": None,
+    }
+
+
+def _empty_step_type_consensus(reason: str) -> dict[str, Any]:
+    return {
+        "step_type_consensus_type": None,
+        "step_type_consensus_signal": None,
+        "step_type_consensus_support_count": 0,
+        "step_type_consensus_vote_fraction": None,
+        "step_type_consensus_group_counts": {},
+        "step_type_consensus_heads": {},
+        "step_type_consensus_signals": {},
+        "step_type_consensus_reject_reason": reason,
+        "step_type_selected_rollout": None,
     }
 
 
@@ -199,48 +255,17 @@ def _stage1_case(
     }
 
 
-def _zero_bridge_cost() -> dict[str, float | int]:
-    return {
-        "probe_decode_tokens": 0,
-        "probe_prefill_tokens": 0,
-        "probe_generate_calls": 0,
-        "probe_wall_time": 0.0,
-        "text_bridge_decode_tokens": 0,
-        "text_bridge_prefill_tokens": 0,
-        "text_bridge_generate_calls": 0,
-        "text_bridge_wall_time": 0.0,
-        "text_bridge_verify_decode_tokens": 0,
-        "text_bridge_verify_prefill_tokens": 0,
-        "text_bridge_verify_generate_calls": 0,
-        "text_bridge_verify_wall_time": 0.0,
-    }
-
-
 def _add_probe_cost(total: dict[str, float | int], delta: dict[str, float | int]) -> None:
     for key, value in delta.items():
         total[key] = total.get(key, 0) + value
 
 
-def _bridge_defaults() -> dict[str, Any]:
+def _zero_probe_cost() -> dict[str, float | int]:
     return {
-        "text_bridge_triggered": False,
-        "text_bridge_accepted": False,
-        "text_bridge_reason": None,
-        "text_bridge_seed_rollout_idx": None,
-        "text_bridge_seed_mean_logprob": None,
-        "text_bridge_seed_finish_reason": None,
-        "text_bridge_text": None,
-        "text_bridge_token_count": None,
-        "text_bridge_continued": False,
-        "text_bridge_continuation_text": None,
-        "text_bridge_verify_consensus_channel": None,
-        "text_bridge_verify_consensus_value": None,
-        "text_bridge_verify_consensus_support_count": 0,
-        "text_bridge_verify_consensus_vote_fraction": None,
-        "text_bridge_verify_consensus_group_counts": {},
-        "text_bridge_verify_stage1_case": None,
-        "text_bridge_verify_selected_rollout_idx": None,
-        "text_bridge_verify_boundary": None,
+        "probe_decode_tokens": 0,
+        "probe_prefill_tokens": 0,
+        "probe_generate_calls": 0,
+        "probe_wall_time": 0.0,
     }
 
 
@@ -248,61 +273,6 @@ def _step_ends_with_colon(step_text: str, finish: str) -> bool:
     if _is_eos_finish(finish):
         return False
     return step_text.rstrip().endswith(":")
-
-
-def _zero_probe_cost() -> dict[str, float | int]:
-    cost = _zero_bridge_cost()
-    return cost
-
-
-def _complete_text_bridge_step(
-    state: GenerationState,
-    slm,
-    config: BPAConfig,
-    seed_rollout: dict[str, Any],
-    *,
-    bridge_max_tokens: int,
-    probe_stop: str,
-) -> tuple[str, str, int, bool, str, dict[str, float | int]]:
-    tokenizer = slm.ensure_tokenizer()
-    seed_text = str(seed_rollout.get("text") or "")
-    seed_finish = str(seed_rollout.get("finish_reason") or "")
-    seed_token_count = _probe_step_token_count(seed_rollout, slm)
-    cost = _zero_bridge_cost()
-    if seed_finish in {"stop", "eos"}:
-        return seed_text, seed_finish, seed_token_count, False, "", cost
-
-    remaining_bridge_tokens = bridge_max_tokens - seed_token_count
-    if remaining_bridge_tokens <= 0:
-        return seed_text, seed_finish or "length", seed_token_count, False, "", cost
-
-    rendered = render_for_continuation(state.problem_text, state.assistant_prefix_text + seed_text, tokenizer)
-    max_tokens, prompt_tokens = generation_budget_for_rendered(rendered, slm, config, remaining_bridge_tokens)
-    sampling = slm.sampling_params(
-        max_tokens=max_tokens,
-        temperature=0.0,
-        stop=[probe_stop],
-        include_stop_str_in_output=True,
-        logprobs=1,
-        n=1,
-    )
-    generate_start = time.time()
-    out = slm.generate(rendered, sampling)[0]
-    wall_time = time.time() - generate_start
-    completion = (getattr(out, "outputs", []) or [None])[0]
-    continuation_text = getattr(completion, "text", "") if completion is not None else ""
-    token_ids = list(getattr(completion, "token_ids", []) or []) if completion is not None else []
-    finish = str(getattr(completion, "finish_reason", "") or "") if completion is not None else ""
-    token_count = len(token_ids)
-    cost["probe_decode_tokens"] += token_count
-    cost["probe_prefill_tokens"] += prompt_tokens
-    cost["probe_generate_calls"] += 1
-    cost["probe_wall_time"] += wall_time
-    cost["text_bridge_decode_tokens"] += token_count
-    cost["text_bridge_prefill_tokens"] += prompt_tokens
-    cost["text_bridge_generate_calls"] += 1
-    cost["text_bridge_wall_time"] += wall_time
-    return seed_text + (continuation_text or ""), finish or seed_finish, seed_token_count + token_count, True, continuation_text or "", cost
 
 
 def _selected_prefix_consensus_rollout(
@@ -349,128 +319,66 @@ def _selected_prefix_consensus_rollout(
     }
 
 
-def _copy_consensus_fields(target: dict[str, Any], consensus: dict[str, Any]) -> None:
-    for key in (
-        "prefix_anchor_idx",
-        "prefix_anchor_mean_logprob",
-        "prefix_consensus_channel",
-        "prefix_consensus_value",
-        "prefix_consensus_support_count",
-        "prefix_consensus_vote_fraction",
-        "prefix_consensus_support_by_rollout",
-        "prefix_consensus_group_counts",
-        "prefix_consensus_stage",
-    ):
-        target[key] = consensus.get(key)
-
-
-def _verify_text_bridge(
-    state: GenerationState,
-    slm,
-    config: BPAConfig,
+def _selected_step_type_consensus_rollout(
     probe_row: dict[str, Any],
-    prefix_consensus: dict[str, Any],
     *,
+    enabled: bool,
     min_agreement_count: int,
-    probe_temperature: float,
-    probe_max_tokens: int,
-    probe_stop: str,
-    text_bridge_max_tokens: int,
-) -> tuple[dict[str, Any], dict[str, float | int]]:
-    if prefix_consensus.get("selected_rollout") is not None:
-        return prefix_consensus, _zero_bridge_cost()
-
+    consecutive_step_type_exec: int,
+    max_consecutive_step_type_exec: int,
+) -> dict[str, Any]:
     rollouts = list(probe_row.get("rollouts") or [])
-    if prefix_consensus.get("stage1_case") != "all_none" or not rollouts:
-        return prefix_consensus, _zero_bridge_cost()
+    if not rollouts:
+        return _empty_step_type_consensus("empty")
 
-    bridge_info = _bridge_defaults()
-    bridge_info["text_bridge_triggered"] = True
-    seed_rollout = _best_rollout(rollouts)
-    bridge_info["text_bridge_seed_rollout_idx"] = seed_rollout.get("rollout_idx")
-    bridge_info["text_bridge_seed_mean_logprob"] = seed_rollout.get("mean_logprob")
-    bridge_info["text_bridge_seed_finish_reason"] = seed_rollout.get("finish_reason")
+    groups: dict[str, list[dict[str, Any]]] = {}
+    heads: dict[str, str] = {}
+    signals: dict[str, str] = {}
+    for idx, rollout in enumerate(rollouts):
+        if "rollout_idx" not in rollout:
+            rollout["rollout_idx"] = idx
+        rollout_idx = str(_rollout_idx_sort_value(rollout))
+        classified = _classify_step_type(rollout.get("text"))
+        step_type = classified["step_type"]
+        rollout["step_type"] = step_type
+        rollout["step_type_signal"] = classified["step_type_signal"]
+        rollout["step_type_head"] = classified["step_type_head"]
+        heads[rollout_idx] = classified["step_type_head"]
+        signals[rollout_idx] = classified["step_type_signal"]
+        groups.setdefault(step_type, []).append(rollout)
 
-    bridge_text, bridge_finish, bridge_token_count, bridge_continued, bridge_continuation_text, cost = _complete_text_bridge_step(
-        state,
-        slm,
-        config,
-        seed_rollout,
-        bridge_max_tokens=text_bridge_max_tokens,
-        probe_stop=probe_stop,
-    )
-    bridge_text_normalized = ensure_step_terminator(bridge_text, bridge_finish)
-    bridge_info.update(
-        {
-            "text_bridge_text": bridge_text_normalized,
-            "text_bridge_token_count": bridge_token_count,
-            "text_bridge_continued": bridge_continued,
-            "text_bridge_continuation_text": bridge_continuation_text,
-        }
-    )
-    if bridge_finish != "stop":
-        bridge_info["text_bridge_reason"] = "bridge_not_closed" if bridge_finish != "eos" else "bridge_eos_without_evidence"
-        prefix_consensus.update(bridge_info)
-        return prefix_consensus, cost
+    group_counts = {step_type: len(group_rows) for step_type, group_rows in sorted(groups.items())}
+    execution_group = groups.get(STEP_TYPE_EXECUTION, [])
+    support_count = len(execution_group)
+    vote_fraction = support_count / len(rollouts) if rollouts else None
+    result = {
+        "step_type_consensus_type": STEP_TYPE_EXECUTION if execution_group else None,
+        "step_type_consensus_signal": "execution_prefix" if execution_group else None,
+        "step_type_consensus_support_count": support_count,
+        "step_type_consensus_vote_fraction": vote_fraction,
+        "step_type_consensus_group_counts": group_counts,
+        "step_type_consensus_heads": heads,
+        "step_type_consensus_signals": signals,
+        "step_type_consensus_reject_reason": None,
+        "step_type_selected_rollout": None,
+    }
 
-    verifier_state = GenerationState(problem_text=state.problem_text, generation_protocol=state.generation_protocol)
-    verifier_state.assistant_prefix_text = state.assistant_prefix_text + bridge_text_normalized
-    verifier_row, verifier_cost = _sample_probe_rollouts(
-        verifier_state,
-        slm,
-        config,
-        probe_k=len(rollouts),
-        probe_temperature=probe_temperature,
-        probe_max_tokens=probe_max_tokens,
-        probe_stop=probe_stop,
-    )
-    _add_probe_cost(cost, verifier_cost)
-    cost["text_bridge_verify_decode_tokens"] += verifier_cost.get("probe_decode_tokens", 0)
-    cost["text_bridge_verify_prefill_tokens"] += verifier_cost.get("probe_prefill_tokens", 0)
-    cost["text_bridge_verify_generate_calls"] += verifier_cost.get("probe_generate_calls", 0)
-    cost["text_bridge_verify_wall_time"] += verifier_cost.get("probe_wall_time", 0.0)
+    if not enabled:
+        result["step_type_consensus_reject_reason"] = "disabled_or_not_all_none"
+        return result
+    if max_consecutive_step_type_exec < 1:
+        result["step_type_consensus_reject_reason"] = "budget_disabled"
+        return result
+    if consecutive_step_type_exec >= max_consecutive_step_type_exec:
+        result["step_type_consensus_reject_reason"] = "consecutive_budget"
+        return result
+    if support_count < min_agreement_count:
+        result["step_type_consensus_reject_reason"] = "insufficient_execution_agreement"
+        return result
 
-    verifier_consensus = _selected_prefix_consensus_rollout(
-        verifier_row,
-        min_agreement_count=min_agreement_count,
-    )
-    bridge_info["text_bridge_verify_boundary"] = verifier_row
-    bridge_info["text_bridge_verify_consensus_channel"] = verifier_consensus["prefix_consensus_channel"]
-    bridge_info["text_bridge_verify_consensus_value"] = verifier_consensus["prefix_consensus_value"]
-    bridge_info["text_bridge_verify_consensus_support_count"] = verifier_consensus["prefix_consensus_support_count"]
-    bridge_info["text_bridge_verify_consensus_vote_fraction"] = verifier_consensus["prefix_consensus_vote_fraction"]
-    bridge_info["text_bridge_verify_consensus_group_counts"] = verifier_consensus["prefix_consensus_group_counts"]
-    bridge_info["text_bridge_verify_stage1_case"] = verifier_consensus["stage1_case"]
-
-    verifier_rollout = verifier_consensus.get("selected_rollout")
-    if verifier_rollout is None:
-        bridge_info["text_bridge_reason"] = "no_post_bridge_consensus"
-        prefix_consensus.update(bridge_info)
-        return prefix_consensus, cost
-
-    bridge_info["text_bridge_accepted"] = True
-    bridge_info["text_bridge_reason"] = "post_bridge_consensus"
-    bridge_info["text_bridge_verify_selected_rollout_idx"] = verifier_rollout.get("rollout_idx")
-    verifier_text = str(verifier_rollout.get("text") or "")
-    combined_rollout = dict(verifier_rollout)
-    combined_rollout.update(
-        {
-            "rollout_idx": verifier_rollout.get("rollout_idx"),
-            "text": bridge_text_normalized + verifier_text,
-            "finish_reason": verifier_rollout.get("finish_reason"),
-            "token_count": bridge_token_count + _probe_step_token_count(verifier_rollout, slm),
-            "mean_logprob": verifier_rollout.get("mean_logprob"),
-            "text_bridge_prefix_text": bridge_text_normalized,
-            "text_bridge_verifier_text": verifier_text,
-        }
-    )
-    _copy_consensus_fields(prefix_consensus, verifier_consensus)
-    prefix_consensus["prefix_consensus_stage"] = "text_bridge"
-    prefix_consensus["prefix_anchor_idx"] = verifier_rollout.get("rollout_idx")
-    prefix_consensus["prefix_anchor_mean_logprob"] = verifier_rollout.get("mean_logprob")
-    prefix_consensus["selected_rollout"] = combined_rollout
-    prefix_consensus.update(bridge_info)
-    return prefix_consensus, cost
+    selected_rollout = _best_rollout(execution_group)
+    result["step_type_selected_rollout"] = selected_rollout
+    return result
 
 
 def _probe_step_token_count(rollout: dict[str, Any], slm) -> int:
@@ -518,9 +426,9 @@ def _selected_probe_prefix_step(
             prefix_text,
             prefix_finish,
             prefix_token_count,
-            bool(selected_rollout.get("text_bridge_prefix_text")),
+            False,
             prefix_text,
-            str(selected_rollout.get("text_bridge_verifier_text") or ""),
+            "",
         )
 
     current_decode_tokens = state.slm_decode_tokens + state.llm_decode_tokens
@@ -562,14 +470,16 @@ def run_disagreement_routing(
     probe_temperature: float = 0.7,
     probe_max_tokens: int = 32,
     probe_stop: str = "\n\n",
-    text_bridge_max_tokens: int | None = None,
+    enable_step_type_routing: bool = False,
+    step_type_min_agreement_count: int | None = None,
+    max_consecutive_step_type_exec: int = 2,
 ) -> tuple[BPAResult, list[dict[str, Any]], dict[str, float | int]]:
     if min_agreement_count > probe_k:
         raise ValueError("min_agreement_count cannot exceed probe_k")
-    if text_bridge_max_tokens is None:
-        text_bridge_max_tokens = max(probe_max_tokens, min(config.max_step_tokens, 128))
-    if text_bridge_max_tokens < probe_max_tokens:
-        raise ValueError("text_bridge_max_tokens must be >= probe_max_tokens")
+    if step_type_min_agreement_count is None:
+        step_type_min_agreement_count = min_agreement_count
+    if step_type_min_agreement_count > probe_k:
+        raise ValueError("step_type_min_agreement_count cannot exceed probe_k")
 
     protocol = "evidence_consensus_routing"
     state = GenerationState(problem_text=problem_text, generation_protocol=protocol)
@@ -580,6 +490,7 @@ def run_disagreement_routing(
     probe_cost = _zero_probe_cost()
     boundary_idx = 0
     force_next_llm = False
+    consecutive_step_type_exec = 0
 
     while state.phase != Phase.DONE:
         if state.slm_decode_tokens + state.llm_decode_tokens >= config.max_total_tokens:
@@ -687,6 +598,7 @@ def run_disagreement_routing(
             generated_step_tokens = state.slm_decode_tokens + state.llm_decode_tokens - decode_tokens_before
             state.assistant_prefix_text += step_text_normalized
             state.step_count += 1
+            consecutive_step_type_exec = 0
             step_logs.append(
                 {
                     "step_idx": state.step_count - 1,
@@ -746,26 +658,31 @@ def run_disagreement_routing(
             probe_row,
             min_agreement_count=min_agreement_count,
         )
-        try:
-            prefix_consensus, bridge_cost = _verify_text_bridge(
-                state,
-                slm,
-                config,
-                probe_row,
-                prefix_consensus,
-                min_agreement_count=min_agreement_count,
-                probe_temperature=probe_temperature,
-                probe_max_tokens=probe_max_tokens,
-                probe_stop=probe_stop,
-                text_bridge_max_tokens=text_bridge_max_tokens,
-            )
-            _add_probe_cost(probe_cost, bridge_cost)
-        except ContextBudgetExceeded as exc:
-            state.phase = Phase.DONE
-            state.stop_reason = "context_budget"
-            state.trace.append(TraceEvent(state.step_count, "context_budget_exhausted", exc.to_trace_data()))
-            break
         selected_rollout = prefix_consensus["selected_rollout"]
+        step_type_consensus = _selected_step_type_consensus_rollout(
+            probe_row,
+            enabled=enable_step_type_routing and prefix_consensus["stage1_case"] == "all_none",
+            min_agreement_count=step_type_min_agreement_count,
+            consecutive_step_type_exec=consecutive_step_type_exec,
+            max_consecutive_step_type_exec=max_consecutive_step_type_exec,
+        )
+        if selected_rollout is None and step_type_consensus["step_type_selected_rollout"] is not None:
+            selected_rollout = step_type_consensus["step_type_selected_rollout"]
+            prefix_consensus = {
+                **prefix_consensus,
+                "prefix_anchor_idx": selected_rollout.get("rollout_idx"),
+                "prefix_anchor_mean_logprob": selected_rollout.get("mean_logprob"),
+                "prefix_consensus_channel": "step_type",
+                "prefix_consensus_value": STEP_TYPE_EXECUTION,
+                "prefix_consensus_support_count": step_type_consensus["step_type_consensus_support_count"],
+                "prefix_consensus_vote_fraction": step_type_consensus["step_type_consensus_vote_fraction"],
+                "prefix_consensus_support_by_rollout": {
+                    str(_rollout_idx_sort_value(rollout)): rollout.get("step_type") == STEP_TYPE_EXECUTION
+                    for rollout in probe_row.get("rollouts") or []
+                },
+                "prefix_consensus_group_counts": step_type_consensus["step_type_consensus_group_counts"],
+                "prefix_consensus_stage": 1.5,
+            }
         route_to_llm = selected_rollout is None
 
         decode_tokens_before = state.slm_decode_tokens + state.llm_decode_tokens
@@ -808,8 +725,18 @@ def run_disagreement_routing(
         probe_row["prefix_consensus_group_counts"] = prefix_consensus["prefix_consensus_group_counts"]
         probe_row["prefix_consensus_stage"] = prefix_consensus["prefix_consensus_stage"]
         probe_row["stage1_case"] = prefix_consensus["stage1_case"]
-        for key, value in _bridge_defaults().items():
-            probe_row[key] = prefix_consensus.get(key, value)
+        probe_row["step_type_routing_enabled"] = enable_step_type_routing
+        probe_row["step_type_min_agreement_count"] = step_type_min_agreement_count
+        probe_row["max_consecutive_step_type_exec"] = max_consecutive_step_type_exec
+        probe_row["consecutive_step_type_exec_before"] = consecutive_step_type_exec
+        probe_row["step_type_consensus_type"] = step_type_consensus["step_type_consensus_type"]
+        probe_row["step_type_consensus_signal"] = step_type_consensus["step_type_consensus_signal"]
+        probe_row["step_type_consensus_support_count"] = step_type_consensus["step_type_consensus_support_count"]
+        probe_row["step_type_consensus_vote_fraction"] = step_type_consensus["step_type_consensus_vote_fraction"]
+        probe_row["step_type_consensus_group_counts"] = step_type_consensus["step_type_consensus_group_counts"]
+        probe_row["step_type_consensus_heads"] = step_type_consensus["step_type_consensus_heads"]
+        probe_row["step_type_consensus_signals"] = step_type_consensus["step_type_consensus_signals"]
+        probe_row["step_type_consensus_reject_reason"] = step_type_consensus["step_type_consensus_reject_reason"]
         probe_row["routed_to_llm"] = route_to_llm
         probe_row["reused_probe_rollout"] = selected_rollout is not None
         probe_row["selected_rollout_idx"] = selected_rollout.get("rollout_idx") if probe_row["reused_probe_rollout"] else None
@@ -832,12 +759,19 @@ def run_disagreement_routing(
         if route_to_llm:
             decision = "llm_consensus_fallback"
             force_next_llm = _step_ends_with_colon(step_text_normalized, finish)
-        elif probe_row["reused_probe_rollout"]:
-            decision = "slm_text_bridge_reuse" if probe_row.get("text_bridge_accepted") else "slm_probe_reuse"
+            consecutive_step_type_exec = 0
+        elif probe_row["prefix_consensus_stage"] == 1.5:
+            decision = "slm_step_type_reuse"
             force_next_llm = False
+            consecutive_step_type_exec += 1
+        elif probe_row["reused_probe_rollout"]:
+            decision = "slm_probe_reuse"
+            force_next_llm = False
+            consecutive_step_type_exec = 0
         else:
             decision = "slm_direct"
             force_next_llm = False
+            consecutive_step_type_exec = 0
         log_row = {
             "step_idx": state.step_count - 1,
             "decision": decision,
@@ -848,6 +782,7 @@ def run_disagreement_routing(
             "reused_probe_rollout": probe_row["reused_probe_rollout"],
             "continued_probe_rollout": continued_probe_rollout,
             "selected_rollout_idx": probe_row["selected_rollout_idx"],
+            "prefix_consensus_stage": probe_row["prefix_consensus_stage"],
         }
         step_logs.append(log_row)
 
@@ -890,6 +825,9 @@ def build_problem_summary(
     min_agreement_count: int,
     config: BPAConfig,
     problem_wall_time: float | None = None,
+    step_type_routing_enabled: bool = False,
+    step_type_min_agreement_count: int | None = None,
+    max_consecutive_step_type_exec: int = 2,
 ) -> dict[str, Any]:
     correct = None
     if problem.gold_answer is not None:
@@ -913,8 +851,12 @@ def build_problem_summary(
         "num_llm_colon_continuation_steps": sum(1 for row in step_rows if row.get("decision") == "llm_colon_continuation"),
         "num_slm_steps": sum(1 for row in real_boundary_rows if not row.get("routed_to_llm")),
         "num_probe_reused_steps": sum(1 for row in real_boundary_rows if row.get("reused_probe_rollout")),
-        "num_text_bridge_triggered": sum(1 for row in real_boundary_rows if row.get("text_bridge_triggered")),
-        "num_text_bridge_accepted": sum(1 for row in real_boundary_rows if row.get("text_bridge_accepted")),
+        "num_step_type_reused_steps": sum(1 for row in real_boundary_rows if row.get("prefix_consensus_stage") == 1.5),
+        "step_type_routing_enabled": step_type_routing_enabled,
+        "step_type_min_agreement_count": (
+            step_type_min_agreement_count if step_type_min_agreement_count is not None else min_agreement_count
+        ),
+        "max_consecutive_step_type_exec": max_consecutive_step_type_exec,
         "total_wall_time": result.total_wall_time,
         "problem_wall_time": problem_wall_time if problem_wall_time is not None else result.total_wall_time,
         "slm_decode_tokens": result.state.slm_decode_tokens,
@@ -942,8 +884,7 @@ def _summary_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_num_llm_routed_steps": _mean([row.get("num_llm_routed_steps") for row in rows]),
         "avg_num_llm_colon_continuation_steps": _mean([row.get("num_llm_colon_continuation_steps") for row in rows]),
         "avg_num_probe_reused_steps": _mean([row.get("num_probe_reused_steps") for row in rows]),
-        "avg_num_text_bridge_triggered": _mean([row.get("num_text_bridge_triggered") for row in rows]),
-        "avg_num_text_bridge_accepted": _mean([row.get("num_text_bridge_accepted") for row in rows]),
+        "avg_num_step_type_reused_steps": _mean([row.get("num_step_type_reused_steps") for row in rows]),
         "avg_main_decode_tokens": _mean([row.get("main_decode_tokens") for row in rows]),
         "avg_total_decode_tokens_including_probe": _mean(
             [row.get("total_decode_tokens_including_probe") for row in rows]
@@ -952,8 +893,7 @@ def _summary_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "total_llm_prefill_tokens": sum(float(row.get("llm_prefill_tokens") or 0.0) for row in rows),
         "total_slm_decode_tokens": sum(float(row.get("slm_decode_tokens") or 0.0) for row in rows),
         "total_probe_decode_tokens": sum(float(row.get("probe_decode_tokens") or 0.0) for row in rows),
-        "total_text_bridge_decode_tokens": sum(float(row.get("text_bridge_decode_tokens") or 0.0) for row in rows),
-        "total_text_bridge_verify_decode_tokens": sum(float(row.get("text_bridge_verify_decode_tokens") or 0.0) for row in rows),
+        "total_step_type_reused_steps": sum(float(row.get("num_step_type_reused_steps") or 0.0) for row in rows),
         "total_main_decode_tokens": sum(float(row.get("main_decode_tokens") or 0.0) for row in rows),
         "total_decode_tokens_including_probe": sum(
             float(row.get("total_decode_tokens_including_probe") or 0.0) for row in rows
@@ -1108,8 +1048,10 @@ def main() -> None:
     parser.add_argument("--probe-k", type=int, default=4)
     parser.add_argument("--probe-temperature", type=float, default=0.7)
     parser.add_argument("--probe-max-tokens", type=int, default=32)
-    parser.add_argument("--text-bridge-max-tokens", type=int, default=None)
     parser.add_argument("--post-stop-lookahead-tokens", type=int, default=None)
+    parser.add_argument("--enable-step-type-routing", action="store_true", help="Allow all-none execution-style probe consensus to reuse an SLM rollout.")
+    parser.add_argument("--step-type-min-agreement-count", type=int, default=None, help="Agreement count for Tier 1.5 execution consensus; defaults to --min-agreement-count.")
+    parser.add_argument("--max-consecutive-step-type-exec", type=int, default=2, help="Maximum consecutive Tier 1.5 SLM execution-style reuses before forcing an LLM check-in.")
     parser.add_argument("--output-name", default=None, help="Optional diagnostics output folder name under disagreement_routing/.")
     parser.add_argument("--resume", action="store_true", help="Skip problems that already have complete per-problem outputs.")
     args = parser.parse_args()
@@ -1154,7 +1096,9 @@ def main() -> None:
             probe_k=args.probe_k,
             probe_temperature=args.probe_temperature,
             probe_max_tokens=args.probe_max_tokens,
-            text_bridge_max_tokens=args.text_bridge_max_tokens,
+            enable_step_type_routing=args.enable_step_type_routing,
+            step_type_min_agreement_count=args.step_type_min_agreement_count,
+            max_consecutive_step_type_exec=args.max_consecutive_step_type_exec,
         )
         summary = build_problem_summary(
             dataset=args.dataset,
@@ -1165,6 +1109,9 @@ def main() -> None:
             min_agreement_count=args.min_agreement_count,
             config=config,
             problem_wall_time=time.time() - problem_start,
+            step_type_routing_enabled=args.enable_step_type_routing,
+            step_type_min_agreement_count=args.step_type_min_agreement_count,
+            max_consecutive_step_type_exec=args.max_consecutive_step_type_exec,
         )
         write_problem_outputs(
             out_dir,
