@@ -286,6 +286,24 @@ class CoreTests(unittest.TestCase):
         latex = extract_step_evidence(r"Thus \left(\frac{x}{2}\right) = 7.", "")
         self.assertEqual(latex["equation_claim"], r"equation_claim:(\frac{x}{2})=7")
 
+        equation_chain = extract_step_evidence(
+            "Therefore, E[k] = 1 + 25*4/3 + 100 = 1 + 100/3 + 100.\n\n",
+            "",
+        )
+        self.assertEqual(
+            equation_chain["equation_claim"],
+            "equation_claim:E[k]=1+25*4/3+100=1+100/3+100",
+        )
+
+        prose_prefix = extract_step_evidence(
+            "Then, the expected number of regions is 1 + 27 + 403/3 = 28 + 403/3.\n\n",
+            "",
+        )
+        self.assertEqual(
+            prose_prefix["equation_claim"],
+            "equation_claim:1+27+403/3=28+403/3",
+        )
+
         rejected = extract_step_evidence("Set the expression equal to 0.", "")
         self.assertIsNone(rejected["equation_claim"])
 
@@ -678,7 +696,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(boundaries[0]["prefix_consensus_support_count"], 1)
         self.assertEqual(llm.generate_calls, 1)
 
-    def test_stage2_partial_commitment_extends_none_rollouts(self):
+    def test_partial_commitment_routes_to_llm_without_bridge(self):
         slm = WeightedSamplingProbeEngine(
             outputs=[
                 ("First step.\n\n", "stop"),
@@ -688,82 +706,6 @@ class CoreTests(unittest.TestCase):
                 ("Compute the result:", -0.2, "stop"),
                 ("Compute the result:", -0.3, "stop"),
                 ("Still working", -0.4, "stop"),
-                (r" Final \boxed{1}", -0.1, "eos"),
-                (r" Final \boxed{1}", -0.1, "eos"),
-                (" no result", -0.1, "stop"),
-            ],
-        )
-        llm = SequencedEngine(fail_on_generate=True)
-        result, boundaries, probe_cost = run_disagreement_routing(
-            "Problem: x?",
-            slm,
-            llm,
-            BPAConfig(max_total_tokens=300),
-            min_agreement_count=3,
-            probe_k=4,
-            probe_temperature=0.7,
-            probe_max_tokens=32,
-            stage2_min_agreement_count=3,
-            stage2_probe_max_tokens=32,
-        )
-        self.assertEqual(result.answer, "1")
-        self.assertEqual(result.state.stop_reason, "eos")
-        self.assertEqual(len(boundaries), 1)
-        self.assertEqual(boundaries[0]["stage1_case"], "partial")
-        self.assertTrue(boundaries[0]["stage2_triggered"])
-        self.assertEqual(boundaries[0]["prefix_consensus_stage"], 2)
-        self.assertEqual(boundaries[0]["stage2_consensus_support_count"], 3)
-        self.assertTrue(boundaries[0]["stage2_would_accept_m3"])
-        self.assertFalse(boundaries[0]["routed_to_llm"])
-        self.assertGreater(probe_cost["stage2_probe_generate_calls"], 0)
-
-    def test_stage2_all_none_extends_all_rollouts(self):
-        slm = WeightedSamplingProbeEngine(
-            outputs=[
-                ("First step.\n\n", "stop"),
-            ],
-            probe_outputs=[
-                ("Compute the result:", -0.2, "stop"),
-                ("Compute the result:", -0.3, "stop"),
-                ("Compute the result:", -0.4, "stop"),
-                ("Compute the result:", -0.5, "stop"),
-                (r" x = 1", -0.1, "eos"),
-                (r" x = 1", -0.1, "eos"),
-                (r" x = 1", -0.1, "eos"),
-                (r" x = 1", -0.1, "eos"),
-            ],
-        )
-        llm = SequencedEngine(fail_on_generate=True)
-        result, boundaries, _ = run_disagreement_routing(
-            "Problem: x?",
-            slm,
-            llm,
-            BPAConfig(max_total_tokens=300),
-            min_agreement_count=3,
-            probe_k=4,
-            probe_temperature=0.7,
-            probe_max_tokens=32,
-            stage2_min_agreement_count=4,
-            stage2_probe_max_tokens=32,
-        )
-        self.assertEqual(result.state.stop_reason, "eos")
-        self.assertEqual(len(boundaries), 1)
-        self.assertEqual(boundaries[0]["stage1_case"], "all_none")
-        self.assertTrue(boundaries[0]["stage2_triggered"])
-        self.assertEqual(boundaries[0]["prefix_consensus_stage"], 2)
-        self.assertEqual(boundaries[0]["stage2_consensus_support_count"], 4)
-        self.assertTrue(boundaries[0]["stage2_would_accept_m4"])
-
-    def test_stage2_skips_conflicting_stage1_signatures(self):
-        slm = WeightedSamplingProbeEngine(
-            outputs=[
-                ("First step.\n\n", "stop"),
-            ],
-            probe_outputs=[
-                (r"Final \boxed{1}", -0.1, "stop"),
-                (r"Final \boxed{2}", -0.2, "stop"),
-                ("Compute something", -0.3, "stop"),
-                ("Compute something else", -0.4, "stop"),
             ],
         )
         llm = SequencedEngine([(r"\boxed{9}", "eos")])
@@ -776,14 +718,113 @@ class CoreTests(unittest.TestCase):
             probe_k=4,
             probe_temperature=0.7,
             probe_max_tokens=32,
-            stage2_min_agreement_count=3,
-            stage2_probe_max_tokens=32,
         )
         self.assertEqual(result.answer, "9")
-        self.assertEqual(boundaries[0]["stage1_case"], "conflict")
-        self.assertEqual(boundaries[0]["stage2_case"], "conflict")
-        self.assertFalse(boundaries[0]["stage2_triggered"])
-        self.assertEqual(probe_cost["stage2_probe_generate_calls"], 0)
+        self.assertEqual(result.state.stop_reason, "eos")
+        self.assertEqual(len(boundaries), 1)
+        self.assertEqual(boundaries[0]["stage1_case"], "partial")
+        self.assertFalse(boundaries[0]["text_bridge_triggered"])
+        self.assertTrue(boundaries[0]["routed_to_llm"])
+        self.assertEqual(probe_cost["text_bridge_generate_calls"], 0)
+
+    def test_text_bridge_accepts_after_post_bridge_consensus(self):
+        slm = WeightedSamplingProbeEngine(
+            outputs=[
+                ("First step.\n\n", "stop"),
+            ],
+            probe_outputs=[
+                ("We organize the work.\n\n", -0.1, "stop"),
+                ("Let us proceed carefully.\n\n", -0.2, "stop"),
+                ("We check the cases.\n\n", -0.3, "stop"),
+                ("Now continue.\n\n", -0.4, "stop"),
+                (r"Final \boxed{1}", -0.1, "eos"),
+                (r"Final \boxed{1}", -0.2, "eos"),
+                (r"Final \boxed{1}", -0.3, "eos"),
+                ("No answer", -0.4, "eos"),
+            ],
+        )
+        llm = SequencedEngine(fail_on_generate=True)
+        result, boundaries, _ = run_disagreement_routing(
+            "Problem: x?",
+            slm,
+            llm,
+            BPAConfig(max_total_tokens=300),
+            min_agreement_count=3,
+            probe_k=4,
+            probe_temperature=0.7,
+            probe_max_tokens=32,
+        )
+        self.assertEqual(result.answer, "1")
+        self.assertEqual(result.state.stop_reason, "eos")
+        self.assertEqual(len(boundaries), 1)
+        self.assertEqual(boundaries[0]["stage1_case"], "all_none")
+        self.assertTrue(boundaries[0]["text_bridge_triggered"])
+        self.assertTrue(boundaries[0]["text_bridge_accepted"])
+        self.assertEqual(boundaries[0]["prefix_consensus_stage"], "text_bridge")
+        self.assertEqual(boundaries[0]["text_bridge_verify_consensus_support_count"], 3)
+        self.assertIn("We organize the work.", result.state.assistant_prefix_text)
+        self.assertIn(r"Final \boxed{1}", result.state.assistant_prefix_text)
+
+    def test_text_bridge_rejects_unclosed_bridge_and_routes_to_llm(self):
+        slm = WeightedSamplingProbeEngine(
+            outputs=[
+                ("First step.\n\n", "stop"),
+            ],
+            probe_outputs=[
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", -0.1, "length"),
+                ("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", -0.2, "length"),
+                ("cccccccccccccccccccccccccccccccc", -0.3, "length"),
+                ("dddddddddddddddddddddddddddddddd", -0.4, "length"),
+            ],
+        )
+        llm = SequencedEngine([(r"\boxed{9}", "eos")])
+        result, boundaries, probe_cost = run_disagreement_routing(
+            "Problem: x?",
+            slm,
+            llm,
+            BPAConfig(max_total_tokens=300),
+            min_agreement_count=3,
+            probe_k=4,
+            probe_temperature=0.7,
+            probe_max_tokens=32,
+            text_bridge_max_tokens=32,
+        )
+        self.assertEqual(result.answer, "9")
+        self.assertEqual(boundaries[0]["stage1_case"], "all_none")
+        self.assertTrue(boundaries[0]["text_bridge_triggered"])
+        self.assertFalse(boundaries[0]["text_bridge_accepted"])
+        self.assertEqual(boundaries[0]["text_bridge_reason"], "bridge_not_closed")
+        self.assertTrue(boundaries[0]["routed_to_llm"])
+        self.assertEqual(probe_cost["text_bridge_generate_calls"], 0)
+
+    def test_llm_colon_continuation_skips_next_probe(self):
+        slm = WeightedSamplingProbeEngine(
+            outputs=[
+                ("First step.\n\n", "stop"),
+            ],
+            probe_outputs=[
+                (r"Final \boxed{1}", -0.1, "stop"),
+                (r"Final \boxed{2}", -0.2, "stop"),
+                ("Compute something", -0.3, "stop"),
+                ("Compute something else", -0.4, "stop"),
+            ],
+        )
+        llm = SequencedEngine([("We split into cases:\n\n", "stop"), (r"\boxed{9}", "eos")])
+        result, boundaries, _ = run_disagreement_routing(
+            "Problem: x?",
+            slm,
+            llm,
+            BPAConfig(max_total_tokens=300),
+            min_agreement_count=3,
+            probe_k=4,
+            probe_temperature=0.7,
+            probe_max_tokens=32,
+        )
+        self.assertEqual(result.answer, "9")
+        self.assertEqual(len(boundaries), 1)
+        self.assertEqual(llm.generate_calls, 2)
+        steps = [event.data["steps"] for event in result.state.trace if event.event == "step_logs"][0]
+        self.assertEqual(steps[-1]["decision"], "llm_colon_continuation")
 
     def test_operation_intent_is_diagnostic_not_routing_evidence(self):
         slm = WeightedSamplingProbeEngine(

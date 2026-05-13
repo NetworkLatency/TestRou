@@ -40,6 +40,7 @@ _LATEX_NUMBER_PATTERNS = (
 _PLAIN_NUMBER_PATTERN = re.compile(r"(?<![A-Za-z])[-+]?(?:\d+\s*/\s*\d+|\d+(?:\.\d+)?%?)(?![A-Za-z])")
 _MATH_BOUNDARY_CHARS = set(" \t\r\n.,;:")
 _MATH_SYMBOL_CHARS = set("+-*/^_()[]{}\\|<>")
+_MATH_SPACE_CONNECTORS = set("+-*/^_=|<>")
 
 
 def _normalize_signature_value(value: str) -> str:
@@ -60,13 +61,44 @@ def _balanced_braces(text: str) -> bool:
     return not stack
 
 
+def _nonspace_left(text: str, idx: int) -> str | None:
+    idx -= 1
+    while idx >= 0 and text[idx].isspace():
+        idx -= 1
+    return text[idx] if idx >= 0 else None
+
+
+def _nonspace_right(text: str, idx: int) -> str | None:
+    idx += 1
+    while idx < len(text) and text[idx].isspace():
+        idx += 1
+    return text[idx] if idx < len(text) else None
+
+
+def _space_inside_math(text: str, idx: int) -> bool:
+    left = _nonspace_left(text, idx)
+    right = _nonspace_right(text, idx)
+    if left is None or right is None:
+        return False
+    return left in _MATH_SPACE_CONNECTORS or right in _MATH_SPACE_CONNECTORS
+
+
+def _is_math_expression_char(ch: str) -> bool:
+    return ch.isalnum() or ch in _MATH_SYMBOL_CHARS or ch == "="
+
+
 def _math_left_boundary(text: str, eq_idx: int) -> int:
     idx = eq_idx - 1
     while idx >= 0 and text[idx].isspace():
         idx -= 1
     while idx >= 0:
         ch = text[idx]
-        if ch.isalnum() or ch in _MATH_SYMBOL_CHARS:
+        if ch.isspace():
+            if _space_inside_math(text, idx):
+                idx -= 1
+                continue
+            break
+        if _is_math_expression_char(ch):
             idx -= 1
             continue
         if ch in _MATH_BOUNDARY_CHARS or ch == "$":
@@ -81,7 +113,12 @@ def _math_right_boundary(text: str, eq_idx: int) -> int:
         idx += 1
     while idx < len(text):
         ch = text[idx]
-        if ch.isalnum() or ch in _MATH_SYMBOL_CHARS:
+        if ch.isspace():
+            if _space_inside_math(text, idx):
+                idx += 1
+                continue
+            break
+        if _is_math_expression_char(ch):
             idx += 1
             continue
         if ch in _MATH_BOUNDARY_CHARS or ch == "$":
@@ -111,13 +148,17 @@ def _extract_equation(text: str) -> str | None:
         if not line:
             continue
         for match in re.finditer("=", line):
+            if match.start() > 0 and line[match.start() - 1] in "<>!=":
+                continue
+            if match.end() < len(line) and line[match.end()] == "=":
+                continue
             left = _math_left_boundary(line, match.start())
             right = _math_right_boundary(line, match.start())
             candidate = _normalize_signature_value(line[left:right])
-            if not candidate or candidate.count("=") != 1 or len(candidate) > 120:
+            if not candidate or candidate.count("=") < 1 or len(candidate) > 240:
                 continue
-            lhs, rhs = candidate.split("=", 1)
-            if not (_looks_like_math_side(lhs) and _looks_like_math_side(rhs)):
+            parts = candidate.split("=")
+            if not all(_looks_like_math_side(part) for part in parts):
                 continue
             if not _balanced_braces(candidate):
                 continue
