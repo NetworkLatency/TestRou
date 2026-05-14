@@ -84,6 +84,12 @@ _STEP_TYPE_REFLECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("new_setup", re.compile(r"^\s*(?:let|suppose|assume|consider)\b", re.IGNORECASE)),
 )
 
+_STEP_TYPE_CONTAMINATION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("hidden_reflection", re.compile(r"\b(?:wait|hmm|actually|but|however|mistake|wrong|conflict(?:ing)?|not\s+sure|wonder|check|verify|recheck)\b", re.IGNORECASE)),
+    ("hidden_self_directed", re.compile(r"\b(?:let\s+me|let\s+us|let['’]?s|lets|try|maybe|perhaps|might|i\s+(?:think|need|should|will)|we\s+(?:need|should))\b", re.IGNORECASE)),
+    ("hidden_transition", re.compile(r"\b(?:alternative|alternatively|instead|another|different|suppose|assume|consider|case|cases|subcase|give\s+up|tedious)\b", re.IGNORECASE)),
+)
+
 _STEP_TYPE_EXECUTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("math_symbol", re.compile(r"^\s*(?:[=+\-*/^()\[\]{}]|\d|\\(?:frac|sqrt|cdot|times|begin))", re.IGNORECASE)),
     ("derivation_marker", re.compile(r"^\s*(?:so|therefore|thus|hence|then)\b", re.IGNORECASE)),
@@ -136,18 +142,34 @@ def _step_type_head(text: Any, *, max_tokens: int = 4) -> str:
     normalized = re.sub(r"\s+", " ", str(text or "").strip())
     if not normalized:
         return ""
-    pieces = re.findall(r"\\[A-Za-z]+|[A-Za-z]+|\d+|[^\w\s]", normalized)
+    pieces = re.findall(r"\\[A-Za-z]+|[A-Za-z]+(?:['’][A-Za-z]+)?|\d+|[^\w\s]", normalized)
     return " ".join(pieces[:max_tokens])
+
+
+def _step_type_scan_window(text: str, *, max_tokens: int = 16) -> str:
+    pieces = re.findall(r"\\[A-Za-z]+|[A-Za-z]+(?:['’][A-Za-z]+)?|\d+|[^\w\s]", text)
+    head = " ".join(pieces[:max_tokens])
+    head = head.replace("’", "'")
+    head = re.sub(r"\s*'\s*", "'", head)
+    return re.sub(r"\s+", " ", head).strip()
 
 
 def _classify_step_type(text: Any) -> dict[str, str]:
     normalized = re.sub(r"\s+", " ", str(text or "").strip())
     head = _step_type_head(normalized)
+    scan_head = _step_type_scan_window(normalized)
     if not normalized:
         return {"step_type": STEP_TYPE_UNKNOWN, "step_type_signal": "empty", "step_type_head": head}
 
     for signal, pattern in _STEP_TYPE_REFLECTION_PATTERNS:
         if pattern.search(normalized):
+            return {
+                "step_type": STEP_TYPE_REFLECTION_TRANSITION,
+                "step_type_signal": signal,
+                "step_type_head": head,
+            }
+    for signal, pattern in _STEP_TYPE_CONTAMINATION_PATTERNS:
+        if pattern.search(scan_head):
             return {
                 "step_type": STEP_TYPE_REFLECTION_TRANSITION,
                 "step_type_signal": signal,

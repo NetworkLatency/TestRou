@@ -821,6 +821,37 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(boundaries[0]["step_type_consensus_support_count"], 0)
         self.assertEqual(boundaries[0]["step_type_consensus_reject_reason"], "insufficient_execution_agreement")
 
+    def test_step_type_routing_rejects_contaminated_execution_markers(self):
+        slm = WeightedSamplingProbeEngine(
+            outputs=[
+                ("First step.\n\n", "stop"),
+            ],
+            probe_outputs=[
+                ("So, let me try that.\n\n", -0.1, "stop"),
+                ("Therefore, I think this should work.\n\n", -0.2, "stop"),
+                ("Thus, maybe this is enough.\n\n", -0.3, "stop"),
+                ("So, let's consider cases.\n\n", -0.4, "stop"),
+            ],
+        )
+        llm = SequencedEngine([(r"\boxed{9}", "eos")])
+        result, boundaries, _ = run_disagreement_routing(
+            "Problem: x?",
+            slm,
+            llm,
+            BPAConfig(max_total_tokens=300),
+            min_agreement_count=3,
+            probe_k=4,
+            probe_temperature=0.7,
+            probe_max_tokens=32,
+            enable_step_type_routing=True,
+        )
+        self.assertEqual(result.answer, "9")
+        self.assertEqual(len(boundaries), 1)
+        self.assertEqual(boundaries[0]["stage1_case"], "all_none")
+        self.assertTrue(boundaries[0]["routed_to_llm"])
+        self.assertEqual(boundaries[0]["step_type_consensus_support_count"], 0)
+        self.assertEqual(boundaries[0]["step_type_consensus_group_counts"], {"reflection_transition": 4})
+
     def test_llm_colon_continuation_skips_next_probe(self):
         slm = WeightedSamplingProbeEngine(
             outputs=[
