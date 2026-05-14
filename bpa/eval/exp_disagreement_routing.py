@@ -52,9 +52,11 @@ SUMMARY_FIELDS = [
     "num_slm_steps",
     "num_probe_reused_steps",
     "num_step_type_reused_steps",
+    "num_pure_text_reused_steps",
     "step_type_routing_enabled",
     "step_type_min_agreement_count",
     "max_consecutive_step_type_exec",
+    "pure_text_slm_fallback_enabled",
     "total_wall_time",
     "problem_wall_time",
     "slm_decode_tokens",
@@ -495,6 +497,7 @@ def run_disagreement_routing(
     enable_step_type_routing: bool = False,
     step_type_min_agreement_count: int | None = None,
     max_consecutive_step_type_exec: int = 2,
+    enable_pure_text_slm_fallback: bool = False,
 ) -> tuple[BPAResult, list[dict[str, Any]], dict[str, float | int]]:
     if min_agreement_count > probe_k:
         raise ValueError("min_agreement_count cannot exceed probe_k")
@@ -705,6 +708,28 @@ def run_disagreement_routing(
                 "prefix_consensus_group_counts": step_type_consensus["step_type_consensus_group_counts"],
                 "prefix_consensus_stage": 1.5,
             }
+        if (
+            selected_rollout is None
+            and enable_pure_text_slm_fallback
+            and prefix_consensus["stage1_case"] == "all_none"
+        ):
+            pure_text_rollouts = list(probe_row.get("rollouts") or [])
+            if pure_text_rollouts:
+                selected_rollout = _best_rollout(pure_text_rollouts)
+                prefix_consensus = {
+                    **prefix_consensus,
+                    "prefix_anchor_idx": selected_rollout.get("rollout_idx"),
+                    "prefix_anchor_mean_logprob": selected_rollout.get("mean_logprob"),
+                    "prefix_consensus_channel": "pure_text",
+                    "prefix_consensus_value": "all_none_best_logprob",
+                    "prefix_consensus_support_count": len(pure_text_rollouts),
+                    "prefix_consensus_vote_fraction": 1.0,
+                    "prefix_consensus_support_by_rollout": {
+                        str(_rollout_idx_sort_value(rollout)): True for rollout in pure_text_rollouts
+                    },
+                    "prefix_consensus_group_counts": {"all_none": len(pure_text_rollouts)},
+                    "prefix_consensus_stage": 1.6,
+                }
         route_to_llm = selected_rollout is None
 
         decode_tokens_before = state.slm_decode_tokens + state.llm_decode_tokens
@@ -759,6 +784,8 @@ def run_disagreement_routing(
         probe_row["step_type_consensus_heads"] = step_type_consensus["step_type_consensus_heads"]
         probe_row["step_type_consensus_signals"] = step_type_consensus["step_type_consensus_signals"]
         probe_row["step_type_consensus_reject_reason"] = step_type_consensus["step_type_consensus_reject_reason"]
+        probe_row["pure_text_slm_fallback_enabled"] = enable_pure_text_slm_fallback
+        probe_row["pure_text_slm_fallback_used"] = prefix_consensus["prefix_consensus_stage"] == 1.6
         probe_row["routed_to_llm"] = route_to_llm
         probe_row["reused_probe_rollout"] = selected_rollout is not None
         probe_row["selected_rollout_idx"] = selected_rollout.get("rollout_idx") if probe_row["reused_probe_rollout"] else None
@@ -786,6 +813,10 @@ def run_disagreement_routing(
             decision = "slm_step_type_reuse"
             force_next_llm = False
             consecutive_step_type_exec += 1
+        elif probe_row["prefix_consensus_stage"] == 1.6:
+            decision = "slm_pure_text_reuse"
+            force_next_llm = False
+            consecutive_step_type_exec = 0
         elif probe_row["reused_probe_rollout"]:
             decision = "slm_probe_reuse"
             force_next_llm = False
@@ -850,6 +881,7 @@ def build_problem_summary(
     step_type_routing_enabled: bool = False,
     step_type_min_agreement_count: int | None = None,
     max_consecutive_step_type_exec: int = 2,
+    pure_text_slm_fallback_enabled: bool = False,
 ) -> dict[str, Any]:
     correct = None
     if problem.gold_answer is not None:
@@ -874,11 +906,13 @@ def build_problem_summary(
         "num_slm_steps": sum(1 for row in real_boundary_rows if not row.get("routed_to_llm")),
         "num_probe_reused_steps": sum(1 for row in real_boundary_rows if row.get("reused_probe_rollout")),
         "num_step_type_reused_steps": sum(1 for row in real_boundary_rows if row.get("prefix_consensus_stage") == 1.5),
+        "num_pure_text_reused_steps": sum(1 for row in real_boundary_rows if row.get("prefix_consensus_stage") == 1.6),
         "step_type_routing_enabled": step_type_routing_enabled,
         "step_type_min_agreement_count": (
             step_type_min_agreement_count if step_type_min_agreement_count is not None else min_agreement_count
         ),
         "max_consecutive_step_type_exec": max_consecutive_step_type_exec,
+        "pure_text_slm_fallback_enabled": pure_text_slm_fallback_enabled,
         "total_wall_time": result.total_wall_time,
         "problem_wall_time": problem_wall_time if problem_wall_time is not None else result.total_wall_time,
         "slm_decode_tokens": result.state.slm_decode_tokens,
@@ -907,6 +941,7 @@ def _summary_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_num_llm_colon_continuation_steps": _mean([row.get("num_llm_colon_continuation_steps") for row in rows]),
         "avg_num_probe_reused_steps": _mean([row.get("num_probe_reused_steps") for row in rows]),
         "avg_num_step_type_reused_steps": _mean([row.get("num_step_type_reused_steps") for row in rows]),
+        "avg_num_pure_text_reused_steps": _mean([row.get("num_pure_text_reused_steps") for row in rows]),
         "avg_main_decode_tokens": _mean([row.get("main_decode_tokens") for row in rows]),
         "avg_total_decode_tokens_including_probe": _mean(
             [row.get("total_decode_tokens_including_probe") for row in rows]
@@ -916,6 +951,7 @@ def _summary_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "total_slm_decode_tokens": sum(float(row.get("slm_decode_tokens") or 0.0) for row in rows),
         "total_probe_decode_tokens": sum(float(row.get("probe_decode_tokens") or 0.0) for row in rows),
         "total_step_type_reused_steps": sum(float(row.get("num_step_type_reused_steps") or 0.0) for row in rows),
+        "total_pure_text_reused_steps": sum(float(row.get("num_pure_text_reused_steps") or 0.0) for row in rows),
         "total_main_decode_tokens": sum(float(row.get("main_decode_tokens") or 0.0) for row in rows),
         "total_decode_tokens_including_probe": sum(
             float(row.get("total_decode_tokens_including_probe") or 0.0) for row in rows
@@ -1074,6 +1110,7 @@ def main() -> None:
     parser.add_argument("--enable-step-type-routing", action="store_true", help="Allow all-none execution-style probe consensus to reuse an SLM rollout.")
     parser.add_argument("--step-type-min-agreement-count", type=int, default=None, help="Agreement count for Tier 1.5 execution consensus; defaults to --min-agreement-count.")
     parser.add_argument("--max-consecutive-step-type-exec", type=int, default=2, help="Maximum consecutive Tier 1.5 SLM execution-style reuses before forcing an LLM check-in.")
+    parser.add_argument("--enable-pure-text-slm-fallback", action="store_true", help="For all-none pure-text probes not accepted by Tier 1.5, reuse the best SLM probe rollout instead of routing to the LLM.")
     parser.add_argument("--output-name", default=None, help="Optional diagnostics output folder name under disagreement_routing/.")
     parser.add_argument("--resume", action="store_true", help="Skip problems that already have complete per-problem outputs.")
     args = parser.parse_args()
@@ -1121,6 +1158,7 @@ def main() -> None:
             enable_step_type_routing=args.enable_step_type_routing,
             step_type_min_agreement_count=args.step_type_min_agreement_count,
             max_consecutive_step_type_exec=args.max_consecutive_step_type_exec,
+            enable_pure_text_slm_fallback=args.enable_pure_text_slm_fallback,
         )
         summary = build_problem_summary(
             dataset=args.dataset,
@@ -1134,6 +1172,7 @@ def main() -> None:
             step_type_routing_enabled=args.enable_step_type_routing,
             step_type_min_agreement_count=args.step_type_min_agreement_count,
             max_consecutive_step_type_exec=args.max_consecutive_step_type_exec,
+            pure_text_slm_fallback_enabled=args.enable_pure_text_slm_fallback,
         )
         write_problem_outputs(
             out_dir,

@@ -852,6 +852,42 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(boundaries[0]["step_type_consensus_support_count"], 0)
         self.assertEqual(boundaries[0]["step_type_consensus_group_counts"], {"reflection_transition": 4})
 
+    def test_pure_text_slm_fallback_reuses_best_all_none_probe(self):
+        slm = WeightedSamplingProbeEngine(
+            outputs=[
+                ("First step.\n\n", "stop"),
+            ],
+            probe_outputs=[
+                ("Wait, this may not work.\n\n", -0.3, "eos"),
+                ("Let me try another approach.\n\n", -0.1, "eos"),
+                ("Maybe we should split cases.\n\n", -0.2, "eos"),
+                ("Alternatively, use a different setup.\n\n", -0.4, "eos"),
+            ],
+        )
+        llm = SequencedEngine(fail_on_generate=True)
+        result, boundaries, _ = run_disagreement_routing(
+            "Problem: x?",
+            slm,
+            llm,
+            BPAConfig(max_total_tokens=300),
+            min_agreement_count=3,
+            probe_k=4,
+            probe_temperature=0.7,
+            probe_max_tokens=32,
+            enable_step_type_routing=True,
+            enable_pure_text_slm_fallback=True,
+        )
+        self.assertEqual(result.state.stop_reason, "eos")
+        self.assertEqual(len(boundaries), 1)
+        self.assertEqual(boundaries[0]["stage1_case"], "all_none")
+        self.assertFalse(boundaries[0]["routed_to_llm"])
+        self.assertTrue(boundaries[0]["pure_text_slm_fallback_used"])
+        self.assertEqual(boundaries[0]["prefix_consensus_stage"], 1.6)
+        self.assertEqual(boundaries[0]["prefix_consensus_channel"], "pure_text")
+        self.assertEqual(boundaries[0]["selected_rollout_idx"], 1)
+        steps = [event.data["steps"] for event in result.state.trace if event.event == "step_logs"][0]
+        self.assertEqual(steps[-1]["decision"], "slm_pure_text_reuse")
+
     def test_llm_colon_continuation_skips_next_probe(self):
         slm = WeightedSamplingProbeEngine(
             outputs=[
