@@ -84,6 +84,16 @@ def update_strict_step_repetition(rep: RepetitionState, new_step_text: str, min_
     return None
 
 
+def normalize_step_skeleton(step_text: str, *, max_chars: int = 180) -> str:
+    text = str(step_text or "").lower()
+    text = re.sub(r"</?think>", " ", text)
+    text = re.sub(r"\\[a-zA-Z]+", " ", text)
+    text = re.sub(r"[-+]?\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?", "#", text)
+    text = re.sub(r"[^a-z0-9#]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max_chars].strip()
+
+
 def extract_last_boxed(text: Optional[str]) -> Optional[str]:
     if not isinstance(text, str) or not text:
         return None

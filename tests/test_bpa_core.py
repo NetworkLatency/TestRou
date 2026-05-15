@@ -159,6 +159,7 @@ class SamplingProbeEngine(SequencedEngine):
     def generate(self, prompts, sampling_params):
         if sampling_params.get("n"):
             self.generate_calls += 1
+            self.sampling_history.append(dict(sampling_params))
             k = int(sampling_params["n"])
             if len(self.probe_outputs) < k:
                 raise AssertionError("no queued probe outputs")
@@ -186,6 +187,7 @@ class WeightedSamplingProbeEngine(SequencedEngine):
     def generate(self, prompts, sampling_params):
         if sampling_params.get("n"):
             self.generate_calls += 1
+            self.sampling_history.append(dict(sampling_params))
             k = int(sampling_params["n"])
             if len(self.probe_outputs) < k:
                 raise AssertionError("no queued probe outputs")
@@ -194,12 +196,26 @@ class WeightedSamplingProbeEngine(SequencedEngine):
                 item = self.probe_outputs.pop(0)
                 text, mean_logprob, finish = item
                 token_ids = [ord(ch) for ch in text]
+                logprobs = []
+                if isinstance(mean_logprob, (list, tuple)):
+                    for idx, token_id in enumerate(token_ids):
+                        spec = mean_logprob[min(idx, len(mean_logprob) - 1)]
+                        if isinstance(spec, dict):
+                            sample_lp = float(spec.get("sample", -0.1))
+                            step = {token_id: Obj(logprob=sample_lp)}
+                            for alt_idx, alt_lp in enumerate(spec.get("alts", []) or []):
+                                step[-100000 - idx * 10 - alt_idx] = Obj(logprob=float(alt_lp))
+                            logprobs.append(step)
+                        else:
+                            logprobs.append({token_id: Obj(logprob=float(spec))})
+                else:
+                    logprobs = [{token_id: Obj(logprob=mean_logprob)} for token_id in token_ids]
                 completions.append(
                     Obj(
                         text=text,
                         token_ids=token_ids,
                         finish_reason=finish,
-                        logprobs=[{token_id: Obj(logprob=mean_logprob)} for token_id in token_ids],
+                        logprobs=logprobs,
                     )
                 )
             return [Obj(outputs=completions)]
@@ -852,6 +868,101 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(boundaries[0]["step_type_consensus_support_count"], 0)
         self.assertEqual(boundaries[0]["step_type_consensus_group_counts"], {"reflection_transition": 4})
 
+    def test_probe_rollouts_record_surprisal_and_entropy_metrics(self):
+        slm = WeightedSamplingProbeEngine(
+            outputs=[
+                ("First step.\n\n", "stop"),
+            ],
+            probe_outputs=[
+                ("plain transition\n\n", [{"sample": -0.1, "alts": [-1.0]}, {"sample": -0.8, "alts": [-1.2]}], "stop"),
+                ("plain transition\n\n", [{"sample": -0.2, "alts": [-1.1]}, {"sample": -0.7, "alts": [-1.3]}], "stop"),
+                ("plain transition\n\n", [{"sample": -0.3, "alts": [-1.2]}, {"sample": -0.6, "alts": [-1.4]}], "stop"),
+                ("plain transition\n\n", [{"sample": -0.4, "alts": [-1.3]}, {"sample": -0.5, "alts": [-1.5]}], "stop"),
+            ],
+        )
+        llm = SequencedEngine([(r"\boxed{9}", "eos")])
+        _, boundaries, _ = run_disagreement_routing(
+            "Problem: x?",
+            slm,
+            llm,
+            BPAConfig(max_total_tokens=300),
+            min_agreement_count=3,
+            probe_k=4,
+            probe_temperature=0.7,
+            probe_max_tokens=32,
+            probe_logprobs_topk=2,
+        )
+        self.assertTrue(any(row.get("n") == 4 and row.get("logprobs") == 2 for row in slm.sampling_history))
+        rollout = boundaries[0]["rollouts"][0]
+        self.assertIn("token_logprobs", rollout)
+        self.assertIn("token_surprisals", rollout)
+        self.assertGreater(rollout["surprisal_var"], 0.0)
+        self.assertGreater(len(rollout["topk_entropies"]), 0)
+
+    def test_dynamics_routing_reuses_structured_all_none(self):
+        structured = [-0.1, -0.75, -0.12, -0.7, -0.15, -0.65]
+        slm = WeightedSamplingProbeEngine(
+            outputs=[
+                ("First step.\n\n", "stop"),
+            ],
+            probe_outputs=[
+                ("Continue with the transformed setup.\n\n", structured, "eos"),
+                ("Continue with the transformed setup.\n\n", structured, "eos"),
+                ("Continue with the transformed setup.\n\n", structured, "eos"),
+                ("Wait, maybe a different plan.\n\n", structured, "eos"),
+            ],
+        )
+        llm = SequencedEngine(fail_on_generate=True)
+        result, boundaries, _ = run_disagreement_routing(
+            "Problem: x?",
+            slm,
+            llm,
+            BPAConfig(max_total_tokens=300),
+            min_agreement_count=3,
+            probe_k=4,
+            probe_temperature=0.7,
+            probe_max_tokens=32,
+            enable_dynamics_routing=True,
+        )
+        self.assertEqual(result.state.stop_reason, "eos")
+        self.assertEqual(len(boundaries), 1)
+        self.assertFalse(boundaries[0]["routed_to_llm"])
+        self.assertEqual(boundaries[0]["prefix_consensus_stage"], 1.55)
+        self.assertEqual(boundaries[0]["prefix_consensus_channel"], "dynamics")
+        self.assertEqual(boundaries[0]["dynamics_consensus_support_count"], 3)
+        steps = [event.data["steps"] for event in result.state.trace if event.event == "step_logs"][0]
+        self.assertEqual(steps[-1]["decision"], "slm_dynamics_reuse")
+
+    def test_dynamics_routing_rejects_flat_low_all_none(self):
+        flat = [-0.05, -0.05, -0.05, -0.05]
+        slm = WeightedSamplingProbeEngine(
+            outputs=[
+                ("First step.\n\n", "stop"),
+            ],
+            probe_outputs=[
+                ("We organize the work.\n\n", flat, "stop"),
+                ("We organize the work.\n\n", flat, "stop"),
+                ("We organize the work.\n\n", flat, "stop"),
+                ("We organize the work.\n\n", flat, "stop"),
+            ],
+        )
+        llm = SequencedEngine([(r"\boxed{9}", "eos")])
+        result, boundaries, _ = run_disagreement_routing(
+            "Problem: x?",
+            slm,
+            llm,
+            BPAConfig(max_total_tokens=300),
+            min_agreement_count=3,
+            probe_k=4,
+            probe_temperature=0.7,
+            probe_max_tokens=32,
+            enable_dynamics_routing=True,
+        )
+        self.assertEqual(result.answer, "9")
+        self.assertTrue(boundaries[0]["routed_to_llm"])
+        self.assertEqual(boundaries[0]["dynamics_consensus_group_counts"], {"flat_low": 4})
+        self.assertEqual(boundaries[0]["dynamics_consensus_reject_reason"], "insufficient_structured_agreement")
+
     def test_pure_text_slm_fallback_reuses_best_all_none_probe(self):
         slm = WeightedSamplingProbeEngine(
             outputs=[
@@ -887,6 +998,54 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(boundaries[0]["selected_rollout_idx"], 1)
         steps = [event.data["steps"] for event in result.state.trace if event.event == "step_logs"][0]
         self.assertEqual(steps[-1]["decision"], "slm_pure_text_reuse")
+
+    def test_branch_cut_recovery_rolls_back_repeated_skeleton(self):
+        slm = WeightedSamplingProbeEngine(
+            outputs=[
+                ("First step.\n\n", "stop"),
+            ],
+            probe_outputs=[
+                ("Let b = 3 and test the equation.\n\n", -0.1, "stop"),
+                ("Let b = 3 and test the equation.\n\n", -0.2, "stop"),
+                ("Let b = 3 and test the equation.\n\n", -0.3, "stop"),
+                ("Let b = 3 and test the equation.\n\n", -0.4, "stop"),
+                ("Let b = 4 and test the equation.\n\n", -0.1, "stop"),
+                ("Let b = 4 and test the equation.\n\n", -0.2, "stop"),
+                ("Let b = 4 and test the equation.\n\n", -0.3, "stop"),
+                ("Let b = 4 and test the equation.\n\n", -0.4, "stop"),
+                ("Let b = 2 and test the equation.\n\n", -0.1, "stop"),
+                ("Let b = 2 and test the equation.\n\n", -0.2, "stop"),
+                ("Let b = 2 and test the equation.\n\n", -0.3, "stop"),
+                ("Let b = 2 and test the equation.\n\n", -0.4, "stop"),
+            ],
+        )
+        llm = SequencedEngine([(r"Use a different invariant. The answer is \boxed{9}.", "eos")])
+        result, boundaries, _ = run_disagreement_routing(
+            "Problem: x?",
+            slm,
+            llm,
+            BPAConfig(max_total_tokens=500),
+            min_agreement_count=3,
+            probe_k=4,
+            probe_temperature=0.7,
+            probe_max_tokens=32,
+            enable_branch_cut_recovery=True,
+            branch_cut_skeleton_window=12,
+            branch_cut_skeleton_threshold=3,
+            branch_cut_recovery_steps=5,
+        )
+        self.assertEqual(result.answer, "9")
+        self.assertEqual(result.state.stop_reason, "eos")
+        self.assertEqual(len(boundaries), 3)
+        self.assertNotIn("Let b = 3", result.state.assistant_prefix_text)
+        self.assertIn("different representation", result.state.assistant_prefix_text)
+        recovery_events = [event for event in result.state.trace if event.event == "branch_cut_recovery"]
+        self.assertEqual(len(recovery_events), 1)
+        self.assertEqual(recovery_events[0].data["discarded_step_indices"], [1, 2, 3])
+        steps = [event.data["steps"] for event in result.state.trace if event.event == "step_logs"][0]
+        discarded = [row for row in steps if row.get("discarded_by_branch_cut")]
+        self.assertEqual([row["step_idx"] for row in discarded], [1, 2, 3])
+        self.assertEqual(steps[-1]["decision"], "llm_branch_recovery")
 
     def test_llm_colon_continuation_skips_next_probe(self):
         slm = WeightedSamplingProbeEngine(

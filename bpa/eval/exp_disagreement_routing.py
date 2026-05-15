@@ -32,7 +32,7 @@ from bpa.pipeline import (
     _slm_generate_step,
 )
 from bpa.render import render_for_continuation
-from bpa.safety import ensure_step_terminator, extract_answer_from_steps, update_strict_step_repetition
+from bpa.safety import ensure_step_terminator, extract_answer_from_steps, normalize_step_skeleton, update_strict_step_repetition
 from bpa.state import GenerationState, Phase, RepetitionState, TraceEvent
 from bpa.trace import BPAResult, json_safe, result_summary, write_json, write_jsonl
 
@@ -52,11 +52,28 @@ SUMMARY_FIELDS = [
     "num_slm_steps",
     "num_probe_reused_steps",
     "num_step_type_reused_steps",
+    "num_dynamics_reused_steps",
     "num_pure_text_reused_steps",
     "step_type_routing_enabled",
     "step_type_min_agreement_count",
     "max_consecutive_step_type_exec",
+    "dynamics_routing_enabled",
+    "dynamics_min_agreement_count",
+    "probe_logprobs_topk",
+    "dynamics_flat_max_mean_surprisal",
+    "dynamics_flat_max_var",
+    "dynamics_flat_max_delta",
+    "dynamics_unstable_min_delta",
+    "dynamics_unstable_min_max_jump",
+    "dynamics_unstable_min_spike_ratio",
+    "dynamics_structured_min_var",
+    "dynamics_structured_min_max_jump",
     "pure_text_slm_fallback_enabled",
+    "branch_cut_recovery_enabled",
+    "num_branch_cut_recoveries",
+    "branch_cut_recovery_steps",
+    "branch_cut_skeleton_window",
+    "branch_cut_skeleton_threshold",
     "total_wall_time",
     "problem_wall_time",
     "slm_decode_tokens",
@@ -78,6 +95,11 @@ STEP_TYPE_EXECUTION = "execution"
 STEP_TYPE_REFLECTION_TRANSITION = "reflection_transition"
 STEP_TYPE_UNKNOWN = "unknown"
 
+DYNAMICS_STRUCTURED = "structured"
+DYNAMICS_FLAT_LOW = "flat_low"
+DYNAMICS_UNSTABLE = "unstable"
+DYNAMICS_UNKNOWN = "unknown"
+
 _STEP_TYPE_REFLECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("wait", re.compile(r"^\s*(?:wait|hmm|uh|oh|oops)\b", re.IGNORECASE)),
     ("correction", re.compile(r"^\s*(?:actually|but|however|although|nevertheless)\b", re.IGNORECASE)),
@@ -97,6 +119,13 @@ _STEP_TYPE_EXECUTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("derivation_marker", re.compile(r"^\s*(?:so|therefore|thus|hence|then)\b", re.IGNORECASE)),
     ("mechanical_verb", re.compile(r"^\s*(?:substituting|plugging|computing|calculating|expanding|simplifying|factoring|multiplying|dividing|adding|subtracting|combining|solving|rearranging|reducing|evaluating)\b", re.IGNORECASE)),
     ("result_phrase", re.compile(r"^\s*(?:we\s+(?:get|obtain|have|find|see)|this\s+(?:gives|means|implies|becomes|is)|which\s+(?:gives|means|implies)|it\s+(?:follows|is))\b", re.IGNORECASE)),
+)
+
+BRANCH_CUT_RECOVERY_BRIDGE = (
+    "\n\nThe previous branch is repeating the same reasoning pattern without progress. "
+    "I will abandon that local branch and restart from the last stable point. "
+    "I will not continue enumerating similar candidates. "
+    "I will use a different representation, invariant, or counting argument, and each next step must produce a concrete new constraint or conclusion.\n\n"
 )
 
 def _mean(values: list[float | int | None]) -> float | None:
@@ -223,6 +252,75 @@ def _empty_step_type_consensus(reason: str) -> dict[str, Any]:
     }
 
 
+def _empty_dynamics_consensus(reason: str) -> dict[str, Any]:
+    return {
+        "dynamics_consensus_type": None,
+        "dynamics_consensus_signal": None,
+        "dynamics_consensus_support_count": 0,
+        "dynamics_consensus_vote_fraction": None,
+        "dynamics_consensus_group_counts": {},
+        "dynamics_consensus_reject_reason": reason,
+        "dynamics_selected_rollout": None,
+    }
+
+
+def _float_metric(row: dict[str, Any], key: str) -> float | None:
+    value = row.get(key)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _classify_dynamics(
+    rollout: dict[str, Any],
+    *,
+    flat_max_mean_surprisal: float,
+    flat_max_var: float,
+    flat_max_delta: float,
+    unstable_min_delta: float,
+    unstable_min_max_jump: float,
+    unstable_min_spike_ratio: float,
+    structured_min_var: float,
+    structured_min_max_jump: float,
+) -> dict[str, str]:
+    scored_tokens = int(rollout.get("dynamics_num_scored_tokens") or 0)
+    if scored_tokens <= 0:
+        return {"dynamics_category": DYNAMICS_UNKNOWN, "dynamics_signal": "no_scores"}
+
+    mean_surprisal = _float_metric(rollout, "surprisal_mean")
+    var = _float_metric(rollout, "surprisal_var")
+    mean_abs_delta = _float_metric(rollout, "surprisal_mean_abs_delta")
+    max_abs_delta = _float_metric(rollout, "surprisal_max_abs_delta")
+    spike_ratio = _float_metric(rollout, "surprisal_spike_ratio")
+
+    if (
+        mean_surprisal is not None
+        and var is not None
+        and mean_surprisal <= flat_max_mean_surprisal
+        and var <= flat_max_var
+        and (mean_abs_delta is None or mean_abs_delta <= flat_max_delta)
+    ):
+        return {"dynamics_category": DYNAMICS_FLAT_LOW, "dynamics_signal": "low_flat_surprisal"}
+
+    if (
+        (mean_abs_delta is not None and mean_abs_delta >= unstable_min_delta)
+        or (max_abs_delta is not None and max_abs_delta >= unstable_min_max_jump)
+        or (spike_ratio is not None and spike_ratio >= unstable_min_spike_ratio)
+    ):
+        return {"dynamics_category": DYNAMICS_UNSTABLE, "dynamics_signal": "unstable_surprisal"}
+
+    if (
+        (var is not None and var >= structured_min_var)
+        or (max_abs_delta is not None and max_abs_delta >= structured_min_max_jump)
+    ):
+        return {"dynamics_category": DYNAMICS_STRUCTURED, "dynamics_signal": "structured_surprisal"}
+
+    return {"dynamics_category": DYNAMICS_UNKNOWN, "dynamics_signal": "low_information"}
+
+
 def _stage1_groups(rollouts: list[dict[str, Any]]) -> tuple[str | None, dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
     for channel in ROUTING_EVIDENCE_CHANNEL_PRIORITY:
         groups: dict[str, list[dict[str, Any]]] = {}
@@ -297,6 +395,118 @@ def _step_ends_with_colon(step_text: str, finish: str) -> bool:
     if _is_eos_finish(finish):
         return False
     return step_text.rstrip().endswith(":")
+
+
+def _active_step_logs(step_logs: list[dict[str, Any]]) -> list[tuple[int, dict[str, Any], str]]:
+    rows: list[tuple[int, dict[str, Any], str]] = []
+    for idx, row in enumerate(step_logs):
+        if row.get("discarded_by_branch_cut"):
+            continue
+        text = str(row.get("step_text") or "")
+        skeleton = str(row.get("step_skeleton") or normalize_step_skeleton(text))
+        row["step_skeleton"] = skeleton
+        if skeleton:
+            rows.append((idx, row, skeleton))
+    return rows
+
+
+def _branch_cut_repeat_candidate(
+    step_logs: list[dict[str, Any]],
+    *,
+    window: int,
+    threshold: int,
+) -> dict[str, Any] | None:
+    if window < 2 or threshold < 2:
+        return None
+    recent = _active_step_logs(step_logs)[-window:]
+    if len(recent) < threshold:
+        return None
+
+    by_skeleton: dict[str, list[tuple[int, dict[str, Any], str]]] = {}
+    for item in recent:
+        by_skeleton.setdefault(item[2], []).append(item)
+    current_skeleton = recent[-1][2]
+    candidates = [
+        (skeleton, items)
+        for skeleton, items in by_skeleton.items()
+        if len(items) >= threshold and skeleton == current_skeleton
+    ]
+    if not candidates:
+        candidates = [(skeleton, items) for skeleton, items in by_skeleton.items() if len(items) >= threshold]
+    if not candidates:
+        return None
+
+    skeleton, items = max(candidates, key=lambda item: (len(item[1]), item[1][-1][0]))
+    return {
+        "skeleton": skeleton,
+        "support_count": len(items),
+        "support_step_indices": [int(item[1].get("step_idx") or 0) for item in items],
+        "cut_log_idx": items[0][0],
+    }
+
+
+def _apply_branch_cut_recovery(
+    state: GenerationState,
+    step_logs: list[dict[str, Any]],
+    *,
+    recovery_id: int,
+    trigger_reason: str,
+    window: int,
+    threshold: int,
+) -> bool:
+    candidate = _branch_cut_repeat_candidate(step_logs, window=window, threshold=threshold)
+    if candidate is None:
+        return False
+
+    cut_log_idx = int(candidate["cut_log_idx"])
+    discarded: list[dict[str, Any]] = []
+    suffix_parts: list[str] = []
+    for row in step_logs[cut_log_idx:]:
+        if row.get("discarded_by_branch_cut"):
+            continue
+        row["discarded_by_branch_cut"] = True
+        row["branch_cut_recovery_id"] = recovery_id
+        discarded.append(row)
+        suffix_parts.append(str(row.get("step_text") or ""))
+
+    suffix = "".join(suffix_parts)
+    if not suffix or not state.assistant_prefix_text.endswith(suffix):
+        state.trace.append(
+            TraceEvent(
+                state.step_count,
+                "branch_cut_recovery_failed",
+                {
+                    "recovery_id": recovery_id,
+                    "trigger_reason": trigger_reason,
+                    "skeleton": candidate["skeleton"],
+                    "reason": "prefix_suffix_mismatch",
+                },
+            )
+        )
+        for row in discarded:
+            row.pop("discarded_by_branch_cut", None)
+            row.pop("branch_cut_recovery_id", None)
+        return False
+
+    state.assistant_prefix_text = state.assistant_prefix_text[: -len(suffix)] + BRANCH_CUT_RECOVERY_BRIDGE
+    state.trace.append(
+        TraceEvent(
+            state.step_count,
+            "branch_cut_recovery",
+            {
+                "recovery_id": recovery_id,
+                "trigger_reason": trigger_reason,
+                "skeleton": candidate["skeleton"],
+                "support_count": candidate["support_count"],
+                "support_step_indices": candidate["support_step_indices"],
+                "discarded_step_indices": [int(row.get("step_idx") or 0) for row in discarded],
+                "bridge": BRANCH_CUT_RECOVERY_BRIDGE,
+                "window": window,
+                "threshold": threshold,
+            },
+        )
+    )
+    return True
 
 
 def _selected_prefix_consensus_rollout(
@@ -405,6 +615,77 @@ def _selected_step_type_consensus_rollout(
     return result
 
 
+def _selected_dynamics_consensus_rollout(
+    probe_row: dict[str, Any],
+    *,
+    enabled: bool,
+    min_agreement_count: int,
+    flat_max_mean_surprisal: float,
+    flat_max_var: float,
+    flat_max_delta: float,
+    unstable_min_delta: float,
+    unstable_min_max_jump: float,
+    unstable_min_spike_ratio: float,
+    structured_min_var: float,
+    structured_min_max_jump: float,
+) -> dict[str, Any]:
+    rollouts = list(probe_row.get("rollouts") or [])
+    if not rollouts:
+        return _empty_dynamics_consensus("empty")
+
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for idx, rollout in enumerate(rollouts):
+        if "rollout_idx" not in rollout:
+            rollout["rollout_idx"] = idx
+        if "step_type" not in rollout:
+            classified = _classify_step_type(rollout.get("text"))
+            rollout["step_type"] = classified["step_type"]
+            rollout["step_type_signal"] = classified["step_type_signal"]
+            rollout["step_type_head"] = classified["step_type_head"]
+        dynamics = _classify_dynamics(
+            rollout,
+            flat_max_mean_surprisal=flat_max_mean_surprisal,
+            flat_max_var=flat_max_var,
+            flat_max_delta=flat_max_delta,
+            unstable_min_delta=unstable_min_delta,
+            unstable_min_max_jump=unstable_min_max_jump,
+            unstable_min_spike_ratio=unstable_min_spike_ratio,
+            structured_min_var=structured_min_var,
+            structured_min_max_jump=structured_min_max_jump,
+        )
+        rollout["dynamics_category"] = dynamics["dynamics_category"]
+        rollout["dynamics_signal"] = dynamics["dynamics_signal"]
+        groups.setdefault(dynamics["dynamics_category"], []).append(rollout)
+
+    group_counts = {category: len(group_rows) for category, group_rows in sorted(groups.items())}
+    structured_group = [
+        rollout
+        for rollout in groups.get(DYNAMICS_STRUCTURED, [])
+        if rollout.get("step_type") != STEP_TYPE_REFLECTION_TRANSITION
+    ]
+    support_count = len(structured_group)
+    vote_fraction = support_count / len(rollouts) if rollouts else None
+    result = {
+        "dynamics_consensus_type": DYNAMICS_STRUCTURED if structured_group else None,
+        "dynamics_consensus_signal": "structured_surprisal" if structured_group else None,
+        "dynamics_consensus_support_count": support_count,
+        "dynamics_consensus_vote_fraction": vote_fraction,
+        "dynamics_consensus_group_counts": group_counts,
+        "dynamics_consensus_reject_reason": None,
+        "dynamics_selected_rollout": None,
+    }
+
+    if not enabled:
+        result["dynamics_consensus_reject_reason"] = "disabled_or_not_all_none"
+        return result
+    if support_count < min_agreement_count:
+        result["dynamics_consensus_reject_reason"] = "insufficient_structured_agreement"
+        return result
+
+    result["dynamics_selected_rollout"] = _best_rollout(structured_group)
+    return result
+
+
 def _probe_step_token_count(rollout: dict[str, Any], slm) -> int:
     token_count = rollout.get("token_count")
     try:
@@ -494,10 +775,26 @@ def run_disagreement_routing(
     probe_temperature: float = 0.7,
     probe_max_tokens: int = 32,
     probe_stop: str = "\n\n",
+    probe_logprobs_topk: int = 1,
     enable_step_type_routing: bool = False,
     step_type_min_agreement_count: int | None = None,
     max_consecutive_step_type_exec: int = 2,
+    enable_dynamics_routing: bool = False,
+    dynamics_min_agreement_count: int | None = None,
+    dynamics_flat_max_mean_surprisal: float = 0.35,
+    dynamics_flat_max_var: float = 0.02,
+    dynamics_flat_max_delta: float = 0.08,
+    dynamics_unstable_min_delta: float = 1.0,
+    dynamics_unstable_min_max_jump: float = 2.0,
+    dynamics_unstable_min_spike_ratio: float = 0.25,
+    dynamics_structured_min_var: float = 0.002,
+    dynamics_structured_min_max_jump: float = 0.15,
     enable_pure_text_slm_fallback: bool = False,
+    enable_branch_cut_recovery: bool = False,
+    branch_cut_skeleton_window: int = 12,
+    branch_cut_skeleton_threshold: int = 3,
+    branch_cut_recovery_steps: int = 5,
+    max_branch_cut_recoveries: int = 2,
 ) -> tuple[BPAResult, list[dict[str, Any]], dict[str, float | int]]:
     if min_agreement_count > probe_k:
         raise ValueError("min_agreement_count cannot exceed probe_k")
@@ -505,6 +802,10 @@ def run_disagreement_routing(
         step_type_min_agreement_count = min_agreement_count
     if step_type_min_agreement_count > probe_k:
         raise ValueError("step_type_min_agreement_count cannot exceed probe_k")
+    if dynamics_min_agreement_count is None:
+        dynamics_min_agreement_count = min_agreement_count
+    if dynamics_min_agreement_count > probe_k:
+        raise ValueError("dynamics_min_agreement_count cannot exceed probe_k")
 
     protocol = "evidence_consensus_routing"
     state = GenerationState(problem_text=problem_text, generation_protocol=protocol)
@@ -516,6 +817,34 @@ def run_disagreement_routing(
     boundary_idx = 0
     force_next_llm = False
     consecutive_step_type_exec = 0
+    branch_cut_recoveries = 0
+    branch_recovery_steps_remaining = 0
+
+    def maybe_start_branch_cut_recovery(trigger_reason: str, *, threshold: int | None = None) -> bool:
+        nonlocal branch_cut_recoveries, branch_recovery_steps_remaining, rep, force_next_llm, consecutive_step_type_exec
+        if not enable_branch_cut_recovery:
+            return False
+        if branch_recovery_steps_remaining > 0:
+            return False
+        if branch_cut_recoveries >= max_branch_cut_recoveries:
+            return False
+        recovery_id = branch_cut_recoveries + 1
+        applied = _apply_branch_cut_recovery(
+            state,
+            step_logs,
+            recovery_id=recovery_id,
+            trigger_reason=trigger_reason,
+            window=branch_cut_skeleton_window,
+            threshold=threshold if threshold is not None else branch_cut_skeleton_threshold,
+        )
+        if not applied:
+            return False
+        branch_cut_recoveries = recovery_id
+        branch_recovery_steps_remaining = max(branch_cut_recovery_steps, 0)
+        rep = RepetitionState()
+        force_next_llm = False
+        consecutive_step_type_exec = 0
+        return True
 
     while state.phase != Phase.DONE:
         if state.slm_decode_tokens + state.llm_decode_tokens >= config.max_total_tokens:
@@ -548,6 +877,7 @@ def run_disagreement_routing(
                     "reused_probe_rollout": False,
                     "continued_probe_rollout": False,
                     "selected_rollout_idx": None,
+                    "step_skeleton": normalize_step_skeleton(step_text_normalized),
                 }
             )
 
@@ -559,6 +889,8 @@ def run_disagreement_routing(
 
             trigger = update_strict_step_repetition(rep, step_text_normalized)
             if trigger is not None:
+                if maybe_start_branch_cut_recovery(trigger, threshold=2):
+                    continue
                 state.trace.append(TraceEvent(state.step_count, "step_repetition_stop", {"trigger_reason": trigger}))
                 if trigger in THINKING_RECOVERY_STOP_REASONS and _can_force_final_answer_from_thinking(state, config):
                     _append_forced_close_think(state)
@@ -566,6 +898,8 @@ def run_disagreement_routing(
                 state.phase = Phase.DONE
                 state.stop_reason = trigger
                 break
+            if maybe_start_branch_cut_recovery("skeleton_repeat"):
+                continue
 
             if _is_eos_finish(finish):
                 state.phase = Phase.DONE
@@ -596,6 +930,7 @@ def run_disagreement_routing(
                     "reused_probe_rollout": False,
                     "continued_probe_rollout": False,
                     "selected_rollout_idx": None,
+                    "step_skeleton": normalize_step_skeleton(step_text_normalized),
                 }
             )
 
@@ -607,6 +942,49 @@ def run_disagreement_routing(
 
             state.phase = Phase.DONE
             state.stop_reason = _final_answer_stop_reason(finish)
+            continue
+
+        if branch_recovery_steps_remaining > 0:
+            decode_tokens_before = state.slm_decode_tokens + state.llm_decode_tokens
+            try:
+                step_text, finish = _llm_generate_step(state, llm, config)
+            except ContextBudgetExceeded as exc:
+                state.phase = Phase.DONE
+                state.stop_reason = "context_budget"
+                state.trace.append(TraceEvent(state.step_count, "context_budget_exhausted", exc.to_trace_data()))
+                break
+            step_text_normalized = ensure_step_terminator(step_text, finish)
+            generated_step_tokens = state.slm_decode_tokens + state.llm_decode_tokens - decode_tokens_before
+            state.assistant_prefix_text += step_text_normalized
+            state.step_count += 1
+            branch_recovery_steps_remaining -= 1
+            consecutive_step_type_exec = 0
+            step_logs.append(
+                {
+                    "step_idx": state.step_count - 1,
+                    "decision": "llm_branch_recovery",
+                    "generation_source": "llm",
+                    "finish_reason": finish,
+                    "step_text": step_text_normalized,
+                    "generated_step_tokens": generated_step_tokens,
+                    "reused_probe_rollout": False,
+                    "continued_probe_rollout": False,
+                    "selected_rollout_idx": None,
+                    "branch_cut_recovery_id": branch_cut_recoveries,
+                    "branch_recovery_steps_remaining": branch_recovery_steps_remaining,
+                    "step_skeleton": normalize_step_skeleton(step_text_normalized),
+                }
+            )
+            if generated_step_tokens <= 0 and not step_text_normalized.strip():
+                state.phase = Phase.DONE
+                state.stop_reason = "empty_step"
+                state.trace.append(TraceEvent(state.step_count, "empty_step", {}))
+                break
+            if _is_eos_finish(finish):
+                state.phase = Phase.DONE
+                state.stop_reason = "eos"
+            else:
+                force_next_llm = branch_recovery_steps_remaining <= 0 and _step_ends_with_colon(step_text_normalized, finish)
             continue
 
         if force_next_llm:
@@ -635,6 +1013,7 @@ def run_disagreement_routing(
                     "reused_probe_rollout": False,
                     "continued_probe_rollout": False,
                     "selected_rollout_idx": None,
+                    "step_skeleton": normalize_step_skeleton(step_text_normalized),
                 }
             )
             if generated_step_tokens <= 0 and not step_text_normalized.strip():
@@ -644,6 +1023,8 @@ def run_disagreement_routing(
                 break
             trigger = update_strict_step_repetition(rep, step_text_normalized)
             if trigger is not None:
+                if maybe_start_branch_cut_recovery(trigger, threshold=2):
+                    continue
                 state.trace.append(TraceEvent(state.step_count, "step_repetition_stop", {"trigger_reason": trigger}))
                 if trigger in THINKING_RECOVERY_STOP_REASONS and _can_force_final_answer_from_thinking(state, config):
                     _append_forced_close_think(state)
@@ -651,6 +1032,8 @@ def run_disagreement_routing(
                 state.phase = Phase.DONE
                 state.stop_reason = trigger
                 break
+            if maybe_start_branch_cut_recovery("skeleton_repeat"):
+                continue
             if _is_eos_finish(finish):
                 state.phase = Phase.DONE
                 state.stop_reason = "eos"
@@ -668,6 +1051,7 @@ def run_disagreement_routing(
                 probe_temperature=probe_temperature,
                 probe_max_tokens=probe_max_tokens,
                 probe_stop=probe_stop,
+                probe_logprobs_topk=probe_logprobs_topk,
             )
         except ContextBudgetExceeded as exc:
             state.phase = Phase.DONE
@@ -691,6 +1075,19 @@ def run_disagreement_routing(
             consecutive_step_type_exec=consecutive_step_type_exec,
             max_consecutive_step_type_exec=max_consecutive_step_type_exec,
         )
+        dynamics_consensus = _selected_dynamics_consensus_rollout(
+            probe_row,
+            enabled=enable_dynamics_routing and prefix_consensus["stage1_case"] == "all_none",
+            min_agreement_count=dynamics_min_agreement_count,
+            flat_max_mean_surprisal=dynamics_flat_max_mean_surprisal,
+            flat_max_var=dynamics_flat_max_var,
+            flat_max_delta=dynamics_flat_max_delta,
+            unstable_min_delta=dynamics_unstable_min_delta,
+            unstable_min_max_jump=dynamics_unstable_min_max_jump,
+            unstable_min_spike_ratio=dynamics_unstable_min_spike_ratio,
+            structured_min_var=dynamics_structured_min_var,
+            structured_min_max_jump=dynamics_structured_min_max_jump,
+        )
         if selected_rollout is None and step_type_consensus["step_type_selected_rollout"] is not None:
             selected_rollout = step_type_consensus["step_type_selected_rollout"]
             prefix_consensus = {
@@ -707,6 +1104,26 @@ def run_disagreement_routing(
                 },
                 "prefix_consensus_group_counts": step_type_consensus["step_type_consensus_group_counts"],
                 "prefix_consensus_stage": 1.5,
+            }
+        if selected_rollout is None and dynamics_consensus["dynamics_selected_rollout"] is not None:
+            selected_rollout = dynamics_consensus["dynamics_selected_rollout"]
+            prefix_consensus = {
+                **prefix_consensus,
+                "prefix_anchor_idx": selected_rollout.get("rollout_idx"),
+                "prefix_anchor_mean_logprob": selected_rollout.get("mean_logprob"),
+                "prefix_consensus_channel": "dynamics",
+                "prefix_consensus_value": DYNAMICS_STRUCTURED,
+                "prefix_consensus_support_count": dynamics_consensus["dynamics_consensus_support_count"],
+                "prefix_consensus_vote_fraction": dynamics_consensus["dynamics_consensus_vote_fraction"],
+                "prefix_consensus_support_by_rollout": {
+                    str(_rollout_idx_sort_value(rollout)): (
+                        rollout.get("dynamics_category") == DYNAMICS_STRUCTURED
+                        and rollout.get("step_type") != STEP_TYPE_REFLECTION_TRANSITION
+                    )
+                    for rollout in probe_row.get("rollouts") or []
+                },
+                "prefix_consensus_group_counts": dynamics_consensus["dynamics_consensus_group_counts"],
+                "prefix_consensus_stage": 1.55,
             }
         if (
             selected_rollout is None
@@ -784,6 +1201,15 @@ def run_disagreement_routing(
         probe_row["step_type_consensus_heads"] = step_type_consensus["step_type_consensus_heads"]
         probe_row["step_type_consensus_signals"] = step_type_consensus["step_type_consensus_signals"]
         probe_row["step_type_consensus_reject_reason"] = step_type_consensus["step_type_consensus_reject_reason"]
+        probe_row["dynamics_routing_enabled"] = enable_dynamics_routing
+        probe_row["dynamics_min_agreement_count"] = dynamics_min_agreement_count
+        probe_row["probe_logprobs_topk"] = probe_logprobs_topk
+        probe_row["dynamics_consensus_type"] = dynamics_consensus["dynamics_consensus_type"]
+        probe_row["dynamics_consensus_signal"] = dynamics_consensus["dynamics_consensus_signal"]
+        probe_row["dynamics_consensus_support_count"] = dynamics_consensus["dynamics_consensus_support_count"]
+        probe_row["dynamics_consensus_vote_fraction"] = dynamics_consensus["dynamics_consensus_vote_fraction"]
+        probe_row["dynamics_consensus_group_counts"] = dynamics_consensus["dynamics_consensus_group_counts"]
+        probe_row["dynamics_consensus_reject_reason"] = dynamics_consensus["dynamics_consensus_reject_reason"]
         probe_row["pure_text_slm_fallback_enabled"] = enable_pure_text_slm_fallback
         probe_row["pure_text_slm_fallback_used"] = prefix_consensus["prefix_consensus_stage"] == 1.6
         probe_row["routed_to_llm"] = route_to_llm
@@ -813,6 +1239,10 @@ def run_disagreement_routing(
             decision = "slm_step_type_reuse"
             force_next_llm = False
             consecutive_step_type_exec += 1
+        elif probe_row["prefix_consensus_stage"] == 1.55:
+            decision = "slm_dynamics_reuse"
+            force_next_llm = False
+            consecutive_step_type_exec = 0
         elif probe_row["prefix_consensus_stage"] == 1.6:
             decision = "slm_pure_text_reuse"
             force_next_llm = False
@@ -836,6 +1266,7 @@ def run_disagreement_routing(
             "continued_probe_rollout": continued_probe_rollout,
             "selected_rollout_idx": probe_row["selected_rollout_idx"],
             "prefix_consensus_stage": probe_row["prefix_consensus_stage"],
+            "step_skeleton": normalize_step_skeleton(step_text_normalized),
         }
         step_logs.append(log_row)
 
@@ -847,6 +1278,8 @@ def run_disagreement_routing(
 
         trigger = update_strict_step_repetition(rep, step_text_normalized)
         if trigger is not None:
+            if maybe_start_branch_cut_recovery(trigger, threshold=2):
+                continue
             state.trace.append(TraceEvent(state.step_count, "step_repetition_stop", {"trigger_reason": trigger}))
             if trigger in THINKING_RECOVERY_STOP_REASONS and _can_force_final_answer_from_thinking(state, config):
                 _append_forced_close_think(state)
@@ -854,14 +1287,17 @@ def run_disagreement_routing(
             state.phase = Phase.DONE
             state.stop_reason = trigger
             break
+        if maybe_start_branch_cut_recovery("skeleton_repeat"):
+            continue
 
         if _is_eos_finish(finish):
             state.phase = Phase.DONE
             state.stop_reason = "eos"
 
     state.trace.append(TraceEvent(state.step_count, "step_logs", {"steps": step_logs}))
+    active_step_logs = [row for row in step_logs if not row.get("discarded_by_branch_cut")]
     result = BPAResult(
-        answer=extract_answer_from_steps(step_logs, state.assistant_prefix_text),
+        answer=extract_answer_from_steps(active_step_logs, state.assistant_prefix_text),
         state=state,
         total_wall_time=time.time() - start_time,
     )
@@ -881,7 +1317,22 @@ def build_problem_summary(
     step_type_routing_enabled: bool = False,
     step_type_min_agreement_count: int | None = None,
     max_consecutive_step_type_exec: int = 2,
+    dynamics_routing_enabled: bool = False,
+    dynamics_min_agreement_count: int | None = None,
+    probe_logprobs_topk: int = 1,
+    dynamics_flat_max_mean_surprisal: float = 0.35,
+    dynamics_flat_max_var: float = 0.02,
+    dynamics_flat_max_delta: float = 0.08,
+    dynamics_unstable_min_delta: float = 1.0,
+    dynamics_unstable_min_max_jump: float = 2.0,
+    dynamics_unstable_min_spike_ratio: float = 0.25,
+    dynamics_structured_min_var: float = 0.002,
+    dynamics_structured_min_max_jump: float = 0.15,
     pure_text_slm_fallback_enabled: bool = False,
+    branch_cut_recovery_enabled: bool = False,
+    branch_cut_recovery_steps: int = 5,
+    branch_cut_skeleton_window: int = 12,
+    branch_cut_skeleton_threshold: int = 3,
 ) -> dict[str, Any]:
     correct = None
     if problem.gold_answer is not None:
@@ -891,6 +1342,7 @@ def build_problem_summary(
     probe_decode_tokens = int(probe_cost.get("probe_decode_tokens") or 0)
     real_boundary_rows = list(boundary_rows)
     step_rows = _step_rows(result)
+    num_branch_cut_recoveries = sum(1 for event in result.state.trace if event.event == "branch_cut_recovery")
     return {
         "dataset": dataset,
         "problem_id": problem.problem_id,
@@ -906,13 +1358,32 @@ def build_problem_summary(
         "num_slm_steps": sum(1 for row in real_boundary_rows if not row.get("routed_to_llm")),
         "num_probe_reused_steps": sum(1 for row in real_boundary_rows if row.get("reused_probe_rollout")),
         "num_step_type_reused_steps": sum(1 for row in real_boundary_rows if row.get("prefix_consensus_stage") == 1.5),
+        "num_dynamics_reused_steps": sum(1 for row in real_boundary_rows if row.get("prefix_consensus_stage") == 1.55),
         "num_pure_text_reused_steps": sum(1 for row in real_boundary_rows if row.get("prefix_consensus_stage") == 1.6),
         "step_type_routing_enabled": step_type_routing_enabled,
         "step_type_min_agreement_count": (
             step_type_min_agreement_count if step_type_min_agreement_count is not None else min_agreement_count
         ),
         "max_consecutive_step_type_exec": max_consecutive_step_type_exec,
+        "dynamics_routing_enabled": dynamics_routing_enabled,
+        "dynamics_min_agreement_count": (
+            dynamics_min_agreement_count if dynamics_min_agreement_count is not None else min_agreement_count
+        ),
+        "probe_logprobs_topk": probe_logprobs_topk,
+        "dynamics_flat_max_mean_surprisal": dynamics_flat_max_mean_surprisal,
+        "dynamics_flat_max_var": dynamics_flat_max_var,
+        "dynamics_flat_max_delta": dynamics_flat_max_delta,
+        "dynamics_unstable_min_delta": dynamics_unstable_min_delta,
+        "dynamics_unstable_min_max_jump": dynamics_unstable_min_max_jump,
+        "dynamics_unstable_min_spike_ratio": dynamics_unstable_min_spike_ratio,
+        "dynamics_structured_min_var": dynamics_structured_min_var,
+        "dynamics_structured_min_max_jump": dynamics_structured_min_max_jump,
         "pure_text_slm_fallback_enabled": pure_text_slm_fallback_enabled,
+        "branch_cut_recovery_enabled": branch_cut_recovery_enabled,
+        "num_branch_cut_recoveries": num_branch_cut_recoveries,
+        "branch_cut_recovery_steps": branch_cut_recovery_steps,
+        "branch_cut_skeleton_window": branch_cut_skeleton_window,
+        "branch_cut_skeleton_threshold": branch_cut_skeleton_threshold,
         "total_wall_time": result.total_wall_time,
         "problem_wall_time": problem_wall_time if problem_wall_time is not None else result.total_wall_time,
         "slm_decode_tokens": result.state.slm_decode_tokens,
@@ -941,7 +1412,9 @@ def _summary_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_num_llm_colon_continuation_steps": _mean([row.get("num_llm_colon_continuation_steps") for row in rows]),
         "avg_num_probe_reused_steps": _mean([row.get("num_probe_reused_steps") for row in rows]),
         "avg_num_step_type_reused_steps": _mean([row.get("num_step_type_reused_steps") for row in rows]),
+        "avg_num_dynamics_reused_steps": _mean([row.get("num_dynamics_reused_steps") for row in rows]),
         "avg_num_pure_text_reused_steps": _mean([row.get("num_pure_text_reused_steps") for row in rows]),
+        "avg_num_branch_cut_recoveries": _mean([row.get("num_branch_cut_recoveries") for row in rows]),
         "avg_main_decode_tokens": _mean([row.get("main_decode_tokens") for row in rows]),
         "avg_total_decode_tokens_including_probe": _mean(
             [row.get("total_decode_tokens_including_probe") for row in rows]
@@ -951,7 +1424,9 @@ def _summary_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "total_slm_decode_tokens": sum(float(row.get("slm_decode_tokens") or 0.0) for row in rows),
         "total_probe_decode_tokens": sum(float(row.get("probe_decode_tokens") or 0.0) for row in rows),
         "total_step_type_reused_steps": sum(float(row.get("num_step_type_reused_steps") or 0.0) for row in rows),
+        "total_dynamics_reused_steps": sum(float(row.get("num_dynamics_reused_steps") or 0.0) for row in rows),
         "total_pure_text_reused_steps": sum(float(row.get("num_pure_text_reused_steps") or 0.0) for row in rows),
+        "total_branch_cut_recoveries": sum(float(row.get("num_branch_cut_recoveries") or 0.0) for row in rows),
         "total_main_decode_tokens": sum(float(row.get("main_decode_tokens") or 0.0) for row in rows),
         "total_decode_tokens_including_probe": sum(
             float(row.get("total_decode_tokens_including_probe") or 0.0) for row in rows
@@ -1106,11 +1581,27 @@ def main() -> None:
     parser.add_argument("--probe-k", type=int, default=4)
     parser.add_argument("--probe-temperature", type=float, default=0.7)
     parser.add_argument("--probe-max-tokens", type=int, default=32)
+    parser.add_argument("--probe-logprobs-topk", type=int, default=1, help="Top-k logprobs to request for each probe token; 1 records sampled-token surprisal only, >1 also approximates entropy.")
     parser.add_argument("--post-stop-lookahead-tokens", type=int, default=None)
     parser.add_argument("--enable-step-type-routing", action="store_true", help="Allow all-none execution-style probe consensus to reuse an SLM rollout.")
     parser.add_argument("--step-type-min-agreement-count", type=int, default=None, help="Agreement count for Tier 1.5 execution consensus; defaults to --min-agreement-count.")
     parser.add_argument("--max-consecutive-step-type-exec", type=int, default=2, help="Maximum consecutive Tier 1.5 SLM execution-style reuses before forcing an LLM check-in.")
+    parser.add_argument("--enable-dynamics-routing", action="store_true", help="Allow all-none structured-surprisal probe consensus to reuse an SLM rollout.")
+    parser.add_argument("--dynamics-min-agreement-count", type=int, default=None, help="Agreement count for structured dynamics consensus; defaults to --min-agreement-count.")
+    parser.add_argument("--dynamics-flat-max-mean-surprisal", type=float, default=0.35)
+    parser.add_argument("--dynamics-flat-max-var", type=float, default=0.02)
+    parser.add_argument("--dynamics-flat-max-delta", type=float, default=0.08)
+    parser.add_argument("--dynamics-unstable-min-delta", type=float, default=1.0)
+    parser.add_argument("--dynamics-unstable-min-max-jump", type=float, default=2.0)
+    parser.add_argument("--dynamics-unstable-min-spike-ratio", type=float, default=0.25)
+    parser.add_argument("--dynamics-structured-min-var", type=float, default=0.002)
+    parser.add_argument("--dynamics-structured-min-max-jump", type=float, default=0.15)
     parser.add_argument("--enable-pure-text-slm-fallback", action="store_true", help="For all-none pure-text probes not accepted by Tier 1.5, reuse the best SLM probe rollout instead of routing to the LLM.")
+    parser.add_argument("--enable-branch-cut-recovery", action="store_true", help="When a repeated reasoning skeleton is detected, cut the repeated branch and let the LLM recover for a few steps.")
+    parser.add_argument("--branch-cut-skeleton-window", type=int, default=12)
+    parser.add_argument("--branch-cut-skeleton-threshold", type=int, default=3)
+    parser.add_argument("--branch-cut-recovery-steps", type=int, default=5)
+    parser.add_argument("--max-branch-cut-recoveries", type=int, default=2)
     parser.add_argument("--output-name", default=None, help="Optional diagnostics output folder name under disagreement_routing/.")
     parser.add_argument("--resume", action="store_true", help="Skip problems that already have complete per-problem outputs.")
     args = parser.parse_args()
@@ -1155,10 +1646,26 @@ def main() -> None:
             probe_k=args.probe_k,
             probe_temperature=args.probe_temperature,
             probe_max_tokens=args.probe_max_tokens,
+            probe_logprobs_topk=args.probe_logprobs_topk,
             enable_step_type_routing=args.enable_step_type_routing,
             step_type_min_agreement_count=args.step_type_min_agreement_count,
             max_consecutive_step_type_exec=args.max_consecutive_step_type_exec,
+            enable_dynamics_routing=args.enable_dynamics_routing,
+            dynamics_min_agreement_count=args.dynamics_min_agreement_count,
+            dynamics_flat_max_mean_surprisal=args.dynamics_flat_max_mean_surprisal,
+            dynamics_flat_max_var=args.dynamics_flat_max_var,
+            dynamics_flat_max_delta=args.dynamics_flat_max_delta,
+            dynamics_unstable_min_delta=args.dynamics_unstable_min_delta,
+            dynamics_unstable_min_max_jump=args.dynamics_unstable_min_max_jump,
+            dynamics_unstable_min_spike_ratio=args.dynamics_unstable_min_spike_ratio,
+            dynamics_structured_min_var=args.dynamics_structured_min_var,
+            dynamics_structured_min_max_jump=args.dynamics_structured_min_max_jump,
             enable_pure_text_slm_fallback=args.enable_pure_text_slm_fallback,
+            enable_branch_cut_recovery=args.enable_branch_cut_recovery,
+            branch_cut_skeleton_window=args.branch_cut_skeleton_window,
+            branch_cut_skeleton_threshold=args.branch_cut_skeleton_threshold,
+            branch_cut_recovery_steps=args.branch_cut_recovery_steps,
+            max_branch_cut_recoveries=args.max_branch_cut_recoveries,
         )
         summary = build_problem_summary(
             dataset=args.dataset,
@@ -1172,7 +1679,22 @@ def main() -> None:
             step_type_routing_enabled=args.enable_step_type_routing,
             step_type_min_agreement_count=args.step_type_min_agreement_count,
             max_consecutive_step_type_exec=args.max_consecutive_step_type_exec,
+            dynamics_routing_enabled=args.enable_dynamics_routing,
+            dynamics_min_agreement_count=args.dynamics_min_agreement_count,
+            probe_logprobs_topk=args.probe_logprobs_topk,
+            dynamics_flat_max_mean_surprisal=args.dynamics_flat_max_mean_surprisal,
+            dynamics_flat_max_var=args.dynamics_flat_max_var,
+            dynamics_flat_max_delta=args.dynamics_flat_max_delta,
+            dynamics_unstable_min_delta=args.dynamics_unstable_min_delta,
+            dynamics_unstable_min_max_jump=args.dynamics_unstable_min_max_jump,
+            dynamics_unstable_min_spike_ratio=args.dynamics_unstable_min_spike_ratio,
+            dynamics_structured_min_var=args.dynamics_structured_min_var,
+            dynamics_structured_min_max_jump=args.dynamics_structured_min_max_jump,
             pure_text_slm_fallback_enabled=args.enable_pure_text_slm_fallback,
+            branch_cut_recovery_enabled=args.enable_branch_cut_recovery,
+            branch_cut_recovery_steps=args.branch_cut_recovery_steps,
+            branch_cut_skeleton_window=args.branch_cut_skeleton_window,
+            branch_cut_skeleton_threshold=args.branch_cut_skeleton_threshold,
         )
         write_problem_outputs(
             out_dir,

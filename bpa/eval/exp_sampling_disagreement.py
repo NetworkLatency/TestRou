@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -70,6 +71,113 @@ def _completion_mean_logprob(completion: Any) -> float | None:
     return (sum(values) / len(values)) if values else None
 
 
+def _completion_token_logprob(record: Any, token_id: int) -> float | None:
+    if not isinstance(record, dict):
+        return None
+    value = record.get(token_id)
+    if value is None:
+        value = record.get(str(token_id))
+    if value is None and len(record) == 1:
+        value = next(iter(record.values()))
+    if value is None:
+        return None
+    try:
+        return logprob_value(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _entropy_from_step_logprobs(record: Any) -> float | None:
+    if not isinstance(record, dict) or not record:
+        return None
+    values: list[float] = []
+    for value in record.values():
+        try:
+            lp = logprob_value(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(lp):
+            values.append(lp)
+    if len(values) < 2:
+        return None
+    max_lp = max(values)
+    weights = [math.exp(lp - max_lp) for lp in values]
+    total = sum(weights)
+    if total <= 0.0:
+        return None
+    probs = [weight / total for weight in weights]
+    return -sum(prob * math.log(prob) for prob in probs if prob > 0.0)
+
+
+def _series_mean(values: list[float]) -> float | None:
+    return sum(values) / len(values) if values else None
+
+
+def _series_variance(values: list[float]) -> float | None:
+    if not values:
+        return None
+    mean = sum(values) / len(values)
+    return sum((value - mean) ** 2 for value in values) / len(values)
+
+
+def _series_mean_abs_delta(values: list[float]) -> float | None:
+    if len(values) < 2:
+        return None
+    return sum(abs(values[idx] - values[idx - 1]) for idx in range(1, len(values))) / (len(values) - 1)
+
+
+def _series_max_abs_delta(values: list[float]) -> float | None:
+    if len(values) < 2:
+        return None
+    return max(abs(values[idx] - values[idx - 1]) for idx in range(1, len(values)))
+
+
+def _rollout_dynamics_metrics(completion: Any, *, spike_threshold: float = 1.5) -> dict[str, Any]:
+    token_ids = list(getattr(completion, "token_ids", []) or [])
+    logprob_steps = list(getattr(completion, "logprobs", []) or [])
+    token_logprobs: list[float | None] = []
+    surprisals: list[float] = []
+    entropies: list[float] = []
+    for token_id, step in zip(token_ids, logprob_steps):
+        token_logprob = _completion_token_logprob(step, int(token_id))
+        token_logprobs.append(token_logprob)
+        if token_logprob is not None and math.isfinite(token_logprob):
+            surprisals.append(max(0.0, -token_logprob))
+        entropy = _entropy_from_step_logprobs(step)
+        if entropy is not None:
+            entropies.append(entropy)
+
+    surprisal_mean = _series_mean(surprisals)
+    surprisal_var = _series_variance(surprisals)
+    surprisal_mean_abs_delta = _series_mean_abs_delta(surprisals)
+    surprisal_max_abs_delta = _series_max_abs_delta(surprisals)
+    surprisal_spike_ratio = (
+        sum(1 for value in surprisals if value >= spike_threshold) / len(surprisals)
+        if surprisals
+        else None
+    )
+    entropy_mean = _series_mean(entropies)
+    entropy_var = _series_variance(entropies)
+    entropy_mean_abs_delta = _series_mean_abs_delta(entropies)
+    entropy_max_abs_delta = _series_max_abs_delta(entropies)
+    return {
+        "token_logprobs": token_logprobs,
+        "token_surprisals": surprisals,
+        "topk_entropies": entropies,
+        "surprisal_mean": surprisal_mean,
+        "surprisal_var": surprisal_var,
+        "surprisal_mean_abs_delta": surprisal_mean_abs_delta,
+        "surprisal_max_abs_delta": surprisal_max_abs_delta,
+        "surprisal_spike_ratio": surprisal_spike_ratio,
+        "entropy_mean": entropy_mean,
+        "entropy_var": entropy_var,
+        "entropy_mean_abs_delta": entropy_mean_abs_delta,
+        "entropy_max_abs_delta": entropy_max_abs_delta,
+        "dynamics_num_scored_tokens": len(surprisals),
+        "dynamics_num_entropy_tokens": len(entropies),
+    }
+
+
 def _sample_probe_rollouts(
     state: GenerationState,
     slm,
@@ -78,6 +186,7 @@ def _sample_probe_rollouts(
     probe_temperature: float,
     probe_max_tokens: int,
     probe_stop: str,
+    probe_logprobs_topk: int = 1,
 ) -> tuple[dict[str, Any], dict[str, float | int]]:
     tokenizer = slm.ensure_tokenizer()
     rendered = render_for_continuation(state.problem_text, state.assistant_prefix_text, tokenizer)
@@ -87,7 +196,7 @@ def _sample_probe_rollouts(
         temperature=probe_temperature,
         stop=[probe_stop],
         include_stop_str_in_output=True,
-        logprobs=1,
+        logprobs=max(1, int(probe_logprobs_topk)),
         n=probe_k,
     )
     generate_start = time.time()
@@ -101,6 +210,7 @@ def _sample_probe_rollouts(
         text = getattr(completion, "text", "") or ""
         token_ids = list(getattr(completion, "token_ids", []) or [])
         mean_logprob = _completion_mean_logprob(completion)
+        dynamics_metrics = _rollout_dynamics_metrics(completion)
         step_evidence = extract_step_evidence(text, context_text)
         probe_decode_tokens += len(token_ids)
         rollouts.append(
@@ -111,6 +221,7 @@ def _sample_probe_rollouts(
                 "token_count": len(token_ids),
                 "finish_reason": str(getattr(completion, "finish_reason", "") or ""),
                 "mean_logprob": mean_logprob,
+                **dynamics_metrics,
                 "step_evidence": step_evidence,
                 **{f"evidence_{key}": value for key, value in step_evidence.items() if key != "evidence_channels"},
                 "evidence_channels": step_evidence["evidence_channels"],
@@ -141,6 +252,7 @@ def run_sampling_disagreement(
     probe_temperature: float = 0.7,
     probe_max_tokens: int = 32,
     probe_stop: str = "\n\n",
+    probe_logprobs_topk: int = 1,
 ) -> tuple[BPAResult, list[dict[str, Any]], dict[str, float | int]]:
     if probe_k < 3:
         raise ValueError("probe_k must be >= 3 for this diagnostic.")
@@ -178,6 +290,7 @@ def run_sampling_disagreement(
                     probe_temperature=probe_temperature,
                     probe_max_tokens=probe_max_tokens,
                     probe_stop=probe_stop,
+                    probe_logprobs_topk=probe_logprobs_topk,
                 )
         except ContextBudgetExceeded as exc:
             state.phase = Phase.DONE
@@ -339,6 +452,7 @@ def main() -> None:
     parser.add_argument("--probe-k", type=int, default=4)
     parser.add_argument("--probe-temperature", type=float, default=0.7)
     parser.add_argument("--probe-max-tokens", type=int, default=32)
+    parser.add_argument("--probe-logprobs-topk", type=int, default=1)
     parser.add_argument("--probe-stop", default="\n\n")
     args = parser.parse_args()
 
@@ -357,6 +471,7 @@ def main() -> None:
             probe_temperature=args.probe_temperature,
             probe_max_tokens=args.probe_max_tokens,
             probe_stop=args.probe_stop,
+            probe_logprobs_topk=args.probe_logprobs_topk,
         )
         summary_rows.append(build_problem_summary(problem, result, probe_rows, probe_cost, args.dataset))
         all_probe_rows.extend(enrich_probe_rows(problem, probe_rows, result, args.dataset))
