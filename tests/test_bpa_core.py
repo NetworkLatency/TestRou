@@ -868,6 +868,35 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(boundaries[0]["step_type_consensus_support_count"], 0)
         self.assertEqual(boundaries[0]["step_type_consensus_group_counts"], {"reflection_transition": 4})
 
+    def test_step_type_routing_rejects_bridge_operation_labels(self):
+        slm = WeightedSamplingProbeEngine(
+            outputs=[
+                ("First step.\n\n", "stop"),
+            ],
+            probe_outputs=[
+                ("Squaring both sides:\n\n", -0.1, "stop"),
+                ("Compute each term:\n\n", -0.2, "stop"),
+                ("We can write this as:\n\n", -0.3, "stop"),
+                ("Bring all terms to one side:\n\n", -0.4, "stop"),
+            ],
+        )
+        llm = SequencedEngine([(r"\boxed{9}", "eos")])
+        result, boundaries, _ = run_disagreement_routing(
+            "Problem: x?",
+            slm,
+            llm,
+            BPAConfig(max_total_tokens=300),
+            min_agreement_count=3,
+            probe_k=4,
+            probe_temperature=0.7,
+            probe_max_tokens=32,
+            enable_step_type_routing=True,
+        )
+        self.assertEqual(result.answer, "9")
+        self.assertTrue(boundaries[0]["routed_to_llm"])
+        self.assertEqual(boundaries[0]["step_type_consensus_support_count"], 0)
+        self.assertEqual(boundaries[0]["step_type_consensus_group_counts"], {"bridge_operation": 4})
+
     def test_probe_rollouts_record_surprisal_and_entropy_metrics(self):
         slm = WeightedSamplingProbeEngine(
             outputs=[
@@ -898,6 +927,9 @@ class CoreTests(unittest.TestCase):
         self.assertIn("token_surprisals", rollout)
         self.assertGreater(rollout["surprisal_var"], 0.0)
         self.assertGreater(len(rollout["topk_entropies"]), 0)
+        self.assertIn("probe_confidence_best", boundaries[0])
+        self.assertIsNotNone(boundaries[0]["probe_confidence_best"])
+        self.assertEqual(boundaries[0]["confidence_step_index"], 1)
 
     def test_dynamics_routing_reuses_structured_all_none(self):
         structured = [-0.1, -0.75, -0.12, -0.7, -0.15, -0.65]
@@ -1046,6 +1078,54 @@ class CoreTests(unittest.TestCase):
         discarded = [row for row in steps if row.get("discarded_by_branch_cut")]
         self.assertEqual([row["step_idx"] for row in discarded], [1, 2, 3])
         self.assertEqual(steps[-1]["decision"], "llm_branch_recovery")
+
+    def test_trajectory_monitor_enters_llm_only_recovery(self):
+        slm = WeightedSamplingProbeEngine(
+            outputs=[
+                ("First step.\n\n", "stop"),
+            ],
+            probe_outputs=[
+                ("no evidence\n\n", -0.1, "stop"),
+                ("still no evidence\n\n", -0.2, "stop"),
+                ("plain text\n\n", -0.3, "stop"),
+                ("another text\n\n", -0.4, "stop"),
+                ("no evidence\n\n", -0.1, "stop"),
+                ("still no evidence\n\n", -0.2, "stop"),
+                ("plain text\n\n", -0.3, "stop"),
+                ("another text\n\n", -0.4, "stop"),
+                ("no evidence\n\n", -0.1, "stop"),
+                ("still no evidence\n\n", -0.2, "stop"),
+                ("plain text\n\n", -0.3, "stop"),
+                ("another text\n\n", -0.4, "stop"),
+            ],
+        )
+        llm = SequencedEngine(
+            [
+                ("Wait, maybe this is wrong.\n\n", "stop"),
+                ("But I am not sure.\n\n", "stop"),
+                ("Maybe another way is needed.\n\n", "stop"),
+                (r"The answer is \boxed{9}.", "eos"),
+            ]
+        )
+        result, boundaries, _ = run_disagreement_routing(
+            "Problem: x?",
+            slm,
+            llm,
+            BPAConfig(max_total_tokens=500),
+            min_agreement_count=3,
+            probe_k=4,
+            probe_temperature=0.7,
+            probe_max_tokens=32,
+            enable_trajectory_monitor=True,
+            trajectory_monitor_window=4,
+            trajectory_uncertain_threshold=3,
+            trajectory_recovery_steps=1,
+        )
+        self.assertEqual(result.answer, "9")
+        self.assertEqual(len(boundaries), 3)
+        steps = [event.data["steps"] for event in result.state.trace if event.event == "step_logs"][0]
+        self.assertEqual(steps[-1]["decision"], "llm_trajectory_recovery")
+        self.assertTrue(any(event.event == "trajectory_monitor_recovery" for event in result.state.trace))
 
     def test_llm_colon_continuation_skips_next_probe(self):
         slm = WeightedSamplingProbeEngine(

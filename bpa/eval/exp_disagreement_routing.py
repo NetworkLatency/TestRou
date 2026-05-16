@@ -71,9 +71,15 @@ SUMMARY_FIELDS = [
     "pure_text_slm_fallback_enabled",
     "branch_cut_recovery_enabled",
     "num_branch_cut_recoveries",
+    "num_trajectory_recoveries",
+    "num_trajectory_finalizations",
     "branch_cut_recovery_steps",
     "branch_cut_skeleton_window",
     "branch_cut_skeleton_threshold",
+    "trajectory_monitor_enabled",
+    "trajectory_monitor_window",
+    "trajectory_recovery_steps",
+    "max_trajectory_recoveries",
     "total_wall_time",
     "problem_wall_time",
     "slm_decode_tokens",
@@ -92,6 +98,7 @@ SUMMARY_FIELDS = [
 
 
 STEP_TYPE_EXECUTION = "execution"
+STEP_TYPE_BRIDGE_OPERATION = "bridge_operation"
 STEP_TYPE_REFLECTION_TRANSITION = "reflection_transition"
 STEP_TYPE_UNKNOWN = "unknown"
 
@@ -119,6 +126,32 @@ _STEP_TYPE_EXECUTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("derivation_marker", re.compile(r"^\s*(?:so|therefore|thus|hence|then)\b", re.IGNORECASE)),
     ("mechanical_verb", re.compile(r"^\s*(?:substituting|plugging|computing|calculating|expanding|simplifying|factoring|multiplying|dividing|adding|subtracting|combining|solving|rearranging|reducing|evaluating)\b", re.IGNORECASE)),
     ("result_phrase", re.compile(r"^\s*(?:we\s+(?:get|obtain|have|find|see)|this\s+(?:gives|means|implies|becomes|is)|which\s+(?:gives|means|implies)|it\s+(?:follows|is))\b", re.IGNORECASE)),
+)
+
+_STEP_TYPE_BRIDGE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("bridge_write", re.compile(r"^\s*(?:we\s+can\s+)?(?:write|rewrite)\s+(?:this|it)\s+as\b", re.IGNORECASE)),
+    ("bridge_move_terms", re.compile(r"^\s*(?:bring|move)\s+all\s+terms\b", re.IGNORECASE)),
+    ("bridge_square", re.compile(r"^\s*(?:now,?\s*)?(?:square|squaring)\b", re.IGNORECASE)),
+    ("bridge_compute", re.compile(r"^\s*(?:now,?\s*)?(?:compute|computing|calculate|calculating)\s+(?:each|the|this|these)?\s*(?:term|terms|expression|value|sum)?\b", re.IGNORECASE)),
+    ("bridge_expand", re.compile(r"^\s*(?:now,?\s*)?(?:expand|expanding|simplify|simplifying|factor|factoring)\b", re.IGNORECASE)),
+    ("bridge_substitute", re.compile(r"^\s*(?:now,?\s*)?(?:substitute|substituting|plug|plugging)\b", re.IGNORECASE)),
+    ("bridge_operation", re.compile(r"^\s*(?:using|apply|applying|divide|dividing|multiply|multiplying|add|adding|subtract|subtracting)\b", re.IGNORECASE)),
+)
+
+_UNCERTAIN_MARKER_RE = re.compile(
+    r"\b(?:wait|hmm|actually|but|however|maybe|perhaps|not\s+sure|mistake|wrong|conflict|contradict|check|verify|recheck|doubt)\b",
+    re.IGNORECASE,
+)
+_TRANSITION_MARKER_RE = re.compile(
+    r"\b(?:alternatively|instead|another\s+way|different\s+approach|try\s+another|let\s+me\s+try|suppose|consider|case|cases)\b",
+    re.IGNORECASE,
+)
+_COMMIT_MARKER_RE = re.compile(
+    r"\b(?:therefore|thus|hence|so\s+we\s+(?:have|get|obtain|find)|this\s+(?:gives|implies|means)|we\s+(?:get|obtain|find)|must\s+be|answer\s+is|final\s+answer|boxed)\b|=",
+    re.IGNORECASE,
+)
+_ANSWER_CANDIDATE_RE = re.compile(
+    r"(?is)\b(?:final\s+answer|the\s+answer|answer|result)\b\s*(?:is|=|:)?\s*(?:\\boxed\s*\{)?\s*([A-Za-z0-9+\-*/^().,\\{}]+)"
 )
 
 BRANCH_CUT_RECOVERY_BRIDGE = (
@@ -185,6 +218,29 @@ def _step_type_scan_window(text: str, *, max_tokens: int = 16) -> str:
     return re.sub(r"\s+", " ", head).strip()
 
 
+def _word_count(text: str) -> int:
+    return len(re.findall(r"[A-Za-z0-9]+|\\[A-Za-z]+", text))
+
+
+def _has_commit_expression(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text or "")
+    return bool(_COMMIT_MARKER_RE.search(normalized) or re.search(r"\\boxed\s*\{", normalized))
+
+
+def _classify_bridge_operation(text: str) -> tuple[bool, str | None]:
+    normalized = re.sub(r"\s+", " ", text or "").strip()
+    if not normalized:
+        return False, None
+    short_or_label = normalized.rstrip().endswith(":") or _word_count(normalized) <= 18
+    if not short_or_label:
+        return False, None
+    for signal, pattern in _STEP_TYPE_BRIDGE_PATTERNS:
+        if pattern.search(normalized):
+            if normalized.rstrip().endswith(":") or not _has_commit_expression(normalized):
+                return True, signal
+    return False, None
+
+
 def _classify_step_type(text: Any) -> dict[str, str]:
     normalized = re.sub(r"\s+", " ", str(text or "").strip())
     head = _step_type_head(normalized)
@@ -206,6 +262,13 @@ def _classify_step_type(text: Any) -> dict[str, str]:
                 "step_type_signal": signal,
                 "step_type_head": head,
             }
+    is_bridge, bridge_signal = _classify_bridge_operation(normalized)
+    if is_bridge:
+        return {
+            "step_type": STEP_TYPE_BRIDGE_OPERATION,
+            "step_type_signal": bridge_signal or "bridge_operation",
+            "step_type_head": head,
+        }
     for signal, pattern in _STEP_TYPE_EXECUTION_PATTERNS:
         if pattern.search(normalized):
             return {"step_type": STEP_TYPE_EXECUTION, "step_type_signal": signal, "step_type_head": head}
@@ -389,6 +452,179 @@ def _zero_probe_cost() -> dict[str, float | int]:
         "probe_generate_calls": 0,
         "probe_wall_time": 0.0,
     }
+
+
+def _linear_slope(values: list[float]) -> float | None:
+    if len(values) < 2:
+        return None
+    n = len(values)
+    x_mean = (n - 1) / 2.0
+    y_mean = sum(values) / n
+    denom = sum((idx - x_mean) ** 2 for idx in range(n))
+    if denom <= 0.0:
+        return None
+    return sum((idx - x_mean) * (value - y_mean) for idx, value in enumerate(values)) / denom
+
+
+def _turning_points(values: list[float]) -> int:
+    if len(values) < 3:
+        return 0
+    signs: list[int] = []
+    for idx in range(1, len(values)):
+        delta = values[idx] - values[idx - 1]
+        if abs(delta) < 1e-9:
+            continue
+        signs.append(1 if delta > 0 else -1)
+    return sum(1 for idx in range(1, len(signs)) if signs[idx] != signs[idx - 1])
+
+
+def _probe_confidence_metrics(probe_row: dict[str, Any]) -> dict[str, Any]:
+    values = [
+        float(rollout["mean_logprob"])
+        for rollout in probe_row.get("rollouts") or []
+        if rollout.get("mean_logprob") is not None
+    ]
+    if not values:
+        return {
+            "probe_confidence_best": None,
+            "probe_confidence_mean": None,
+            "probe_confidence_var": None,
+            "probe_confidence_spread": None,
+            "probe_confidence_num_rollouts": 0,
+        }
+    mean = sum(values) / len(values)
+    return {
+        "probe_confidence_best": max(values),
+        "probe_confidence_mean": mean,
+        "probe_confidence_var": sum((value - mean) ** 2 for value in values) / len(values),
+        "probe_confidence_spread": max(values) - min(values),
+        "probe_confidence_num_rollouts": len(values),
+    }
+
+
+def _candidate_answer_from_text(text: str) -> str | None:
+    boxed = re.findall(r"\\boxed\s*\{([^{}\r\n]{1,80})\}", text)
+    if boxed:
+        return re.sub(r"\s+", "", boxed[-1].strip())
+    matches = list(_ANSWER_CANDIDATE_RE.finditer(text))
+    if not matches:
+        return None
+    candidate = matches[-1].group(1).strip()
+    candidate = candidate.split("}", 1)[0].strip()
+    candidate = re.split(r"[\s,.;\r\n]+", candidate, maxsplit=1)[0].strip()
+    candidate = re.sub(r"^\$|\$$", "", candidate)
+    return re.sub(r"\s+", "", candidate)[:80] or None
+
+
+def _step_expression_flags(text: str, step_type: str | None = None) -> dict[str, Any]:
+    normalized = re.sub(r"\s+", " ", text or "").strip()
+    classified = _classify_step_type(normalized)
+    current_type = step_type or classified["step_type"]
+    return {
+        "expr_uncertain": bool(_UNCERTAIN_MARKER_RE.search(normalized)),
+        "expr_transition": bool(_TRANSITION_MARKER_RE.search(normalized)) or current_type == STEP_TYPE_REFLECTION_TRANSITION,
+        "expr_commit": bool(_COMMIT_MARKER_RE.search(normalized)),
+        "expr_bridge_operation": current_type == STEP_TYPE_BRIDGE_OPERATION,
+        "monitor_step_type": current_type,
+        "candidate_answer": _candidate_answer_from_text(normalized),
+    }
+
+
+class TrajectoryMonitor:
+    def __init__(self, *, window: int, confidence_window: int) -> None:
+        self.window = max(2, int(window))
+        self.confidence_window = max(2, int(confidence_window))
+        self.records: list[dict[str, Any]] = []
+        self.confidence_values: list[float] = []
+
+    def record(self, log_row: dict[str, Any], boundary_row: dict[str, Any] | None = None) -> dict[str, Any]:
+        flags = _step_expression_flags(str(log_row.get("step_text") or ""), log_row.get("monitor_step_type"))
+        confidence_metrics = _probe_confidence_metrics(boundary_row or {})
+        confidence_value = confidence_metrics.get("probe_confidence_best")
+        if isinstance(confidence_value, (float, int)):
+            self.confidence_values.append(float(confidence_value))
+
+        recent_conf = self.confidence_values[-self.confidence_window :]
+        confidence_delta = None
+        confidence_curvature = None
+        if len(self.confidence_values) >= 2:
+            confidence_delta = self.confidence_values[-1] - self.confidence_values[-2]
+        if len(self.confidence_values) >= 3:
+            confidence_curvature = (
+                self.confidence_values[-1]
+                - 2.0 * self.confidence_values[-2]
+                + self.confidence_values[-3]
+            )
+        snapshot = {
+            **confidence_metrics,
+            "confidence_step_index": len(self.confidence_values),
+            "confidence_delta": confidence_delta,
+            "confidence_curvature": confidence_curvature,
+            "confidence_window_slope": _linear_slope(recent_conf),
+            "confidence_window_turning_points": _turning_points(recent_conf),
+            "confidence_window_min": min(recent_conf) if recent_conf else None,
+            "confidence_window_max": max(recent_conf) if recent_conf else None,
+        }
+        record = {
+            "step_idx": log_row.get("step_idx"),
+            "decision": log_row.get("decision"),
+            "generation_source": log_row.get("generation_source"),
+            "prefix_consensus_stage": log_row.get("prefix_consensus_stage"),
+            "step_skeleton": log_row.get("step_skeleton"),
+            "hard_accept": log_row.get("prefix_consensus_stage") == 1,
+            **flags,
+            **snapshot,
+        }
+        self.records.append(record)
+        log_row.update({key: value for key, value in flags.items() if key != "candidate_answer"})
+        log_row["candidate_answer"] = flags["candidate_answer"]
+        log_row.update(snapshot)
+        if boundary_row is not None:
+            boundary_row.update(snapshot)
+            boundary_row["candidate_answer"] = flags["candidate_answer"]
+            boundary_row["expr_uncertain"] = flags["expr_uncertain"]
+            boundary_row["expr_transition"] = flags["expr_transition"]
+            boundary_row["expr_bridge_operation"] = flags["expr_bridge_operation"]
+        return record
+
+    def detect(
+        self,
+        *,
+        uncertain_threshold: int,
+        bridge_threshold: int,
+        answer_repeat_threshold: int,
+        answer_churn_unique_threshold: int,
+    ) -> dict[str, Any] | None:
+        recent = self.records[-self.window :]
+        if len(recent) < min(4, self.window):
+            return None
+        uncertain_count = sum(1 for row in recent if row.get("expr_uncertain") or row.get("expr_transition"))
+        bridge_count = sum(1 for row in recent if row.get("expr_bridge_operation"))
+        hard_accept_count = sum(1 for row in recent if row.get("hard_accept"))
+        candidates = [str(row.get("candidate_answer")) for row in recent if row.get("candidate_answer")]
+        candidate_counts = {candidate: candidates.count(candidate) for candidate in sorted(set(candidates))}
+        repeated_candidate = max(candidate_counts.values(), default=0)
+        unique_candidates = len(candidate_counts)
+
+        base = {
+            "window": len(recent),
+            "uncertain_count": uncertain_count,
+            "bridge_operation_count": bridge_count,
+            "hard_accept_count": hard_accept_count,
+            "candidate_counts": candidate_counts,
+            "unique_candidate_count": unique_candidates,
+            "confidence_window_slope": self.records[-1].get("confidence_window_slope"),
+            "confidence_window_turning_points": self.records[-1].get("confidence_window_turning_points"),
+        }
+        if unique_candidates >= answer_churn_unique_threshold and uncertain_count >= 2:
+            return {**base, "trigger_reason": "answer_churn", "action": "soft_recovery"}
+        if repeated_candidate >= answer_repeat_threshold and uncertain_count <= 1:
+            return {**base, "trigger_reason": "answer_converged", "action": "final_answer"}
+        if uncertain_count >= uncertain_threshold and hard_accept_count == 0:
+            return {**base, "trigger_reason": "reflection_loop", "action": "soft_recovery"}
+        if bridge_count >= bridge_threshold and hard_accept_count == 0 and not candidates:
+            return {**base, "trigger_reason": "bridge_loop", "action": "soft_recovery"}
+        return None
 
 
 def _step_ends_with_colon(step_text: str, finish: str) -> bool:
@@ -661,7 +897,7 @@ def _selected_dynamics_consensus_rollout(
     structured_group = [
         rollout
         for rollout in groups.get(DYNAMICS_STRUCTURED, [])
-        if rollout.get("step_type") != STEP_TYPE_REFLECTION_TRANSITION
+        if rollout.get("step_type") not in {STEP_TYPE_REFLECTION_TRANSITION, STEP_TYPE_BRIDGE_OPERATION}
     ]
     support_count = len(structured_group)
     vote_fraction = support_count / len(rollouts) if rollouts else None
@@ -795,6 +1031,15 @@ def run_disagreement_routing(
     branch_cut_skeleton_threshold: int = 3,
     branch_cut_recovery_steps: int = 5,
     max_branch_cut_recoveries: int = 2,
+    enable_trajectory_monitor: bool = False,
+    trajectory_monitor_window: int = 12,
+    trajectory_confidence_window: int = 12,
+    trajectory_recovery_steps: int = 5,
+    max_trajectory_recoveries: int = 2,
+    trajectory_uncertain_threshold: int = 6,
+    trajectory_bridge_threshold: int = 5,
+    trajectory_answer_repeat_threshold: int = 3,
+    trajectory_answer_churn_unique_threshold: int = 2,
 ) -> tuple[BPAResult, list[dict[str, Any]], dict[str, float | int]]:
     if min_agreement_count > probe_k:
         raise ValueError("min_agreement_count cannot exceed probe_k")
@@ -819,6 +1064,10 @@ def run_disagreement_routing(
     consecutive_step_type_exec = 0
     branch_cut_recoveries = 0
     branch_recovery_steps_remaining = 0
+    trajectory_recoveries = 0
+    trajectory_finalizations = 0
+    trajectory_recovery_steps_remaining = 0
+    monitor = TrajectoryMonitor(window=trajectory_monitor_window, confidence_window=trajectory_confidence_window)
 
     def maybe_start_branch_cut_recovery(trigger_reason: str, *, threshold: int | None = None) -> bool:
         nonlocal branch_cut_recoveries, branch_recovery_steps_remaining, rep, force_next_llm, consecutive_step_type_exec
@@ -846,6 +1095,47 @@ def run_disagreement_routing(
         consecutive_step_type_exec = 0
         return True
 
+    def maybe_start_trajectory_recovery(event: dict[str, Any] | None) -> bool:
+        nonlocal trajectory_recoveries, trajectory_finalizations, trajectory_recovery_steps_remaining, force_next_llm, consecutive_step_type_exec
+        if not enable_trajectory_monitor or event is None:
+            return False
+        if trajectory_recovery_steps_remaining > 0:
+            return False
+        action = str(event.get("action") or "soft_recovery")
+        if action == "final_answer":
+            if not _can_force_final_answer_from_thinking(state, config):
+                return False
+            trajectory_finalizations += 1
+            state.trace.append(TraceEvent(state.step_count, "trajectory_monitor_final_answer", event))
+            _append_forced_close_think(state)
+            force_next_llm = False
+            consecutive_step_type_exec = 0
+            return True
+        if trajectory_recoveries >= max_trajectory_recoveries:
+            return False
+        trajectory_recoveries += 1
+        trajectory_recovery_steps_remaining = max(trajectory_recovery_steps, 0)
+        state.trace.append(
+            TraceEvent(
+                state.step_count,
+                "trajectory_monitor_recovery",
+                {**event, "recovery_id": trajectory_recoveries, "recovery_steps": trajectory_recovery_steps_remaining},
+            )
+        )
+        force_next_llm = False
+        consecutive_step_type_exec = 0
+        return trajectory_recovery_steps_remaining > 0
+
+    def record_trajectory_step(log_row: dict[str, Any], boundary_row: dict[str, Any] | None = None) -> bool:
+        monitor.record(log_row, boundary_row)
+        event = monitor.detect(
+            uncertain_threshold=trajectory_uncertain_threshold,
+            bridge_threshold=trajectory_bridge_threshold,
+            answer_repeat_threshold=trajectory_answer_repeat_threshold,
+            answer_churn_unique_threshold=trajectory_answer_churn_unique_threshold,
+        )
+        return maybe_start_trajectory_recovery(event)
+
     while state.phase != Phase.DONE:
         if state.slm_decode_tokens + state.llm_decode_tokens >= config.max_total_tokens:
             state.trace.append(TraceEvent(state.step_count, "total_token_budget_exhausted", {}))
@@ -866,20 +1156,19 @@ def run_disagreement_routing(
             state.assistant_prefix_text += step_text_normalized
             state.step_count += 1
 
-            step_logs.append(
-                {
-                    "step_idx": state.step_count - 1,
-                    "decision": "slm_initial",
-                    "generation_source": "slm",
-                    "finish_reason": finish,
-                    "step_text": step_text_normalized,
-                    "generated_step_tokens": generated_step_tokens,
-                    "reused_probe_rollout": False,
-                    "continued_probe_rollout": False,
-                    "selected_rollout_idx": None,
-                    "step_skeleton": normalize_step_skeleton(step_text_normalized),
-                }
-            )
+            log_row = {
+                "step_idx": state.step_count - 1,
+                "decision": "slm_initial",
+                "generation_source": "slm",
+                "finish_reason": finish,
+                "step_text": step_text_normalized,
+                "generated_step_tokens": generated_step_tokens,
+                "reused_probe_rollout": False,
+                "continued_probe_rollout": False,
+                "selected_rollout_idx": None,
+                "step_skeleton": normalize_step_skeleton(step_text_normalized),
+            }
+            step_logs.append(log_row)
 
             if generated_step_tokens <= 0 and not step_text_normalized.strip():
                 state.phase = Phase.DONE
@@ -899,6 +1188,8 @@ def run_disagreement_routing(
                 state.stop_reason = trigger
                 break
             if maybe_start_branch_cut_recovery("skeleton_repeat"):
+                continue
+            if record_trajectory_step(log_row):
                 continue
 
             if _is_eos_finish(finish):
@@ -944,6 +1235,51 @@ def run_disagreement_routing(
             state.stop_reason = _final_answer_stop_reason(finish)
             continue
 
+        if trajectory_recovery_steps_remaining > 0:
+            decode_tokens_before = state.slm_decode_tokens + state.llm_decode_tokens
+            try:
+                step_text, finish = _llm_generate_step(state, llm, config)
+            except ContextBudgetExceeded as exc:
+                state.phase = Phase.DONE
+                state.stop_reason = "context_budget"
+                state.trace.append(TraceEvent(state.step_count, "context_budget_exhausted", exc.to_trace_data()))
+                break
+            step_text_normalized = ensure_step_terminator(step_text, finish)
+            generated_step_tokens = state.slm_decode_tokens + state.llm_decode_tokens - decode_tokens_before
+            state.assistant_prefix_text += step_text_normalized
+            state.step_count += 1
+            trajectory_recovery_steps_remaining -= 1
+            consecutive_step_type_exec = 0
+            log_row = {
+                "step_idx": state.step_count - 1,
+                "decision": "llm_trajectory_recovery",
+                "generation_source": "llm",
+                "finish_reason": finish,
+                "step_text": step_text_normalized,
+                "generated_step_tokens": generated_step_tokens,
+                "reused_probe_rollout": False,
+                "continued_probe_rollout": False,
+                "selected_rollout_idx": None,
+                "trajectory_recovery_id": trajectory_recoveries,
+                "trajectory_recovery_steps_remaining": trajectory_recovery_steps_remaining,
+                "step_skeleton": normalize_step_skeleton(step_text_normalized),
+            }
+            step_logs.append(log_row)
+            if generated_step_tokens <= 0 and not step_text_normalized.strip():
+                state.phase = Phase.DONE
+                state.stop_reason = "empty_step"
+                state.trace.append(TraceEvent(state.step_count, "empty_step", {}))
+                break
+            if _is_eos_finish(finish):
+                state.phase = Phase.DONE
+                state.stop_reason = "eos"
+                record_trajectory_step(log_row)
+                continue
+            if record_trajectory_step(log_row):
+                continue
+            force_next_llm = trajectory_recovery_steps_remaining <= 0 and _step_ends_with_colon(step_text_normalized, finish)
+            continue
+
         if branch_recovery_steps_remaining > 0:
             decode_tokens_before = state.slm_decode_tokens + state.llm_decode_tokens
             try:
@@ -980,6 +1316,8 @@ def run_disagreement_routing(
                 state.stop_reason = "empty_step"
                 state.trace.append(TraceEvent(state.step_count, "empty_step", {}))
                 break
+            if record_trajectory_step(step_logs[-1]):
+                continue
             if _is_eos_finish(finish):
                 state.phase = Phase.DONE
                 state.stop_reason = "eos"
@@ -1033,6 +1371,8 @@ def run_disagreement_routing(
                 state.stop_reason = trigger
                 break
             if maybe_start_branch_cut_recovery("skeleton_repeat"):
+                continue
+            if record_trajectory_step(step_logs[-1]):
                 continue
             if _is_eos_finish(finish):
                 state.phase = Phase.DONE
@@ -1118,7 +1458,7 @@ def run_disagreement_routing(
                 "prefix_consensus_support_by_rollout": {
                     str(_rollout_idx_sort_value(rollout)): (
                         rollout.get("dynamics_category") == DYNAMICS_STRUCTURED
-                        and rollout.get("step_type") != STEP_TYPE_REFLECTION_TRANSITION
+                        and rollout.get("step_type") not in {STEP_TYPE_REFLECTION_TRANSITION, STEP_TYPE_BRIDGE_OPERATION}
                     )
                     for rollout in probe_row.get("rollouts") or []
                 },
@@ -1266,6 +1606,7 @@ def run_disagreement_routing(
             "continued_probe_rollout": continued_probe_rollout,
             "selected_rollout_idx": probe_row["selected_rollout_idx"],
             "prefix_consensus_stage": probe_row["prefix_consensus_stage"],
+            "monitor_step_type": selected_rollout.get("step_type") if selected_rollout is not None else None,
             "step_skeleton": normalize_step_skeleton(step_text_normalized),
         }
         step_logs.append(log_row)
@@ -1288,6 +1629,8 @@ def run_disagreement_routing(
             state.stop_reason = trigger
             break
         if maybe_start_branch_cut_recovery("skeleton_repeat"):
+            continue
+        if record_trajectory_step(log_row, probe_row):
             continue
 
         if _is_eos_finish(finish):
@@ -1333,6 +1676,10 @@ def build_problem_summary(
     branch_cut_recovery_steps: int = 5,
     branch_cut_skeleton_window: int = 12,
     branch_cut_skeleton_threshold: int = 3,
+    trajectory_monitor_enabled: bool = False,
+    trajectory_monitor_window: int = 12,
+    trajectory_recovery_steps: int = 5,
+    max_trajectory_recoveries: int = 2,
 ) -> dict[str, Any]:
     correct = None
     if problem.gold_answer is not None:
@@ -1343,6 +1690,10 @@ def build_problem_summary(
     real_boundary_rows = list(boundary_rows)
     step_rows = _step_rows(result)
     num_branch_cut_recoveries = sum(1 for event in result.state.trace if event.event == "branch_cut_recovery")
+    num_trajectory_recoveries = sum(1 for event in result.state.trace if event.event == "trajectory_monitor_recovery")
+    num_trajectory_finalizations = sum(
+        1 for event in result.state.trace if event.event == "trajectory_monitor_final_answer"
+    )
     return {
         "dataset": dataset,
         "problem_id": problem.problem_id,
@@ -1381,9 +1732,15 @@ def build_problem_summary(
         "pure_text_slm_fallback_enabled": pure_text_slm_fallback_enabled,
         "branch_cut_recovery_enabled": branch_cut_recovery_enabled,
         "num_branch_cut_recoveries": num_branch_cut_recoveries,
+        "num_trajectory_recoveries": num_trajectory_recoveries,
+        "num_trajectory_finalizations": num_trajectory_finalizations,
         "branch_cut_recovery_steps": branch_cut_recovery_steps,
         "branch_cut_skeleton_window": branch_cut_skeleton_window,
         "branch_cut_skeleton_threshold": branch_cut_skeleton_threshold,
+        "trajectory_monitor_enabled": trajectory_monitor_enabled,
+        "trajectory_monitor_window": trajectory_monitor_window,
+        "trajectory_recovery_steps": trajectory_recovery_steps,
+        "max_trajectory_recoveries": max_trajectory_recoveries,
         "total_wall_time": result.total_wall_time,
         "problem_wall_time": problem_wall_time if problem_wall_time is not None else result.total_wall_time,
         "slm_decode_tokens": result.state.slm_decode_tokens,
@@ -1415,6 +1772,8 @@ def _summary_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_num_dynamics_reused_steps": _mean([row.get("num_dynamics_reused_steps") for row in rows]),
         "avg_num_pure_text_reused_steps": _mean([row.get("num_pure_text_reused_steps") for row in rows]),
         "avg_num_branch_cut_recoveries": _mean([row.get("num_branch_cut_recoveries") for row in rows]),
+        "avg_num_trajectory_recoveries": _mean([row.get("num_trajectory_recoveries") for row in rows]),
+        "avg_num_trajectory_finalizations": _mean([row.get("num_trajectory_finalizations") for row in rows]),
         "avg_main_decode_tokens": _mean([row.get("main_decode_tokens") for row in rows]),
         "avg_total_decode_tokens_including_probe": _mean(
             [row.get("total_decode_tokens_including_probe") for row in rows]
@@ -1427,6 +1786,8 @@ def _summary_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "total_dynamics_reused_steps": sum(float(row.get("num_dynamics_reused_steps") or 0.0) for row in rows),
         "total_pure_text_reused_steps": sum(float(row.get("num_pure_text_reused_steps") or 0.0) for row in rows),
         "total_branch_cut_recoveries": sum(float(row.get("num_branch_cut_recoveries") or 0.0) for row in rows),
+        "total_trajectory_recoveries": sum(float(row.get("num_trajectory_recoveries") or 0.0) for row in rows),
+        "total_trajectory_finalizations": sum(float(row.get("num_trajectory_finalizations") or 0.0) for row in rows),
         "total_main_decode_tokens": sum(float(row.get("main_decode_tokens") or 0.0) for row in rows),
         "total_decode_tokens_including_probe": sum(
             float(row.get("total_decode_tokens_including_probe") or 0.0) for row in rows
@@ -1602,6 +1963,15 @@ def main() -> None:
     parser.add_argument("--branch-cut-skeleton-threshold", type=int, default=3)
     parser.add_argument("--branch-cut-recovery-steps", type=int, default=5)
     parser.add_argument("--max-branch-cut-recoveries", type=int, default=2)
+    parser.add_argument("--enable-trajectory-monitor", action="store_true", help="Use expression-density and answer-convergence monitors to enter short LLM-only recovery or final-answer mode.")
+    parser.add_argument("--trajectory-monitor-window", type=int, default=12)
+    parser.add_argument("--trajectory-confidence-window", type=int, default=12)
+    parser.add_argument("--trajectory-recovery-steps", type=int, default=5)
+    parser.add_argument("--max-trajectory-recoveries", type=int, default=2)
+    parser.add_argument("--trajectory-uncertain-threshold", type=int, default=6)
+    parser.add_argument("--trajectory-bridge-threshold", type=int, default=5)
+    parser.add_argument("--trajectory-answer-repeat-threshold", type=int, default=3)
+    parser.add_argument("--trajectory-answer-churn-unique-threshold", type=int, default=2)
     parser.add_argument("--output-name", default=None, help="Optional diagnostics output folder name under disagreement_routing/.")
     parser.add_argument("--resume", action="store_true", help="Skip problems that already have complete per-problem outputs.")
     args = parser.parse_args()
@@ -1666,6 +2036,15 @@ def main() -> None:
             branch_cut_skeleton_threshold=args.branch_cut_skeleton_threshold,
             branch_cut_recovery_steps=args.branch_cut_recovery_steps,
             max_branch_cut_recoveries=args.max_branch_cut_recoveries,
+            enable_trajectory_monitor=args.enable_trajectory_monitor,
+            trajectory_monitor_window=args.trajectory_monitor_window,
+            trajectory_confidence_window=args.trajectory_confidence_window,
+            trajectory_recovery_steps=args.trajectory_recovery_steps,
+            max_trajectory_recoveries=args.max_trajectory_recoveries,
+            trajectory_uncertain_threshold=args.trajectory_uncertain_threshold,
+            trajectory_bridge_threshold=args.trajectory_bridge_threshold,
+            trajectory_answer_repeat_threshold=args.trajectory_answer_repeat_threshold,
+            trajectory_answer_churn_unique_threshold=args.trajectory_answer_churn_unique_threshold,
         )
         summary = build_problem_summary(
             dataset=args.dataset,
@@ -1695,6 +2074,10 @@ def main() -> None:
             branch_cut_recovery_steps=args.branch_cut_recovery_steps,
             branch_cut_skeleton_window=args.branch_cut_skeleton_window,
             branch_cut_skeleton_threshold=args.branch_cut_skeleton_threshold,
+            trajectory_monitor_enabled=args.enable_trajectory_monitor,
+            trajectory_monitor_window=args.trajectory_monitor_window,
+            trajectory_recovery_steps=args.trajectory_recovery_steps,
+            max_trajectory_recoveries=args.max_trajectory_recoveries,
         )
         write_problem_outputs(
             out_dir,
