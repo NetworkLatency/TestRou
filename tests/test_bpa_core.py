@@ -1120,6 +1120,8 @@ class CoreTests(unittest.TestCase):
             trajectory_monitor_window=4,
             trajectory_uncertain_threshold=3,
             trajectory_recovery_steps=1,
+            trajectory_min_steps_before_recovery=0,
+            trajectory_confidence_min_turning_points=0,
         )
         self.assertEqual(result.answer, "9")
         self.assertEqual(len(boundaries), 3)

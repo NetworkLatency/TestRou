@@ -80,6 +80,11 @@ SUMMARY_FIELDS = [
     "trajectory_monitor_window",
     "trajectory_recovery_steps",
     "max_trajectory_recoveries",
+    "trajectory_min_steps_before_recovery",
+    "trajectory_min_steps_before_finalization",
+    "trajectory_cooldown_steps",
+    "trajectory_confidence_min_turning_points",
+    "trajectory_confidence_max_slope_for_loop",
     "total_wall_time",
     "problem_wall_time",
     "slm_decode_tokens",
@@ -151,7 +156,8 @@ _COMMIT_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 _ANSWER_CANDIDATE_RE = re.compile(
-    r"(?is)\b(?:final\s+answer|the\s+answer|answer|result)\b\s*(?:is|=|:)?\s*(?:\\boxed\s*\{)?\s*([A-Za-z0-9+\-*/^().,\\{}]+)"
+    r"(?is)\b(?:final\s+answer|the\s+answer|answer)\b\s*(?:is|=|:)\s*(?:\\boxed\s*\{)?\s*"
+    r"([+-]?(?:\d+(?:/\d+)?|\d*\.\d+|\\frac\s*\{[^{}\r\n]{1,24}\}\s*\{[^{}\r\n]{1,24}\}|[A-Z]|\([^{}\r\n]{1,40}\)))"
 )
 
 BRANCH_CUT_RECOVERY_BRIDGE = (
@@ -587,6 +593,10 @@ class TrajectoryMonitor:
             boundary_row["expr_bridge_operation"] = flags["expr_bridge_operation"]
         return record
 
+    def reset_recent(self) -> None:
+        self.records.clear()
+        self.confidence_values.clear()
+
     def detect(
         self,
         *,
@@ -594,6 +604,10 @@ class TrajectoryMonitor:
         bridge_threshold: int,
         answer_repeat_threshold: int,
         answer_churn_unique_threshold: int,
+        min_steps_before_recovery: int,
+        min_steps_before_finalization: int,
+        confidence_min_turning_points: int,
+        confidence_max_slope_for_loop: float,
     ) -> dict[str, Any] | None:
         recent = self.records[-self.window :]
         if len(recent) < min(4, self.window):
@@ -605,6 +619,17 @@ class TrajectoryMonitor:
         candidate_counts = {candidate: candidates.count(candidate) for candidate in sorted(set(candidates))}
         repeated_candidate = max(candidate_counts.values(), default=0)
         unique_candidates = len(candidate_counts)
+        current_step_idx = int(self.records[-1].get("step_idx") or 0)
+        confidence_slope = self.records[-1].get("confidence_window_slope")
+        confidence_turns = self.records[-1].get("confidence_window_turning_points")
+        confidence_loop_confirmed = (
+            isinstance(confidence_turns, int)
+            and confidence_min_turning_points >= 0
+            and confidence_turns >= confidence_min_turning_points
+        ) or (
+            isinstance(confidence_slope, (float, int))
+            and float(confidence_slope) <= confidence_max_slope_for_loop
+        )
 
         base = {
             "window": len(recent),
@@ -613,16 +638,21 @@ class TrajectoryMonitor:
             "hard_accept_count": hard_accept_count,
             "candidate_counts": candidate_counts,
             "unique_candidate_count": unique_candidates,
-            "confidence_window_slope": self.records[-1].get("confidence_window_slope"),
-            "confidence_window_turning_points": self.records[-1].get("confidence_window_turning_points"),
+            "confidence_window_slope": confidence_slope,
+            "confidence_window_turning_points": confidence_turns,
+            "confidence_loop_confirmed": confidence_loop_confirmed,
+            "min_steps_before_recovery": min_steps_before_recovery,
+            "min_steps_before_finalization": min_steps_before_finalization,
         }
-        if unique_candidates >= answer_churn_unique_threshold and uncertain_count >= 2:
+        can_recover = current_step_idx >= min_steps_before_recovery and confidence_loop_confirmed
+        can_finalize = current_step_idx >= min_steps_before_finalization
+        if can_recover and unique_candidates >= answer_churn_unique_threshold and uncertain_count >= 2:
             return {**base, "trigger_reason": "answer_churn", "action": "soft_recovery"}
-        if repeated_candidate >= answer_repeat_threshold and uncertain_count <= 1:
+        if can_finalize and repeated_candidate >= answer_repeat_threshold and uncertain_count <= 1:
             return {**base, "trigger_reason": "answer_converged", "action": "final_answer"}
-        if uncertain_count >= uncertain_threshold and hard_accept_count == 0:
+        if can_recover and uncertain_count >= uncertain_threshold and hard_accept_count == 0:
             return {**base, "trigger_reason": "reflection_loop", "action": "soft_recovery"}
-        if bridge_count >= bridge_threshold and hard_accept_count == 0 and not candidates:
+        if can_recover and bridge_count >= bridge_threshold and hard_accept_count == 0 and not candidates:
             return {**base, "trigger_reason": "bridge_loop", "action": "soft_recovery"}
         return None
 
@@ -1036,6 +1066,11 @@ def run_disagreement_routing(
     trajectory_confidence_window: int = 12,
     trajectory_recovery_steps: int = 5,
     max_trajectory_recoveries: int = 2,
+    trajectory_min_steps_before_recovery: int = 80,
+    trajectory_min_steps_before_finalization: int = 180,
+    trajectory_cooldown_steps: int = 12,
+    trajectory_confidence_min_turning_points: int = 7,
+    trajectory_confidence_max_slope_for_loop: float = -0.02,
     trajectory_uncertain_threshold: int = 6,
     trajectory_bridge_threshold: int = 5,
     trajectory_answer_repeat_threshold: int = 3,
@@ -1067,6 +1102,7 @@ def run_disagreement_routing(
     trajectory_recoveries = 0
     trajectory_finalizations = 0
     trajectory_recovery_steps_remaining = 0
+    trajectory_cooldown_steps_remaining = 0
     monitor = TrajectoryMonitor(window=trajectory_monitor_window, confidence_window=trajectory_confidence_window)
 
     def maybe_start_branch_cut_recovery(trigger_reason: str, *, threshold: int | None = None) -> bool:
@@ -1096,7 +1132,8 @@ def run_disagreement_routing(
         return True
 
     def maybe_start_trajectory_recovery(event: dict[str, Any] | None) -> bool:
-        nonlocal trajectory_recoveries, trajectory_finalizations, trajectory_recovery_steps_remaining, force_next_llm, consecutive_step_type_exec
+        nonlocal trajectory_recoveries, trajectory_finalizations, trajectory_recovery_steps_remaining
+        nonlocal trajectory_cooldown_steps_remaining, force_next_llm, consecutive_step_type_exec
         if not enable_trajectory_monitor or event is None:
             return False
         if trajectory_recovery_steps_remaining > 0:
@@ -1115,6 +1152,7 @@ def run_disagreement_routing(
             return False
         trajectory_recoveries += 1
         trajectory_recovery_steps_remaining = max(trajectory_recovery_steps, 0)
+        trajectory_cooldown_steps_remaining = max(trajectory_cooldown_steps, 0)
         state.trace.append(
             TraceEvent(
                 state.step_count,
@@ -1122,17 +1160,33 @@ def run_disagreement_routing(
                 {**event, "recovery_id": trajectory_recoveries, "recovery_steps": trajectory_recovery_steps_remaining},
             )
         )
+        monitor.reset_recent()
         force_next_llm = False
         consecutive_step_type_exec = 0
         return trajectory_recovery_steps_remaining > 0
 
-    def record_trajectory_step(log_row: dict[str, Any], boundary_row: dict[str, Any] | None = None) -> bool:
+    def record_trajectory_step(
+        log_row: dict[str, Any],
+        boundary_row: dict[str, Any] | None = None,
+        *,
+        allow_detect: bool = True,
+    ) -> bool:
+        nonlocal trajectory_cooldown_steps_remaining
         monitor.record(log_row, boundary_row)
+        if not allow_detect:
+            return False
+        if trajectory_cooldown_steps_remaining > 0:
+            trajectory_cooldown_steps_remaining -= 1
+            return False
         event = monitor.detect(
             uncertain_threshold=trajectory_uncertain_threshold,
             bridge_threshold=trajectory_bridge_threshold,
             answer_repeat_threshold=trajectory_answer_repeat_threshold,
             answer_churn_unique_threshold=trajectory_answer_churn_unique_threshold,
+            min_steps_before_recovery=trajectory_min_steps_before_recovery,
+            min_steps_before_finalization=trajectory_min_steps_before_finalization,
+            confidence_min_turning_points=trajectory_confidence_min_turning_points,
+            confidence_max_slope_for_loop=trajectory_confidence_max_slope_for_loop,
         )
         return maybe_start_trajectory_recovery(event)
 
@@ -1262,6 +1316,7 @@ def run_disagreement_routing(
                 "selected_rollout_idx": None,
                 "trajectory_recovery_id": trajectory_recoveries,
                 "trajectory_recovery_steps_remaining": trajectory_recovery_steps_remaining,
+                "trajectory_cooldown_steps_remaining": trajectory_cooldown_steps_remaining,
                 "step_skeleton": normalize_step_skeleton(step_text_normalized),
             }
             step_logs.append(log_row)
@@ -1273,9 +1328,9 @@ def run_disagreement_routing(
             if _is_eos_finish(finish):
                 state.phase = Phase.DONE
                 state.stop_reason = "eos"
-                record_trajectory_step(log_row)
+                record_trajectory_step(log_row, allow_detect=False)
                 continue
-            if record_trajectory_step(log_row):
+            if record_trajectory_step(log_row, allow_detect=False):
                 continue
             force_next_llm = trajectory_recovery_steps_remaining <= 0 and _step_ends_with_colon(step_text_normalized, finish)
             continue
@@ -1680,6 +1735,11 @@ def build_problem_summary(
     trajectory_monitor_window: int = 12,
     trajectory_recovery_steps: int = 5,
     max_trajectory_recoveries: int = 2,
+    trajectory_min_steps_before_recovery: int = 80,
+    trajectory_min_steps_before_finalization: int = 180,
+    trajectory_cooldown_steps: int = 12,
+    trajectory_confidence_min_turning_points: int = 7,
+    trajectory_confidence_max_slope_for_loop: float = -0.02,
 ) -> dict[str, Any]:
     correct = None
     if problem.gold_answer is not None:
@@ -1741,6 +1801,11 @@ def build_problem_summary(
         "trajectory_monitor_window": trajectory_monitor_window,
         "trajectory_recovery_steps": trajectory_recovery_steps,
         "max_trajectory_recoveries": max_trajectory_recoveries,
+        "trajectory_min_steps_before_recovery": trajectory_min_steps_before_recovery,
+        "trajectory_min_steps_before_finalization": trajectory_min_steps_before_finalization,
+        "trajectory_cooldown_steps": trajectory_cooldown_steps,
+        "trajectory_confidence_min_turning_points": trajectory_confidence_min_turning_points,
+        "trajectory_confidence_max_slope_for_loop": trajectory_confidence_max_slope_for_loop,
         "total_wall_time": result.total_wall_time,
         "problem_wall_time": problem_wall_time if problem_wall_time is not None else result.total_wall_time,
         "slm_decode_tokens": result.state.slm_decode_tokens,
@@ -1968,6 +2033,11 @@ def main() -> None:
     parser.add_argument("--trajectory-confidence-window", type=int, default=12)
     parser.add_argument("--trajectory-recovery-steps", type=int, default=5)
     parser.add_argument("--max-trajectory-recoveries", type=int, default=2)
+    parser.add_argument("--trajectory-min-steps-before-recovery", type=int, default=80)
+    parser.add_argument("--trajectory-min-steps-before-finalization", type=int, default=180)
+    parser.add_argument("--trajectory-cooldown-steps", type=int, default=12)
+    parser.add_argument("--trajectory-confidence-min-turning-points", type=int, default=7)
+    parser.add_argument("--trajectory-confidence-max-slope-for-loop", type=float, default=-0.02)
     parser.add_argument("--trajectory-uncertain-threshold", type=int, default=6)
     parser.add_argument("--trajectory-bridge-threshold", type=int, default=5)
     parser.add_argument("--trajectory-answer-repeat-threshold", type=int, default=3)
@@ -2041,6 +2111,11 @@ def main() -> None:
             trajectory_confidence_window=args.trajectory_confidence_window,
             trajectory_recovery_steps=args.trajectory_recovery_steps,
             max_trajectory_recoveries=args.max_trajectory_recoveries,
+            trajectory_min_steps_before_recovery=args.trajectory_min_steps_before_recovery,
+            trajectory_min_steps_before_finalization=args.trajectory_min_steps_before_finalization,
+            trajectory_cooldown_steps=args.trajectory_cooldown_steps,
+            trajectory_confidence_min_turning_points=args.trajectory_confidence_min_turning_points,
+            trajectory_confidence_max_slope_for_loop=args.trajectory_confidence_max_slope_for_loop,
             trajectory_uncertain_threshold=args.trajectory_uncertain_threshold,
             trajectory_bridge_threshold=args.trajectory_bridge_threshold,
             trajectory_answer_repeat_threshold=args.trajectory_answer_repeat_threshold,
@@ -2078,6 +2153,11 @@ def main() -> None:
             trajectory_monitor_window=args.trajectory_monitor_window,
             trajectory_recovery_steps=args.trajectory_recovery_steps,
             max_trajectory_recoveries=args.max_trajectory_recoveries,
+            trajectory_min_steps_before_recovery=args.trajectory_min_steps_before_recovery,
+            trajectory_min_steps_before_finalization=args.trajectory_min_steps_before_finalization,
+            trajectory_cooldown_steps=args.trajectory_cooldown_steps,
+            trajectory_confidence_min_turning_points=args.trajectory_confidence_min_turning_points,
+            trajectory_confidence_max_slope_for_loop=args.trajectory_confidence_max_slope_for_loop,
         )
         write_problem_outputs(
             out_dir,
