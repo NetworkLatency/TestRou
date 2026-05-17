@@ -19,6 +19,31 @@ from bpa.render import render_for_continuation
 from bpa.safety import extract_answer
 
 
+MULTI_HORIZON_VALUES = [4, 8, 16, 32]
+MULTI_HORIZON_BOUNDARY_FIELDS = [
+    field
+    for horizon in MULTI_HORIZON_VALUES
+    for field in (
+        f"p_end_mean_h{horizon}",
+        f"p_end_max_h{horizon}",
+        f"p_short_h{horizon}",
+        f"log_p_short_h{horizon}",
+        f"end_in_topk_rate_h{horizon}",
+    )
+]
+MULTI_HORIZON_WINDOW_FIELDS = [
+    field
+    for horizon in MULTI_HORIZON_VALUES
+    for field in (
+        f"p_short_h{horizon}_mean",
+        f"p_short_h{horizon}_median",
+        f"log_p_short_h{horizon}_mean",
+        f"log_p_short_h{horizon}_median",
+        f"end_in_topk_rate_h{horizon}",
+    )
+]
+
+
 BOUNDARY_FIELDS = [
     "dataset",
     "problem_id",
@@ -44,6 +69,7 @@ BOUNDARY_FIELDS = [
     "p_newline_max",
     "p_think_end_onset",
     "p_think_end_max",
+    *MULTI_HORIZON_BOUNDARY_FIELDS,
     "token_logprob_onset",
     "token_logprob_mean",
     "topk_entropy_onset",
@@ -110,6 +136,7 @@ WINDOW_FIELDS = [
     "end_in_topk_rate",
     "topk_entropy_mean",
     "token_logprob_mean",
+    *MULTI_HORIZON_WINDOW_FIELDS,
 ]
 
 
@@ -451,8 +478,7 @@ def _generate_problem(args: argparse.Namespace, config: BPAConfig, problem, torc
         generated_slice = generated_ids[onset : min(len(generated_ids), onset + args.lookahead_tokens)]
         p_short = _short_prob(p_end_values)
         log_survival = sum(math.log(max(args.epsilon, 1.0 - min(1.0, value))) for value in p_end_values)
-        boundary_rows.append(
-            {
+        row = {
                 "dataset": args.dataset,
                 "problem_id": problem.problem_id,
                 "boundary_idx": boundary_idx,
@@ -488,7 +514,17 @@ def _generate_problem(args: argparse.Namespace, config: BPAConfig, problem, torc
                 "lookahead_token_count": len(lookahead),
                 "lookahead_text": _token_text(tokenizer, generated_slice).replace("\r", "\\r").replace("\n", "\\n"),
             }
-        )
+        for horizon in args.lookahead_horizons:
+            horizon_rows = stats[onset : min(len(stats), onset + horizon)]
+            horizon_p_end = [item["p_end"] for item in horizon_rows]
+            if horizon_p_end:
+                horizon_p_short = _short_prob(horizon_p_end)
+                row[f"p_end_mean_h{horizon}"] = _mean(horizon_p_end)
+                row[f"p_end_max_h{horizon}"] = max(horizon_p_end)
+                row[f"p_short_h{horizon}"] = horizon_p_short
+                row[f"log_p_short_h{horizon}"] = _safe_log(horizon_p_short, args.epsilon)
+                row[f"end_in_topk_rate_h{horizon}"] = sum(1 for item in horizon_rows if item["end_in_topk"]) / len(horizon_rows)
+        boundary_rows.append(row)
         prev_boundary_idx = token_complete_idx
 
     p_short_values = [_float(row["p_short"]) for row in boundary_rows]
@@ -547,7 +583,7 @@ def _add_window_features(args: argparse.Namespace, boundary_rows: list[dict[str,
             global_z = [(value - global_center) / global_sigma for value in logs if math.isfinite(value)]
             first = used[0]
             window_rows.append(
-                {
+                row := {
                     "dataset": args.dataset,
                     "problem_id": problem_id,
                     "window_size": window_size,
@@ -577,6 +613,12 @@ def _add_window_features(args: argparse.Namespace, boundary_rows: list[dict[str,
                     "token_logprob_mean": _mean([_float(row["token_logprob_mean"], float("nan")) for row in used]),
                 }
             )
+            for horizon in args.lookahead_horizons:
+                row[f"p_short_h{horizon}_mean"] = _mean([_float(item.get(f"p_short_h{horizon}"), float("nan")) for item in used])
+                row[f"p_short_h{horizon}_median"] = _median([_float(item.get(f"p_short_h{horizon}"), float("nan")) for item in used])
+                row[f"log_p_short_h{horizon}_mean"] = _mean([_float(item.get(f"log_p_short_h{horizon}"), float("nan")) for item in used])
+                row[f"log_p_short_h{horizon}_median"] = _median([_float(item.get(f"log_p_short_h{horizon}"), float("nan")) for item in used])
+                row[f"end_in_topk_rate_h{horizon}"] = _mean([_float(item.get(f"end_in_topk_rate_h{horizon}"), float("nan")) for item in used])
     return window_rows
 
 
@@ -607,6 +649,16 @@ def _summarize(args: argparse.Namespace, problem_rows: list[dict[str, Any]], bou
         "topk_entropy_mean",
         "token_logprob_mean",
     ]
+    for horizon in args.lookahead_horizons:
+        metrics.extend(
+            [
+                f"p_short_h{horizon}_mean",
+                f"p_short_h{horizon}_median",
+                f"log_p_short_h{horizon}_mean",
+                f"log_p_short_h{horizon}_median",
+                f"end_in_topk_rate_h{horizon}",
+            ]
+        )
     auc_rows: list[dict[str, Any]] = []
     for window_size in args.window_sizes:
         scoped = [row for row in window_rows if int(row["window_size"]) == window_size]
@@ -691,6 +743,8 @@ def _write_plots(output_dir: Path, problem_rows: list[dict[str, Any]], boundary_
 def run(args: argparse.Namespace) -> None:
     random.seed(args.seed)
     config = BPAConfig.from_json(args.config)
+    if args.max_model_len is not None:
+        config = config.with_updates(max_model_len=args.max_model_len)
     problems = load_eval_dataset(args.dataset, config, max_problems=args.max_problems)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -715,6 +769,7 @@ def run(args: argparse.Namespace) -> None:
         "newline_token_ids": sorted(newline_ids),
         "think_end_token_ids": sorted(think_end_ids),
         "lookahead_tokens": args.lookahead_tokens,
+        "lookahead_horizons": args.lookahead_horizons,
         "topk_for_censoring": args.topk_for_censoring,
         "exact_probability": True,
     }
@@ -778,11 +833,13 @@ def main() -> None:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--device-map", default=None, help="Optional transformers device_map, e.g. auto.")
     parser.add_argument("--dtype", choices=["auto", "float16", "bfloat16", "float32"], default="bfloat16")
+    parser.add_argument("--max-model-len", type=int, default=None, help="Optional context-length override for this diagnostic run.")
     parser.add_argument("--max-new-tokens", type=int, default=8192)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--lookahead-tokens", type=int, default=8)
+    parser.add_argument("--lookahead-horizons", type=int, nargs="+", default=MULTI_HORIZON_VALUES)
     parser.add_argument("--topk-for-censoring", type=int, default=20)
     parser.add_argument("--epsilon", type=float, default=1e-12)
     parser.add_argument("--baseline-boundaries", type=int, default=8)
@@ -793,6 +850,14 @@ def main() -> None:
     parser.add_argument("--long-tail-tokens", type=int, default=6000)
     parser.add_argument("--scan-vocab-for-boundary-tokens", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
+    args.lookahead_horizons = sorted(
+        horizon
+        for horizon in set(int(value) for value in args.lookahead_horizons)
+        if horizon in set(MULTI_HORIZON_VALUES)
+    )
+    if args.lookahead_tokens not in args.lookahead_horizons and args.lookahead_tokens in set(MULTI_HORIZON_VALUES):
+        args.lookahead_horizons.append(args.lookahead_tokens)
+        args.lookahead_horizons = sorted(args.lookahead_horizons)
     run(args)
 
 
