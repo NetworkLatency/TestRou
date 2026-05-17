@@ -51,9 +51,14 @@ SUMMARY_FIELDS = [
     "num_llm_colon_continuation_steps",
     "num_slm_steps",
     "num_probe_reused_steps",
+    "num_local_confidence_reused_steps",
     "num_step_type_reused_steps",
     "num_dynamics_reused_steps",
     "num_pure_text_reused_steps",
+    "hard_evidence_routing_enabled",
+    "local_confidence_routing_enabled",
+    "local_confidence_metric",
+    "local_confidence_min_score",
     "step_type_routing_enabled",
     "step_type_min_agreement_count",
     "max_consecutive_step_type_exec",
@@ -78,6 +83,14 @@ SUMMARY_FIELDS = [
     "branch_cut_skeleton_threshold",
     "trajectory_monitor_enabled",
     "trajectory_monitor_window",
+    "trajectory_routing_gate_enabled",
+    "num_trajectory_gate_blocks",
+    "trajectory_routing_gate_apply_to",
+    "trajectory_routing_gate_window",
+    "trajectory_routing_gate_min_observations",
+    "trajectory_routing_gate_min_closure_rate",
+    "trajectory_routing_gate_min_confidence_best",
+    "trajectory_routing_gate_max_entropy_mean",
     "trajectory_recovery_steps",
     "max_trajectory_recoveries",
     "trajectory_min_steps_before_recovery",
@@ -111,6 +124,8 @@ DYNAMICS_STRUCTURED = "structured"
 DYNAMICS_FLAT_LOW = "flat_low"
 DYNAMICS_UNSTABLE = "unstable"
 DYNAMICS_UNKNOWN = "unknown"
+
+LOCAL_CONFIDENCE_STAGE = 1.4
 
 _STEP_TYPE_REFLECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("wait", re.compile(r"^\s*(?:wait|hmm|uh|oh|oops)\b", re.IGNORECASE)),
@@ -206,6 +221,24 @@ def _rollout_evidence_value(rollout: dict[str, Any], channel: str) -> str | None
     if value in (None, ""):
         return None
     return str(value)
+
+
+def _rollout_first_logprob(rollout: dict[str, Any]) -> float | None:
+    values = rollout.get("token_logprobs")
+    if isinstance(values, list):
+        for value in values:
+            if isinstance(value, (float, int)):
+                return float(value)
+    return None
+
+
+def _rollout_local_confidence_score(rollout: dict[str, Any], metric: str) -> float | None:
+    if metric == "mean_logprob":
+        value = rollout.get("mean_logprob")
+        return float(value) if isinstance(value, (float, int)) else None
+    if metric == "first_logprob":
+        return _rollout_first_logprob(rollout)
+    raise ValueError(f"unsupported local confidence metric: {metric}")
 
 
 def _step_type_head(text: Any, *, max_tokens: int = 4) -> str:
@@ -305,6 +338,66 @@ def _empty_prefix_consensus() -> dict[str, Any]:
         "stage1_case": "empty",
         "selected_rollout": None,
     }
+
+
+def _disabled_hard_evidence_consensus(rollouts: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        **_empty_prefix_consensus(),
+        "prefix_consensus_channel": "hard_evidence_disabled",
+        "prefix_consensus_group_counts": {"all": len(rollouts)},
+        "stage1_case": "all_none",
+    }
+
+
+def _selected_local_confidence_rollout(
+    probe_row: dict[str, Any],
+    *,
+    enabled: bool,
+    metric: str,
+    min_score: float | None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "local_confidence_metric": metric,
+        "local_confidence_min_score": min_score,
+        "local_confidence_best_score": None,
+        "local_confidence_reject_reason": None,
+        "local_confidence_selected_rollout": None,
+    }
+    rollouts = list(probe_row.get("rollouts") or [])
+    if not enabled:
+        result["local_confidence_reject_reason"] = "disabled"
+        return result
+    if not rollouts:
+        result["local_confidence_reject_reason"] = "empty"
+        return result
+
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for idx, rollout in enumerate(rollouts):
+        if "rollout_idx" not in rollout:
+            rollout["rollout_idx"] = idx
+        score = _rollout_local_confidence_score(rollout, metric)
+        rollout["local_confidence_score"] = score
+        if score is not None:
+            scored.append((score, rollout))
+    if not scored:
+        result["local_confidence_reject_reason"] = "no_scores"
+        return result
+
+    best_score, best_rollout = max(
+        scored,
+        key=lambda item: (
+            item[0],
+            _mean_logprob_sort_value(item[1]),
+            -_rollout_idx_sort_value(item[1]),
+        ),
+    )
+    result["local_confidence_best_score"] = best_score
+    if min_score is not None and best_score < min_score:
+        result["local_confidence_reject_reason"] = "below_threshold"
+        return result
+
+    result["local_confidence_selected_rollout"] = best_rollout
+    return result
 
 
 def _empty_step_type_consensus(reason: str) -> dict[str, Any]:
@@ -506,6 +599,148 @@ def _probe_confidence_metrics(probe_row: dict[str, Any]) -> dict[str, Any]:
         "probe_confidence_spread": max(values) - min(values),
         "probe_confidence_num_rollouts": len(values),
     }
+
+
+def _probe_rollout_has_closure(rollout: dict[str, Any]) -> bool:
+    finish = str(rollout.get("finish_reason") or "").lower()
+    text = str(rollout.get("text") or "")
+    if "\n\n" in text:
+        return True
+    if not finish:
+        return False
+    return finish not in {"length", "max_tokens", "none", "null"}
+
+
+def _probe_trajectory_metrics(probe_row: dict[str, Any]) -> dict[str, Any]:
+    rollouts = list(probe_row.get("rollouts") or [])
+    confidence = _probe_confidence_metrics(probe_row)
+    entropy_values = [
+        float(rollout["entropy_mean"])
+        for rollout in rollouts
+        if isinstance(rollout.get("entropy_mean"), (float, int))
+    ]
+    closure_hits = [_probe_rollout_has_closure(rollout) for rollout in rollouts]
+    closure_rate = (sum(1 for value in closure_hits if value) / len(closure_hits)) if closure_hits else None
+    token_counts = [
+        float(rollout["token_count"])
+        for rollout in rollouts
+        if isinstance(rollout.get("token_count"), (float, int))
+    ]
+    return {
+        **confidence,
+        "probe_closure_rate": closure_rate,
+        "probe_entropy_mean": (sum(entropy_values) / len(entropy_values)) if entropy_values else None,
+        "probe_entropy_num_rollouts": len(entropy_values),
+        "probe_token_count_mean": (sum(token_counts) / len(token_counts)) if token_counts else None,
+    }
+
+
+class TrajectoryRoutingGate:
+    """Window-level health gate for SLM reuse decisions.
+
+    The gate does not create a new local accept signal. It only decides whether
+    an already accepted SLM reuse is trustworthy under the recent trajectory
+    state.
+    """
+
+    def __init__(
+        self,
+        *,
+        window: int,
+        min_observations: int,
+        min_closure_rate: float | None,
+        min_confidence_best: float | None,
+        max_entropy_mean: float | None,
+    ) -> None:
+        self.window = max(1, int(window))
+        self.min_observations = max(1, int(min_observations))
+        self.min_closure_rate = min_closure_rate
+        self.min_confidence_best = min_confidence_best
+        self.max_entropy_mean = max_entropy_mean
+        self.records: list[dict[str, Any]] = []
+
+    def _window_with_current(self, current: dict[str, Any]) -> list[dict[str, Any]]:
+        return [*self.records, current][-self.window :]
+
+    def evaluate(
+        self,
+        probe_row: dict[str, Any],
+        *,
+        selected_stage: float | int | None,
+        selected_channel: str | None,
+        apply_to: str,
+    ) -> dict[str, Any]:
+        current = _probe_trajectory_metrics(probe_row)
+        recent = self._window_with_current(current)
+        confidence_best_values = [
+            float(row["probe_confidence_best"])
+            for row in recent
+            if isinstance(row.get("probe_confidence_best"), (float, int))
+        ]
+        closure_values = [
+            float(row["probe_closure_rate"])
+            for row in recent
+            if isinstance(row.get("probe_closure_rate"), (float, int))
+        ]
+        entropy_values = [
+            float(row["probe_entropy_mean"])
+            for row in recent
+            if isinstance(row.get("probe_entropy_mean"), (float, int))
+        ]
+        confidence_best_mean = sum(confidence_best_values) / len(confidence_best_values) if confidence_best_values else None
+        closure_rate_mean = sum(closure_values) / len(closure_values) if closure_values else None
+        entropy_mean = sum(entropy_values) / len(entropy_values) if entropy_values else None
+        has_enough = len(recent) >= self.min_observations
+
+        reasons: list[str] = []
+        if has_enough and self.min_closure_rate is not None:
+            if closure_rate_mean is not None and closure_rate_mean < self.min_closure_rate:
+                reasons.append("closure_sparse")
+        if has_enough and self.min_confidence_best is not None:
+            if confidence_best_mean is not None and confidence_best_mean < self.min_confidence_best:
+                reasons.append("confidence_low")
+        if has_enough and self.max_entropy_mean is not None:
+            if entropy_mean is not None and entropy_mean > self.max_entropy_mean:
+                reasons.append("entropy_high")
+
+        stage = float(selected_stage) if isinstance(selected_stage, (float, int)) else None
+        applies = False
+        if selected_channel:
+            if apply_to == "all":
+                applies = True
+            elif apply_to == "soft":
+                applies = stage is not None and stage >= LOCAL_CONFIDENCE_STAGE
+            elif apply_to == "local_confidence":
+                applies = selected_channel == "local_confidence"
+            elif apply_to == "pure_text":
+                applies = selected_channel == "pure_text"
+            elif apply_to == "non_hard":
+                applies = stage != 1.0
+
+        blocked = bool(applies and reasons)
+        return {
+            **current,
+            "trajectory_gate_enabled": True,
+            "trajectory_gate_apply_to": apply_to,
+            "trajectory_gate_applies": applies,
+            "trajectory_gate_blocked": blocked,
+            "trajectory_gate_reason": ",".join(reasons) if reasons else None,
+            "trajectory_gate_window_count": len(recent),
+            "trajectory_gate_min_observations": self.min_observations,
+            "trajectory_gate_probe_confidence_best_mean": confidence_best_mean,
+            "trajectory_gate_probe_closure_rate_mean": closure_rate_mean,
+            "trajectory_gate_probe_entropy_mean": entropy_mean,
+            "trajectory_gate_selected_stage": selected_stage,
+            "trajectory_gate_selected_channel": selected_channel,
+        }
+
+    def record(self, probe_row: dict[str, Any]) -> None:
+        self.records.append(_probe_trajectory_metrics(probe_row))
+        if len(self.records) > max(self.window * 4, self.min_observations * 4, 32):
+            self.records = self.records[-max(self.window * 2, self.min_observations * 2, 16) :]
+
+    def reset_recent(self) -> None:
+        self.records.clear()
 
 
 def _candidate_answer_from_text(text: str) -> str | None:
@@ -1042,6 +1277,10 @@ def run_disagreement_routing(
     probe_max_tokens: int = 32,
     probe_stop: str = "\n\n",
     probe_logprobs_topk: int = 1,
+    enable_hard_evidence_routing: bool = True,
+    enable_local_confidence_routing: bool = False,
+    local_confidence_metric: str = "mean_logprob",
+    local_confidence_min_score: float | None = None,
     enable_step_type_routing: bool = False,
     step_type_min_agreement_count: int | None = None,
     max_consecutive_step_type_exec: int = 2,
@@ -1075,9 +1314,20 @@ def run_disagreement_routing(
     trajectory_bridge_threshold: int = 5,
     trajectory_answer_repeat_threshold: int = 3,
     trajectory_answer_churn_unique_threshold: int = 2,
+    enable_trajectory_routing_gate: bool = False,
+    trajectory_routing_gate_apply_to: str = "soft",
+    trajectory_routing_gate_window: int = 50,
+    trajectory_routing_gate_min_observations: int = 25,
+    trajectory_routing_gate_min_closure_rate: float | None = 0.15,
+    trajectory_routing_gate_min_confidence_best: float | None = None,
+    trajectory_routing_gate_max_entropy_mean: float | None = None,
 ) -> tuple[BPAResult, list[dict[str, Any]], dict[str, float | int]]:
     if min_agreement_count > probe_k:
         raise ValueError("min_agreement_count cannot exceed probe_k")
+    if local_confidence_metric not in {"mean_logprob", "first_logprob"}:
+        raise ValueError("local_confidence_metric must be one of: mean_logprob, first_logprob")
+    if enable_local_confidence_routing and local_confidence_min_score is None:
+        raise ValueError("local_confidence_min_score is required when local confidence routing is enabled")
     if step_type_min_agreement_count is None:
         step_type_min_agreement_count = min_agreement_count
     if step_type_min_agreement_count > probe_k:
@@ -1086,6 +1336,8 @@ def run_disagreement_routing(
         dynamics_min_agreement_count = min_agreement_count
     if dynamics_min_agreement_count > probe_k:
         raise ValueError("dynamics_min_agreement_count cannot exceed probe_k")
+    if trajectory_routing_gate_apply_to not in {"soft", "all", "local_confidence", "pure_text", "non_hard"}:
+        raise ValueError("trajectory_routing_gate_apply_to must be one of: soft, all, local_confidence, pure_text, non_hard")
 
     protocol = "evidence_consensus_routing"
     state = GenerationState(problem_text=problem_text, generation_protocol=protocol)
@@ -1103,7 +1355,15 @@ def run_disagreement_routing(
     trajectory_finalizations = 0
     trajectory_recovery_steps_remaining = 0
     trajectory_cooldown_steps_remaining = 0
+    trajectory_gate_blocks = 0
     monitor = TrajectoryMonitor(window=trajectory_monitor_window, confidence_window=trajectory_confidence_window)
+    routing_gate = TrajectoryRoutingGate(
+        window=trajectory_routing_gate_window,
+        min_observations=trajectory_routing_gate_min_observations,
+        min_closure_rate=trajectory_routing_gate_min_closure_rate,
+        min_confidence_best=trajectory_routing_gate_min_confidence_best,
+        max_entropy_mean=trajectory_routing_gate_max_entropy_mean,
+    )
 
     def maybe_start_branch_cut_recovery(trigger_reason: str, *, threshold: int | None = None) -> bool:
         nonlocal branch_cut_recoveries, branch_recovery_steps_remaining, rep, force_next_llm, consecutive_step_type_exec
@@ -1129,6 +1389,7 @@ def run_disagreement_routing(
         rep = RepetitionState()
         force_next_llm = False
         consecutive_step_type_exec = 0
+        routing_gate.reset_recent()
         return True
 
     def maybe_start_trajectory_recovery(event: dict[str, Any] | None) -> bool:
@@ -1161,6 +1422,7 @@ def run_disagreement_routing(
             )
         )
         monitor.reset_recent()
+        routing_gate.reset_recent()
         force_next_llm = False
         consecutive_step_type_exec = 0
         return trajectory_recovery_steps_remaining > 0
@@ -1458,11 +1720,20 @@ def run_disagreement_routing(
         probe_row["is_initial_probe"] = False
         boundary_idx += 1
         _add_probe_cost(probe_cost, cost)
-        prefix_consensus = _selected_prefix_consensus_rollout(
-            probe_row,
-            min_agreement_count=min_agreement_count,
-        )
+        if enable_hard_evidence_routing:
+            prefix_consensus = _selected_prefix_consensus_rollout(
+                probe_row,
+                min_agreement_count=min_agreement_count,
+            )
+        else:
+            prefix_consensus = _disabled_hard_evidence_consensus(list(probe_row.get("rollouts") or []))
         selected_rollout = prefix_consensus["selected_rollout"]
+        local_confidence = _selected_local_confidence_rollout(
+            probe_row,
+            enabled=enable_local_confidence_routing,
+            metric=local_confidence_metric,
+            min_score=local_confidence_min_score,
+        )
         step_type_consensus = _selected_step_type_consensus_rollout(
             probe_row,
             enabled=enable_step_type_routing and prefix_consensus["stage1_case"] == "all_none",
@@ -1483,6 +1754,26 @@ def run_disagreement_routing(
             structured_min_var=dynamics_structured_min_var,
             structured_min_max_jump=dynamics_structured_min_max_jump,
         )
+        if selected_rollout is None and local_confidence["local_confidence_selected_rollout"] is not None:
+            selected_rollout = local_confidence["local_confidence_selected_rollout"]
+            prefix_consensus = {
+                **prefix_consensus,
+                "prefix_anchor_idx": selected_rollout.get("rollout_idx"),
+                "prefix_anchor_mean_logprob": selected_rollout.get("mean_logprob"),
+                "prefix_consensus_channel": "local_confidence",
+                "prefix_consensus_value": local_confidence["local_confidence_best_score"],
+                "prefix_consensus_support_count": 1,
+                "prefix_consensus_vote_fraction": 1 / len(probe_row.get("rollouts") or [None]),
+                "prefix_consensus_support_by_rollout": {
+                    str(_rollout_idx_sort_value(rollout)): rollout is selected_rollout
+                    for rollout in probe_row.get("rollouts") or []
+                },
+                "prefix_consensus_group_counts": {
+                    "accepted": 1,
+                    "rejected": max(0, len(probe_row.get("rollouts") or []) - 1),
+                },
+                "prefix_consensus_stage": LOCAL_CONFIDENCE_STAGE,
+            }
         if selected_rollout is None and step_type_consensus["step_type_selected_rollout"] is not None:
             selected_rollout = step_type_consensus["step_type_selected_rollout"]
             prefix_consensus = {
@@ -1542,6 +1833,48 @@ def run_disagreement_routing(
                     "prefix_consensus_group_counts": {"all_none": len(pure_text_rollouts)},
                     "prefix_consensus_stage": 1.6,
                 }
+        trajectory_gate_info: dict[str, Any] = {
+            "trajectory_gate_enabled": enable_trajectory_routing_gate,
+            "trajectory_gate_blocked": False,
+        }
+        if enable_trajectory_routing_gate and selected_rollout is not None:
+            trajectory_gate_info = routing_gate.evaluate(
+                probe_row,
+                selected_stage=prefix_consensus.get("prefix_consensus_stage"),
+                selected_channel=prefix_consensus.get("prefix_consensus_channel"),
+                apply_to=trajectory_routing_gate_apply_to,
+            )
+            if trajectory_gate_info.get("trajectory_gate_blocked"):
+                trajectory_gate_blocks += 1
+                state.trace.append(
+                    TraceEvent(
+                        state.step_count,
+                        "trajectory_routing_gate_block",
+                        {
+                            key: value
+                            for key, value in trajectory_gate_info.items()
+                            if key.startswith("trajectory_gate_")
+                        },
+                    )
+                )
+                prefix_consensus = {
+                    **prefix_consensus,
+                    "trajectory_gate_original_prefix_consensus_stage": prefix_consensus.get("prefix_consensus_stage"),
+                    "trajectory_gate_original_prefix_consensus_channel": prefix_consensus.get("prefix_consensus_channel"),
+                    "trajectory_gate_original_prefix_consensus_value": prefix_consensus.get("prefix_consensus_value"),
+                    "prefix_anchor_idx": None,
+                    "prefix_anchor_mean_logprob": None,
+                    "prefix_consensus_channel": "trajectory_gate_blocked",
+                    "prefix_consensus_value": trajectory_gate_info.get("trajectory_gate_reason"),
+                    "prefix_consensus_support_count": 0,
+                    "prefix_consensus_vote_fraction": None,
+                    "prefix_consensus_support_by_rollout": {},
+                    "prefix_consensus_stage": None,
+                }
+                selected_rollout = None
+        if enable_trajectory_routing_gate:
+            routing_gate.record(probe_row)
+
         route_to_llm = selected_rollout is None
 
         decode_tokens_before = state.slm_decode_tokens + state.llm_decode_tokens
@@ -1584,6 +1917,12 @@ def run_disagreement_routing(
         probe_row["prefix_consensus_group_counts"] = prefix_consensus["prefix_consensus_group_counts"]
         probe_row["prefix_consensus_stage"] = prefix_consensus["prefix_consensus_stage"]
         probe_row["stage1_case"] = prefix_consensus["stage1_case"]
+        probe_row["hard_evidence_routing_enabled"] = enable_hard_evidence_routing
+        probe_row["local_confidence_routing_enabled"] = enable_local_confidence_routing
+        probe_row["local_confidence_metric"] = local_confidence["local_confidence_metric"]
+        probe_row["local_confidence_min_score"] = local_confidence["local_confidence_min_score"]
+        probe_row["local_confidence_best_score"] = local_confidence["local_confidence_best_score"]
+        probe_row["local_confidence_reject_reason"] = local_confidence["local_confidence_reject_reason"]
         probe_row["step_type_routing_enabled"] = enable_step_type_routing
         probe_row["step_type_min_agreement_count"] = step_type_min_agreement_count
         probe_row["max_consecutive_step_type_exec"] = max_consecutive_step_type_exec
@@ -1607,6 +1946,16 @@ def run_disagreement_routing(
         probe_row["dynamics_consensus_reject_reason"] = dynamics_consensus["dynamics_consensus_reject_reason"]
         probe_row["pure_text_slm_fallback_enabled"] = enable_pure_text_slm_fallback
         probe_row["pure_text_slm_fallback_used"] = prefix_consensus["prefix_consensus_stage"] == 1.6
+        probe_row.update(trajectory_gate_info)
+        probe_row["trajectory_gate_original_prefix_consensus_stage"] = prefix_consensus.get(
+            "trajectory_gate_original_prefix_consensus_stage"
+        )
+        probe_row["trajectory_gate_original_prefix_consensus_channel"] = prefix_consensus.get(
+            "trajectory_gate_original_prefix_consensus_channel"
+        )
+        probe_row["trajectory_gate_original_prefix_consensus_value"] = prefix_consensus.get(
+            "trajectory_gate_original_prefix_consensus_value"
+        )
         probe_row["routed_to_llm"] = route_to_llm
         probe_row["reused_probe_rollout"] = selected_rollout is not None
         probe_row["selected_rollout_idx"] = selected_rollout.get("rollout_idx") if probe_row["reused_probe_rollout"] else None
@@ -1629,6 +1978,10 @@ def run_disagreement_routing(
         if route_to_llm:
             decision = "llm_consensus_fallback"
             force_next_llm = _step_ends_with_colon(step_text_normalized, finish)
+            consecutive_step_type_exec = 0
+        elif probe_row["prefix_consensus_stage"] == LOCAL_CONFIDENCE_STAGE:
+            decision = "slm_local_confidence_reuse"
+            force_next_llm = False
             consecutive_step_type_exec = 0
         elif probe_row["prefix_consensus_stage"] == 1.5:
             decision = "slm_step_type_reuse"
@@ -1712,6 +2065,10 @@ def build_problem_summary(
     min_agreement_count: int,
     config: BPAConfig,
     problem_wall_time: float | None = None,
+    hard_evidence_routing_enabled: bool = True,
+    local_confidence_routing_enabled: bool = False,
+    local_confidence_metric: str = "mean_logprob",
+    local_confidence_min_score: float | None = None,
     step_type_routing_enabled: bool = False,
     step_type_min_agreement_count: int | None = None,
     max_consecutive_step_type_exec: int = 2,
@@ -1733,6 +2090,13 @@ def build_problem_summary(
     branch_cut_skeleton_threshold: int = 3,
     trajectory_monitor_enabled: bool = False,
     trajectory_monitor_window: int = 12,
+    trajectory_routing_gate_enabled: bool = False,
+    trajectory_routing_gate_apply_to: str = "soft",
+    trajectory_routing_gate_window: int = 50,
+    trajectory_routing_gate_min_observations: int = 25,
+    trajectory_routing_gate_min_closure_rate: float | None = 0.15,
+    trajectory_routing_gate_min_confidence_best: float | None = None,
+    trajectory_routing_gate_max_entropy_mean: float | None = None,
     trajectory_recovery_steps: int = 5,
     max_trajectory_recoveries: int = 2,
     trajectory_min_steps_before_recovery: int = 80,
@@ -1754,6 +2118,7 @@ def build_problem_summary(
     num_trajectory_finalizations = sum(
         1 for event in result.state.trace if event.event == "trajectory_monitor_final_answer"
     )
+    num_trajectory_gate_blocks = sum(1 for row in real_boundary_rows if row.get("trajectory_gate_blocked"))
     return {
         "dataset": dataset,
         "problem_id": problem.problem_id,
@@ -1768,9 +2133,16 @@ def build_problem_summary(
         "num_llm_colon_continuation_steps": sum(1 for row in step_rows if row.get("decision") == "llm_colon_continuation"),
         "num_slm_steps": sum(1 for row in real_boundary_rows if not row.get("routed_to_llm")),
         "num_probe_reused_steps": sum(1 for row in real_boundary_rows if row.get("reused_probe_rollout")),
+        "num_local_confidence_reused_steps": sum(
+            1 for row in real_boundary_rows if row.get("prefix_consensus_stage") == LOCAL_CONFIDENCE_STAGE
+        ),
         "num_step_type_reused_steps": sum(1 for row in real_boundary_rows if row.get("prefix_consensus_stage") == 1.5),
         "num_dynamics_reused_steps": sum(1 for row in real_boundary_rows if row.get("prefix_consensus_stage") == 1.55),
         "num_pure_text_reused_steps": sum(1 for row in real_boundary_rows if row.get("prefix_consensus_stage") == 1.6),
+        "hard_evidence_routing_enabled": hard_evidence_routing_enabled,
+        "local_confidence_routing_enabled": local_confidence_routing_enabled,
+        "local_confidence_metric": local_confidence_metric,
+        "local_confidence_min_score": local_confidence_min_score,
         "step_type_routing_enabled": step_type_routing_enabled,
         "step_type_min_agreement_count": (
             step_type_min_agreement_count if step_type_min_agreement_count is not None else min_agreement_count
@@ -1799,6 +2171,14 @@ def build_problem_summary(
         "branch_cut_skeleton_threshold": branch_cut_skeleton_threshold,
         "trajectory_monitor_enabled": trajectory_monitor_enabled,
         "trajectory_monitor_window": trajectory_monitor_window,
+        "trajectory_routing_gate_enabled": trajectory_routing_gate_enabled,
+        "num_trajectory_gate_blocks": num_trajectory_gate_blocks,
+        "trajectory_routing_gate_apply_to": trajectory_routing_gate_apply_to,
+        "trajectory_routing_gate_window": trajectory_routing_gate_window,
+        "trajectory_routing_gate_min_observations": trajectory_routing_gate_min_observations,
+        "trajectory_routing_gate_min_closure_rate": trajectory_routing_gate_min_closure_rate,
+        "trajectory_routing_gate_min_confidence_best": trajectory_routing_gate_min_confidence_best,
+        "trajectory_routing_gate_max_entropy_mean": trajectory_routing_gate_max_entropy_mean,
         "trajectory_recovery_steps": trajectory_recovery_steps,
         "max_trajectory_recoveries": max_trajectory_recoveries,
         "trajectory_min_steps_before_recovery": trajectory_min_steps_before_recovery,
@@ -1833,12 +2213,16 @@ def _summary_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_num_llm_routed_steps": _mean([row.get("num_llm_routed_steps") for row in rows]),
         "avg_num_llm_colon_continuation_steps": _mean([row.get("num_llm_colon_continuation_steps") for row in rows]),
         "avg_num_probe_reused_steps": _mean([row.get("num_probe_reused_steps") for row in rows]),
+        "avg_num_local_confidence_reused_steps": _mean(
+            [row.get("num_local_confidence_reused_steps") for row in rows]
+        ),
         "avg_num_step_type_reused_steps": _mean([row.get("num_step_type_reused_steps") for row in rows]),
         "avg_num_dynamics_reused_steps": _mean([row.get("num_dynamics_reused_steps") for row in rows]),
         "avg_num_pure_text_reused_steps": _mean([row.get("num_pure_text_reused_steps") for row in rows]),
         "avg_num_branch_cut_recoveries": _mean([row.get("num_branch_cut_recoveries") for row in rows]),
         "avg_num_trajectory_recoveries": _mean([row.get("num_trajectory_recoveries") for row in rows]),
         "avg_num_trajectory_finalizations": _mean([row.get("num_trajectory_finalizations") for row in rows]),
+        "avg_num_trajectory_gate_blocks": _mean([row.get("num_trajectory_gate_blocks") for row in rows]),
         "avg_main_decode_tokens": _mean([row.get("main_decode_tokens") for row in rows]),
         "avg_total_decode_tokens_including_probe": _mean(
             [row.get("total_decode_tokens_including_probe") for row in rows]
@@ -1847,12 +2231,16 @@ def _summary_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "total_llm_prefill_tokens": sum(float(row.get("llm_prefill_tokens") or 0.0) for row in rows),
         "total_slm_decode_tokens": sum(float(row.get("slm_decode_tokens") or 0.0) for row in rows),
         "total_probe_decode_tokens": sum(float(row.get("probe_decode_tokens") or 0.0) for row in rows),
+        "total_local_confidence_reused_steps": sum(
+            float(row.get("num_local_confidence_reused_steps") or 0.0) for row in rows
+        ),
         "total_step_type_reused_steps": sum(float(row.get("num_step_type_reused_steps") or 0.0) for row in rows),
         "total_dynamics_reused_steps": sum(float(row.get("num_dynamics_reused_steps") or 0.0) for row in rows),
         "total_pure_text_reused_steps": sum(float(row.get("num_pure_text_reused_steps") or 0.0) for row in rows),
         "total_branch_cut_recoveries": sum(float(row.get("num_branch_cut_recoveries") or 0.0) for row in rows),
         "total_trajectory_recoveries": sum(float(row.get("num_trajectory_recoveries") or 0.0) for row in rows),
         "total_trajectory_finalizations": sum(float(row.get("num_trajectory_finalizations") or 0.0) for row in rows),
+        "total_trajectory_gate_blocks": sum(float(row.get("num_trajectory_gate_blocks") or 0.0) for row in rows),
         "total_main_decode_tokens": sum(float(row.get("main_decode_tokens") or 0.0) for row in rows),
         "total_decode_tokens_including_probe": sum(
             float(row.get("total_decode_tokens_including_probe") or 0.0) for row in rows
@@ -2009,6 +2397,10 @@ def main() -> None:
     parser.add_argument("--probe-max-tokens", type=int, default=32)
     parser.add_argument("--probe-logprobs-topk", type=int, default=1, help="Top-k logprobs to request for each probe token; 1 records sampled-token surprisal only, >1 also approximates entropy.")
     parser.add_argument("--post-stop-lookahead-tokens", type=int, default=None)
+    parser.add_argument("--disable-hard-evidence-routing", action="store_true", help="Disable Stage 1 hard-evidence consensus so clean local-confidence baselines can be run.")
+    parser.add_argument("--enable-local-confidence-routing", action="store_true", help="Accept the best SLM probe rollout when its local confidence score passes a threshold.")
+    parser.add_argument("--local-confidence-metric", choices=["mean_logprob", "first_logprob"], default="mean_logprob")
+    parser.add_argument("--local-confidence-min-score", type=float, default=None, help="Minimum local confidence score required for SLM reuse. Required with --enable-local-confidence-routing.")
     parser.add_argument("--enable-step-type-routing", action="store_true", help="Allow all-none execution-style probe consensus to reuse an SLM rollout.")
     parser.add_argument("--step-type-min-agreement-count", type=int, default=None, help="Agreement count for Tier 1.5 execution consensus; defaults to --min-agreement-count.")
     parser.add_argument("--max-consecutive-step-type-exec", type=int, default=2, help="Maximum consecutive Tier 1.5 SLM execution-style reuses before forcing an LLM check-in.")
@@ -2042,9 +2434,22 @@ def main() -> None:
     parser.add_argument("--trajectory-bridge-threshold", type=int, default=5)
     parser.add_argument("--trajectory-answer-repeat-threshold", type=int, default=3)
     parser.add_argument("--trajectory-answer-churn-unique-threshold", type=int, default=2)
+    parser.add_argument("--enable-trajectory-routing-gate", action="store_true", help="Block otherwise accepted SLM reuse when recent probe trajectory state is unhealthy.")
+    parser.add_argument("--trajectory-routing-gate-apply-to", choices=["soft", "all", "local_confidence", "pure_text", "non_hard"], default="soft", help="Which accepted SLM reuses can be blocked by the trajectory gate.")
+    parser.add_argument("--trajectory-routing-gate-window", type=int, default=50)
+    parser.add_argument("--trajectory-routing-gate-min-observations", type=int, default=25)
+    parser.add_argument("--trajectory-routing-gate-min-closure-rate", type=float, default=0.15, help="Minimum recent fraction of probe rollouts that reached a step boundary; set negative to disable.")
+    parser.add_argument("--trajectory-routing-gate-min-confidence-best", type=float, default=None, help="Minimum recent mean of best rollout mean-logprob; unset to disable.")
+    parser.add_argument("--trajectory-routing-gate-max-entropy-mean", type=float, default=None, help="Maximum recent mean top-k entropy; requires --probe-logprobs-topk > 1. Unset to disable.")
     parser.add_argument("--output-name", default=None, help="Optional diagnostics output folder name under disagreement_routing/.")
     parser.add_argument("--resume", action="store_true", help="Skip problems that already have complete per-problem outputs.")
     args = parser.parse_args()
+    trajectory_gate_min_closure_rate = (
+        args.trajectory_routing_gate_min_closure_rate
+        if args.trajectory_routing_gate_min_closure_rate is not None
+        and args.trajectory_routing_gate_min_closure_rate >= 0
+        else None
+    )
 
     config = BPAConfig.from_json(args.config)
     if args.post_stop_lookahead_tokens is not None:
@@ -2087,6 +2492,10 @@ def main() -> None:
             probe_temperature=args.probe_temperature,
             probe_max_tokens=args.probe_max_tokens,
             probe_logprobs_topk=args.probe_logprobs_topk,
+            enable_hard_evidence_routing=not args.disable_hard_evidence_routing,
+            enable_local_confidence_routing=args.enable_local_confidence_routing,
+            local_confidence_metric=args.local_confidence_metric,
+            local_confidence_min_score=args.local_confidence_min_score,
             enable_step_type_routing=args.enable_step_type_routing,
             step_type_min_agreement_count=args.step_type_min_agreement_count,
             max_consecutive_step_type_exec=args.max_consecutive_step_type_exec,
@@ -2120,6 +2529,13 @@ def main() -> None:
             trajectory_bridge_threshold=args.trajectory_bridge_threshold,
             trajectory_answer_repeat_threshold=args.trajectory_answer_repeat_threshold,
             trajectory_answer_churn_unique_threshold=args.trajectory_answer_churn_unique_threshold,
+            enable_trajectory_routing_gate=args.enable_trajectory_routing_gate,
+            trajectory_routing_gate_apply_to=args.trajectory_routing_gate_apply_to,
+            trajectory_routing_gate_window=args.trajectory_routing_gate_window,
+            trajectory_routing_gate_min_observations=args.trajectory_routing_gate_min_observations,
+            trajectory_routing_gate_min_closure_rate=trajectory_gate_min_closure_rate,
+            trajectory_routing_gate_min_confidence_best=args.trajectory_routing_gate_min_confidence_best,
+            trajectory_routing_gate_max_entropy_mean=args.trajectory_routing_gate_max_entropy_mean,
         )
         summary = build_problem_summary(
             dataset=args.dataset,
@@ -2130,6 +2546,10 @@ def main() -> None:
             min_agreement_count=args.min_agreement_count,
             config=config,
             problem_wall_time=time.time() - problem_start,
+            hard_evidence_routing_enabled=not args.disable_hard_evidence_routing,
+            local_confidence_routing_enabled=args.enable_local_confidence_routing,
+            local_confidence_metric=args.local_confidence_metric,
+            local_confidence_min_score=args.local_confidence_min_score,
             step_type_routing_enabled=args.enable_step_type_routing,
             step_type_min_agreement_count=args.step_type_min_agreement_count,
             max_consecutive_step_type_exec=args.max_consecutive_step_type_exec,
@@ -2158,6 +2578,13 @@ def main() -> None:
             trajectory_cooldown_steps=args.trajectory_cooldown_steps,
             trajectory_confidence_min_turning_points=args.trajectory_confidence_min_turning_points,
             trajectory_confidence_max_slope_for_loop=args.trajectory_confidence_max_slope_for_loop,
+            trajectory_routing_gate_enabled=args.enable_trajectory_routing_gate,
+            trajectory_routing_gate_apply_to=args.trajectory_routing_gate_apply_to,
+            trajectory_routing_gate_window=args.trajectory_routing_gate_window,
+            trajectory_routing_gate_min_observations=args.trajectory_routing_gate_min_observations,
+            trajectory_routing_gate_min_closure_rate=trajectory_gate_min_closure_rate,
+            trajectory_routing_gate_min_confidence_best=args.trajectory_routing_gate_min_confidence_best,
+            trajectory_routing_gate_max_entropy_mean=args.trajectory_routing_gate_max_entropy_mean,
         )
         write_problem_outputs(
             out_dir,
