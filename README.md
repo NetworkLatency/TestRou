@@ -1,6 +1,14 @@
-# GlimpRouter / DASR Validation
+# SARR-CoDE / GlimpRouter Validation
 
-This repository now focuses on a compact validation path:
+The active new experiment path is **SARR-CoDE: Stability-Aware Rollback Routing with Confidence-Degeneration Evidence**. It lives in `sarr_code/` with the entrypoint:
+
+```bash
+python scripts/run_sarr_code.py --config configs/sarr_code_aggressive.json --mode run --dataset aime25
+```
+
+See `docs/sarr_code.md` for the offline server workflow, local transformers SLM setup, vLLM LLM startup, percentile calibration, and JSONL log outputs.
+
+The older compact validation path is still present for reference:
 
 - strict GlimpRouter `H_init` routing sweep
 - DASR sequence-level confidence `s_k` sweep
