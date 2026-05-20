@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -22,13 +20,11 @@ from bpa.eval.datasets import load_eval_dataset
 from bpa.eval.main_benchmark import build_summary_metrics, load_summary_rows, write_summary_files
 from bpa.trace import result_summary, write_json, write_jsonl
 from sarr_code import SARRConfig, run_sarr_code
-from sarr_code.calibration import IdentityNormalizer, PercentileNormalizer
-from sarr_code.calibrate import build_calibration_payload, collect_slm_calibration_trace
 from sarr_code.engines import build_llm, build_slm
 
 
 MATH_DATASETS = {"math500", "aime24", "aime25"}
-DEFAULT_VARIANT = "sarr_code_aggressive_prefix"
+DEFAULT_VARIANT = "sarr_code_v2_raw_hcs_confirmed_rollback"
 
 
 def _summary_path(output_root: Path, dataset: str, variant: str) -> Path:
@@ -129,6 +125,7 @@ def _problem_sarr_metrics(result, step_rows: list[dict[str, Any]], rollback_rows
     rollback_count = len(rollback_rows)
     startup_rollback_count = sum(1 for row in rollback_rows if row.get("type") == "STARTUP_ROLLBACK")
     post_stable_rollback_count = sum(1 for row in rollback_rows if row.get("type") == "POST_STABLE_ROLLBACK")
+    hcs_rollback_count = sum(1 for row in rollback_rows if row.get("type") == "HCS_ROLLBACK")
     rollback_span_total = sum(int(row.get("rollback_span") or 0) for row in rollback_rows)
     recovery_steps_total = sum(int(row.get("recovery_actual_steps") or 0) for row in rollback_rows)
     recovery_ready_count = sum(1 for row in rollback_rows if row.get("stop_reason") == "SLM_READY")
@@ -151,6 +148,10 @@ def _problem_sarr_metrics(result, step_rows: list[dict[str, Any]], rollback_rows
         "has_startup_rollback": startup_rollback_count > 0,
         "post_stable_rollback_count": post_stable_rollback_count,
         "has_post_stable_rollback": post_stable_rollback_count > 0,
+        "hcs_rollback_count": hcs_rollback_count,
+        "has_hcs_rollback": hcs_rollback_count > 0,
+        "hcs_suspect_count": sum(1 for row in step_rows if _truthy(row.get("hcs_suspect"))),
+        "hcs_confirmed_count": sum(1 for row in step_rows if _truthy(row.get("hcs_confirmed"))),
         "anchor_zero_count": sum(1 for row in rollback_rows if row.get("anchor_step") == 0),
         "rollback_span_total": rollback_span_total,
         "avg_rollback_span": (rollback_span_total / rollback_count) if rollback_count else 0.0,
@@ -181,6 +182,7 @@ def _extra_sarr_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     total_rollbacks = sum(int(_num(row.get("rollback_count"))) for row in rows)
     total_startup_rollbacks = sum(int(_num(row.get("startup_rollback_count"))) for row in rows)
     total_post_stable_rollbacks = sum(int(_num(row.get("post_stable_rollback_count"))) for row in rows)
+    total_hcs_rollbacks = sum(int(_num(row.get("hcs_rollback_count"))) for row in rows)
     total_anchor_zero = sum(int(_num(row.get("anchor_zero_count"))) for row in rows)
     total_span = sum(_num(row.get("rollback_span_total")) for row in rows)
     total_recovery_steps = sum(_num(row.get("recovery_steps_total")) for row in rows)
@@ -194,12 +196,15 @@ def _extra_sarr_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "rollback_rate": (sum(1 for row in rows if _truthy(row.get("has_rollback"))) / n) if n else 0.0,
         "startup_rollback_rate": (sum(1 for row in rows if _truthy(row.get("has_startup_rollback"))) / n) if n else 0.0,
         "post_stable_rollback_rate": (sum(1 for row in rows if _truthy(row.get("has_post_stable_rollback"))) / n) if n else 0.0,
+        "hcs_rollback_rate": (sum(1 for row in rows if _truthy(row.get("has_hcs_rollback"))) / n) if n else 0.0,
         "avg_rollback_count": avg("rollback_count"),
         "avg_startup_rollback_count": avg("startup_rollback_count"),
         "avg_post_stable_rollback_count": avg("post_stable_rollback_count"),
+        "avg_hcs_rollback_count": avg("hcs_rollback_count"),
         "total_rollback_count": total_rollbacks,
         "total_startup_rollback_count": total_startup_rollbacks,
         "total_post_stable_rollback_count": total_post_stable_rollbacks,
+        "total_hcs_rollback_count": total_hcs_rollbacks,
         "anchor_zero_rate_per_rollback": (total_anchor_zero / total_rollbacks) if total_rollbacks else 0.0,
         "avg_rollback_span": (total_span / total_rollbacks) if total_rollbacks else 0.0,
         "avg_recovery_steps": (total_recovery_steps / total_rollbacks) if total_rollbacks else 0.0,
@@ -224,50 +229,15 @@ def _write_summary(summary_path: Path, dataset: str, variant: str, rows: list[di
 
 
 def _load_normalizer(cfg: SARRConfig):
+    if cfg.calibration.enabled or cfg.calibration.load_cdf or cfg.calibration.use_percentile:
+        raise RuntimeError("This experiment disables calibration; run with calibration.enabled=false.")
     if cfg.confidence.calibration_path:
-        return PercentileNormalizer.from_json(cfg.confidence.calibration_path)
-    if cfg.confidence.allow_identity_normalizer:
-        return IdentityNormalizer()
-    raise RuntimeError(
-        "SARR-CoDE requires confidence.calibration_path for percentile normalization. "
-        "Run --mode calibrate first, or explicitly set confidence.allow_identity_normalizer=true for debugging only."
-    )
+        raise RuntimeError("This experiment disables calibration; remove confidence.calibration_path.")
+    return None
 
 
 def run_calibration(args: argparse.Namespace, cfg: SARRConfig) -> None:
-    problems = load_eval_dataset(args.dataset, cfg, max_problems=args.max_problems)
-    output_path = Path(args.calibration_output or cfg.confidence.calibration_path or "sarr_calibration.json")
-    trace_output = output_path.with_suffix(".traces.jsonl")
-    print(f"[sarr] loaded {len(problems)} calibration problem(s) from {args.dataset}", flush=True)
-    print(f"[sarr] calibration output: {output_path}", flush=True)
-    slm = build_slm(cfg.slm, cfg.runtime)
-
-    traces = []
-    for problem in tqdm(problems, desc=f"calibrate:{args.dataset}"):
-        print(f"[sarr] calibrating problem_id={problem.problem_id}", flush=True)
-        trace = collect_slm_calibration_trace(str(problem.problem_id), problem.problem_text, slm, cfg)
-        traces.append(trace)
-        if cfg.runtime.reset_prefix_cache_after_problem:
-            slm.clear_runtime_cache()
-
-    payload = build_calibration_payload(traces, cfg)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    write_jsonl(
-        trace_output,
-        [
-            {
-                "problem_id": trace.problem_id,
-                "stop_reason": trace.stop_reason,
-                "num_values": len(trace.values),
-                "steps": trace.steps,
-            }
-            for trace in traces
-        ],
-    )
-    print(f"Wrote calibration CDF: {output_path}")
-    print(f"Wrote calibration traces: {trace_output}")
+    raise RuntimeError("Calibration CDF construction is disabled for raw-readiness SARR-CoDE.")
 
 
 def run_experiment(args: argparse.Namespace, cfg: SARRConfig) -> None:
@@ -301,7 +271,7 @@ def run_experiment(args: argparse.Namespace, cfg: SARRConfig) -> None:
         ]
 
     normalizer = _load_normalizer(cfg)
-    print(f"[sarr] normalizer loaded from {cfg.confidence.calibration_path or 'identity'}", flush=True)
+    print("[sarr] readiness_source=raw calibration_enabled=false", flush=True)
     slm = build_slm(cfg.slm, cfg.runtime)
     llm = build_llm(cfg.llm, cfg.runtime)
 
@@ -375,7 +345,7 @@ def raise_csv_field_limit() -> None:
 
 def main() -> None:
     raise_csv_field_limit()
-    parser = argparse.ArgumentParser(description="Run SARR-CoDE aggressive prefix collaboration.")
+    parser = argparse.ArgumentParser(description="Run SARR-CoDE raw-readiness HCS confirmed rollback collaboration.")
     parser.add_argument("--config", required=True, help="Path to SARRConfig JSON.")
     parser.add_argument("--mode", choices=["run", "calibrate"], default="run")
     parser.add_argument("--dataset", default="aime25", choices=["math500", "aime24", "aime25", "gpqa", "gpqa_diamond"])

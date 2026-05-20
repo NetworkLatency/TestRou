@@ -1,10 +1,49 @@
-# SARR-CoDE Aggressive Prefix Experiment
+# SARR-CoDE v2 Raw HCS Confirmed Rollback
 
-This path implements **Aggressive Prefix-Centric SARR-CoDE**. The main method only uses SLM next-token distributions after generated prefixes. It does not use Hinit routing, answer probes, LLM judging, boxed-answer parsing, or KV-cache rollback.
+This path implements **SARR-CoDE with raw-readiness High-Confidence Stagnation confirmed rollback**. The main flow remains:
 
-## 1. Local Assets
+```text
+SLM first -> online confidence-dynamics monitoring -> rollback/recovery -> bounded LLM continuation -> return to SLM
+```
 
-The server is expected to be offline. Configure all model and dataset paths as local filesystem paths in:
+The method no longer builds or reads calibration CDFs. Strategy decisions use raw SLM continuation confidence only:
+
+```text
+R_k = c_raw_k
+R_smooth_k = mean(recent raw c_raw values)
+```
+
+HCS is only an auxiliary failure mode. It does not turn the system into a repetition detector plus LLM bridge, and it does not use Hinit routing, LLM judging, answer probes, boxed-answer parsing, embeddings, hidden states, or diverse sampling.
+
+## 1. Calibration Is Disabled
+
+Formal runs should not set a calibration path and should not run calibration mode.
+
+Required config:
+
+```json
+{
+  "method": "sarr_code_v2_raw_hcs_confirmed_rollback",
+  "calibration": {
+    "enabled": false,
+    "build_cdf": false,
+    "load_cdf": false,
+    "use_percentile": false
+  },
+  "confidence": {
+    "percentile_normalization": false,
+    "calibration_path": null
+  }
+}
+```
+
+`c_norm` and `c_smooth` may still appear as backward-compatible log fields, but they are not used for rollback, anchor refresh, HCS, startup, or low-confidence collapse. The run script does not load a normalizer during `--mode run`.
+
+If `confidence.calibration_path` is set, or any `calibration.*` switch is enabled, the run fails fast.
+
+## 2. Local Assets
+
+Configure model and dataset paths in:
 
 ```bash
 configs/sarr_code_aggressive.json
@@ -26,15 +65,15 @@ Important fields:
     "chat_template_path": "server/template/qwen3.jinja",
     "backend": "openai",
     "api_base_url": "http://127.0.0.1:8000/v1",
-    "api_model": "Qwen-32B",
+    "api_model": "qwen3-4B",
     "local_files_only": true
   }
 }
 ```
 
-The SLM is loaded by transformers in the experiment process so later diagnostics can access full logits. The LLM is expected to run as a vLLM OpenAI-compatible server.
+The SLM is loaded locally through transformers so the experiment can read next-token logits for raw continuation confidence. The LLM is expected to run as an OpenAI-compatible vLLM server.
 
-## 2. Start vLLM for the LLM
+## 3. Start vLLM for the LLM
 
 Example:
 
@@ -50,31 +89,11 @@ GPU_MEMORY_UTILIZATION=0.6 \
 bash server/serve.sh
 ```
 
-Use `server/template/deepseekr1.jinja` for DeepSeek-R1-style models and `server/template/qwen3.jinja` for Qwen3-style models. The experiment script also loads the configured template locally to render completion prompts consistently.
+Use `server/template/deepseekr1.jinja` for DeepSeek-R1-style models and `server/template/qwen3.jinja` for Qwen3-style models.
 
-## 3. Build Percentile Calibration
+## 4. Run SARR-CoDE Raw HCS
 
-Run SLM-only calibration first:
-
-```bash
-python scripts/run_sarr_code.py \
-  --config configs/sarr_code_aggressive.json \
-  --mode calibrate \
-  --dataset aime25 \
-  --max-problems 30 \
-  --calibration-output sarr_results/calibration/aime25_slm_cdf.json
-```
-
-This writes:
-
-```text
-sarr_results/calibration/aime25_slm_cdf.json
-sarr_results/calibration/aime25_slm_cdf.traces.jsonl
-```
-
-The formal run requires `confidence.calibration_path` unless `confidence.allow_identity_normalizer=true` is explicitly enabled for debugging.
-
-## 4. Run SARR-CoDE
+Do not run `--mode calibrate`. Run the experiment directly:
 
 ```bash
 python scripts/run_sarr_code.py \
@@ -89,7 +108,7 @@ python scripts/run_sarr_code.py \
 Outputs are written under:
 
 ```text
-sarr_results/<dataset>/sarr_code_aggressive_prefix/
+sarr_results/<dataset>/sarr_code_v2_raw_hcs_confirmed_rollback/
 ```
 
 Per problem:
@@ -109,9 +128,172 @@ summary.csv
 summary_metrics.json
 ```
 
-## 5. Run The D1-D8 Sweep
+## 5. Raw Readiness
 
-After calibration is ready and `confidence.calibration_path` points to it, run:
+Recommended defaults:
+
+```json
+{
+  "readiness": {
+    "signal": "continuation_confidence",
+    "normalization": "raw",
+    "use_calibration": false,
+    "value_field": "c_raw",
+    "smooth_window": 3,
+    "high_threshold": 0.75,
+    "low_threshold": 0.35
+  }
+}
+```
+
+Each step records:
+
+```json
+{
+  "calibration_enabled": false,
+  "readiness_source": "raw",
+  "c_raw": 0.83,
+  "readiness_raw": 0.83,
+  "readiness_raw_smooth": 0.79,
+  "readiness_high": true,
+  "readiness_low": false
+}
+```
+
+All strategy decisions read readiness through the raw readiness path. Do not use `c_norm` or old percentile-smoothed `c_smooth` for interpretation of current decisions.
+
+## 6. HCS Configuration
+
+Recommended defaults:
+
+```json
+{
+  "stagnation": {
+    "enabled": true,
+    "unit": "step_or_small_block",
+    "block_min_tokens": 32,
+    "block_max_steps": 2,
+    "metric": "word_3gram_jaccard",
+    "repeat_window": 10,
+    "high_threshold": 0.85
+  },
+  "anchor": {
+    "type": "clean_autonomy_anchor",
+    "refresh_condition": "raw_readiness_high_and_not_hcs_suspect",
+    "freeze_on_hcs_suspect": true,
+    "fallback": "startup_anchor_or_zero"
+  },
+  "hcs": {
+    "enabled": true,
+    "enable_after_clean_anchor": true,
+    "suspect_condition": "raw_readiness_high_and_stagnation_high",
+    "suspect_patience": 3,
+    "action": "rollback_to_clean_anchor",
+    "max_hcs_rollbacks_per_problem": 2
+  }
+}
+```
+
+HCS suspect condition:
+
+```text
+readiness_raw_smooth >= readiness.high_threshold
+and
+stagnation_score >= stagnation.high_threshold
+```
+
+A suspect step is logged immediately and cannot refresh `clean_autonomy_anchor`. HCS confirms after three consecutive suspect SLM steps/blocks. Rollback target is always `clean_autonomy_anchor`, never the stagnation onset.
+
+## 7. HCS Recovery
+
+Recommended defaults:
+
+```json
+{
+  "hcs_recovery": {
+    "generator": "llm",
+    "prompt_type": "normal_continuation",
+    "mention_stagnation": false,
+    "mention_repetition": false,
+    "max_llm_steps": 2,
+    "max_tokens_per_step": 128,
+    "return_to_slm_after_recovery": true
+  }
+}
+```
+
+After HCS rollback, the LLM sees only the clean prefix and uses the normal continuation prompt path. The prompt must not mention stagnation, repetition, stuckness, loops, strategy changes, or repair instructions.
+
+HCS rollback events include:
+
+```json
+{
+  "event": "hcs_rollback",
+  "reason": "HCS_CONFIRMED_RAW_READINESS",
+  "trigger_step": 135,
+  "clean_anchor_step": 118,
+  "rollback_span": 17,
+  "hcs_rollback_count": 1,
+  "readiness_source": "raw",
+  "calibration_enabled": false,
+  "llm_recovery_prompt_type": "normal_continuation",
+  "mention_stagnation": false,
+  "return_to_slm": true
+}
+```
+
+## 8. Low-Confidence Path
+
+Low-confidence collapse remains independent from HCS and also uses raw readiness:
+
+```json
+{
+  "low_confidence": {
+    "useful_exploration_grace_blocks": 2,
+    "collapse_patience_blocks": 3,
+    "action_after_patience": "existing_rollback_recovery"
+  }
+}
+```
+
+If raw readiness is low or raw-readiness degeneration appears during the grace window, the step is logged as `USEFUL_EXPLORATION` and SLM continues. If it persists through the patience window, the existing rollback/recovery path is used. This path does not require stagnation.
+
+## 9. Startup
+
+HCS does not handle startup bad prefixes:
+
+```json
+{
+  "startup_guard": {
+    "hcs_enabled": false,
+    "enable_hcs_after_clean_anchor": true
+  }
+}
+```
+
+Startup continues to use the existing startup rollback / confidence-degeneration logic, but the confidence signal is raw readiness. Jaccard stagnation detection does not interfere with startup.
+
+## 10. Problem 6 Checks
+
+For Problem 6, inspect `steps.jsonl` and `rollback_events.jsonl`:
+
+```text
+calibration_enabled=false
+readiness_source=raw
+readiness_raw_smooth is present
+hcs_suspect appears on high-confidence repeated tail steps
+anchor_refresh_blocked_reason=HCS_SUSPECT during suspect steps
+third consecutive suspect triggers event=hcs_rollback
+reason=HCS_CONFIRMED_RAW_READINESS
+clean_anchor_step is the rollback target
+hcs_rollback_count <= 2
+```
+
+The expected behavior is that the high-confidence repeated tail is deleted back to the clean autonomy anchor, LLM performs one or two ordinary continuation steps, and control returns to SLM without another long high-confidence loop.
+
+## 11. Sweep
+
+The existing sweep script can still materialize variants:
 
 ```bash
 python scripts/run_sarr_sweep.py \
@@ -122,86 +304,9 @@ python scripts/run_sarr_sweep.py \
   --resume
 ```
 
-The sweep script materializes one config per variant under:
+The sweep should inherit raw-readiness settings from the base config. Do not add calibration paths to generated variants.
 
-```text
-sarr_results/<dataset>/sarr_sweep/configs/
-```
-
-and writes:
-
-```text
-sarr_results/<dataset>/sarr_sweep/variant_manifest.json
-sarr_results/<dataset>/sarr_sweep/sweep_summary.csv
-sarr_results/<dataset>/sarr_sweep/sweep_summary.json
-```
-
-To run a subset:
-
-```bash
-python scripts/run_sarr_sweep.py \
-  --base-config configs/sarr_code_aggressive.json \
-  --dataset aime25 \
-  --only D1_balanced_055,D5_conservative \
-  --resume
-```
-
-Use `--dry-run` to print the commands without launching model runs.
-
-## 6. Method Boundary
-
-Only the `<think>...</think>` portion uses SARR-CoDE collaboration. There is no step-count limit; thinking stops by natural `</think>`/EOS, context exhaustion, or the configurable thinking token budget. If the token budget is hit, `generation.force_close_think_on_budget` controls whether the script appends the configured `</think>` bridge. The final answer is then generated with `generation.final_answer_generator` and does not feed back into routing or rollback decisions.
-
-## 7. Post-Stable SUSPECT Confirmation
-
-Post-stable destructive rollback is not triggered by a single CoDE-style degeneration event. A low continuation confidence after a generated step means the SLM is uncertain about the next continuation; it does not by itself prove that the already generated prefix is wrong.
-
-The post-stable monitor therefore uses:
-
-```text
-STARTUP -> STABLE -> SUSPECT -> DEGENERATED
-```
-
-When `STABLE` sees a degeneration event, the run enters `SUSPECT` and records the last stable anchor. SLM then generates confirmation steps. If confidence recovers to `theta_s`, the state returns to `STABLE`. If degeneration is confirmed by continued deterioration or by staying below `theta_s` through the suspect horizon, destructive rollback is applied to the recorded stable anchor.
-
-Rollback records include fields useful for diagnosing this path:
-
-```json
-{
-  "requested_anchor_step": 38,
-  "anchor_step": 38,
-  "suspect_start_step": 39,
-  "suspect_steps": 1,
-  "D_suspect": 1
-}
-```
-
-Configured behavior:
-
-```json
-{
-  "rollback": {
-    "long_span_policy": "fallback_once_then_rollback",
-    "max_long_span_fallbacks_per_anchor": 1,
-    "long_span_recovery_steps": 1,
-    "post_stable_intervention_policy": "suspect_confirmed_rollback",
-    "suspect_confirm_steps": 1,
-    "suspect_max_steps": 2,
-    "tau_confirm": 1,
-    "anchor_repeat_policy": "suppress",
-    "anchor_repeat_backoff_after": 1,
-    "anchor_repeat_backoff_steps": 1,
-    "max_root_rollbacks": 2,
-    "root_rollback_action": "force_close_think"
-  }
-}
-```
-
-If recovery returns `SLM_READY`, the main loop resumes from `STABLE` instead of discarding that signal and returning to startup monitoring.
-
-Repeated rollback requests at the same anchor are suppressed by default as a safety guard and the current prefix is treated as stable. To reproduce the older aggressive behavior, set `anchor_repeat_policy` to `backoff`; repeated requests then move the effective rollback anchor earlier. If the requested anchor is already root and repeats beyond `max_root_rollbacks`, the run closes `<think>` and proceeds to final-answer generation.
-
-## 8. Summary Metrics
+## 12. Summary Metrics
 
 `summary_metrics.json` records:
 
@@ -209,6 +314,7 @@ Repeated rollback requests at the same anchor are suppressed by default as a saf
 rollback_rate
 startup_rollback_rate
 post_stable_rollback_rate
+hcs_rollback_rate
 avg_rollback_span
 avg_recovery_steps
 recovery_ready_rate
@@ -218,4 +324,11 @@ force_slm_after_recovery_fail_rate
 llm_token_ratio
 ```
 
-The rate denominators are explicit in the raw per-problem fields in `summary.csv`. Rollback type rates are problem-level trigger rates. Recovery rates and average spans are aggregated over rollback events. `force_slm_after_recovery_fail_rate` is the fraction of forced SLM handoffs that roll back again before reaching a stable anchor.
+Raw per-problem fields in `summary.csv` include:
+
+```text
+hcs_rollback_count
+has_hcs_rollback
+hcs_suspect_count
+hcs_confirmed_count
+```

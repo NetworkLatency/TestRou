@@ -1,5 +1,5 @@
 {
-  "method": "sarr_code_aggressive_prefix",
+  "method": "sarr_code_v2_raw_hcs_confirmed_rollback",
   "slm": {
     "model_path": "/home/lhyang/Documents/code/reasoning_boundary/models/deepseek-aiDeepSeek-R1-Distill-Qwen-1.5B/",
     "tokenizer_path": null,
@@ -43,12 +43,69 @@
   },
   "confidence": {
     "topk_entropy": 20,
-    "percentile_normalization": true,
-    "calibration_path": "sarr_results/calibration/aime25_slm_cdf.json",
+    "percentile_normalization": false,
+    "calibration_path": null,
     "allow_identity_normalizer": false,
     "smooth_window": 2,
     "delta": 0.55,
     "capture_slm_token_entropy": false
+  },
+  "calibration": {
+    "enabled": false,
+    "build_cdf": false,
+    "load_cdf": false,
+    "use_percentile": false
+  },
+  "readiness": {
+    "signal": "continuation_confidence",
+    "normalization": "raw",
+    "use_calibration": false,
+    "value_field": "c_raw",
+    "high_threshold": 0.75,
+    "low_threshold": 0.35,
+    "smooth_window": 3
+  },
+  "stagnation": {
+    "enabled": true,
+    "unit": "step_or_small_block",
+    "block_min_tokens": 32,
+    "block_max_steps": 2,
+    "metric": "word_3gram_jaccard",
+    "repeat_window": 10,
+    "ngram_n": 3,
+    "high_threshold": 0.85
+  },
+  "anchor": {
+    "type": "clean_autonomy_anchor",
+    "refresh_condition": "raw_readiness_high_and_not_hcs_suspect",
+    "freeze_on_hcs_suspect": true,
+    "fallback": "startup_anchor_or_zero"
+  },
+  "hcs": {
+    "enabled": true,
+    "enable_after_clean_anchor": true,
+    "suspect_condition": "raw_readiness_high_and_stagnation_high",
+    "suspect_patience": 3,
+    "action": "rollback_to_clean_anchor",
+    "max_hcs_rollbacks_per_problem": 2
+  },
+  "hcs_recovery": {
+    "generator": "llm",
+    "prompt_type": "normal_continuation",
+    "mention_stagnation": false,
+    "mention_repetition": false,
+    "max_llm_steps": 2,
+    "max_tokens_per_step": 128,
+    "return_to_slm_after_recovery": true
+  },
+  "low_confidence": {
+    "useful_exploration_grace_blocks": 2,
+    "collapse_patience_blocks": 3,
+    "action_after_patience": "existing_rollback_recovery"
+  },
+  "startup_guard": {
+    "hcs_enabled": false,
+    "enable_hcs_after_clean_anchor": true
   },
   "startup": {
     "B_min": 2,
@@ -76,6 +133,10 @@
     "anchor_repeat_backoff_steps": 1,
     "max_root_rollbacks": 2,
     "root_rollback_action": "force_close_think"
+  },
+  "budget": {
+    "max_total_hcs_llm_tokens_per_problem": 512,
+    "max_total_llm_recovery_tokens_per_problem": 1024
   },
   "logging": {
     "save_step_records": true,

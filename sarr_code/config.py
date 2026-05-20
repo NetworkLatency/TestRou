@@ -54,7 +54,7 @@ class GenerationConfig:
 @dataclass
 class ConfidenceConfig:
     topk_entropy: int = 20
-    percentile_normalization: bool = True
+    percentile_normalization: bool = False
     calibration_path: str | None = None
     allow_identity_normalizer: bool = False
     smooth_window: int = 2
@@ -66,6 +66,171 @@ class ConfidenceConfig:
             raise ValueError("confidence.topk_entropy must be >= 2")
         if self.smooth_window < 1:
             raise ValueError("confidence.smooth_window must be >= 1")
+
+
+@dataclass
+class CalibrationConfig:
+    enabled: bool = False
+    build_cdf: bool = False
+    load_cdf: bool = False
+    use_percentile: bool = False
+
+    def __post_init__(self) -> None:
+        if self.enabled or self.build_cdf or self.load_cdf or self.use_percentile:
+            raise ValueError("This experiment disables calibration; calibration.* must all be false")
+
+
+@dataclass
+class ReadinessConfig:
+    signal: str = "continuation_confidence"
+    normalization: str = "raw"
+    use_calibration: bool = False
+    value_field: str = "c_raw"
+    high_threshold: float = 0.75
+    low_threshold: float = 0.35
+    smooth_window: int = 3
+
+    def __post_init__(self) -> None:
+        if self.signal != "continuation_confidence":
+            raise ValueError("readiness.signal must be 'continuation_confidence'")
+        if self.normalization != "raw":
+            raise ValueError("This experiment disables calibration; readiness.normalization must be 'raw'")
+        if self.use_calibration:
+            raise ValueError("This experiment disables calibration; readiness.use_calibration must be false")
+        if self.value_field != "c_raw":
+            raise ValueError("This experiment disables calibration; readiness.value_field must be 'c_raw'")
+        if not 0.0 <= self.high_threshold <= 1.0:
+            raise ValueError("readiness.high_threshold must be in [0, 1]")
+        if not 0.0 <= self.low_threshold <= 1.0:
+            raise ValueError("readiness.low_threshold must be in [0, 1]")
+        if self.low_threshold > self.high_threshold:
+            raise ValueError("readiness.low_threshold must be <= readiness.high_threshold")
+        if self.smooth_window < 1:
+            raise ValueError("readiness.smooth_window must be >= 1")
+
+
+@dataclass
+class StagnationConfig:
+    enabled: bool = True
+    unit: str = "step_or_small_block"
+    block_min_tokens: int = 32
+    block_max_steps: int = 2
+    metric: str = "word_3gram_jaccard"
+    repeat_window: int = 10
+    ngram_n: int = 3
+    high_threshold: float = 0.85
+
+    def __post_init__(self) -> None:
+        if self.unit != "step_or_small_block":
+            raise ValueError("stagnation.unit must be 'step_or_small_block'")
+        if self.block_min_tokens < 1:
+            raise ValueError("stagnation.block_min_tokens must be >= 1")
+        if self.block_max_steps < 1:
+            raise ValueError("stagnation.block_max_steps must be >= 1")
+        if self.metric != "word_3gram_jaccard":
+            raise ValueError("stagnation.metric must be 'word_3gram_jaccard'")
+        if self.repeat_window < 1:
+            raise ValueError("stagnation.repeat_window must be >= 1")
+        if self.ngram_n < 1:
+            raise ValueError("stagnation.ngram_n must be >= 1")
+        if not 0.0 <= self.high_threshold <= 1.0:
+            raise ValueError("stagnation.high_threshold must be in [0, 1]")
+
+
+@dataclass
+class AnchorConfig:
+    type: str = "clean_autonomy_anchor"
+    refresh_condition: str = "raw_readiness_high_and_not_hcs_suspect"
+    freeze_on_hcs_suspect: bool = True
+    fallback: str = "startup_anchor_or_zero"
+
+    def __post_init__(self) -> None:
+        if self.type != "clean_autonomy_anchor":
+            raise ValueError("anchor.type must be 'clean_autonomy_anchor'")
+        if self.refresh_condition != "raw_readiness_high_and_not_hcs_suspect":
+            raise ValueError("anchor.refresh_condition must be 'raw_readiness_high_and_not_hcs_suspect'")
+        if self.fallback not in {"startup_anchor_or_zero", "zero"}:
+            raise ValueError("anchor.fallback must be 'startup_anchor_or_zero' or 'zero'")
+
+
+@dataclass
+class HCSConfig:
+    enabled: bool = True
+    enable_after_clean_anchor: bool = True
+    suspect_condition: str = "raw_readiness_high_and_stagnation_high"
+    suspect_patience: int = 3
+    action: str = "rollback_to_clean_anchor"
+    max_hcs_rollbacks_per_problem: int = 2
+
+    def __post_init__(self) -> None:
+        if self.suspect_condition != "raw_readiness_high_and_stagnation_high":
+            raise ValueError("hcs.suspect_condition must be 'raw_readiness_high_and_stagnation_high'")
+        if self.suspect_patience < 1:
+            raise ValueError("hcs.suspect_patience must be >= 1")
+        if self.action != "rollback_to_clean_anchor":
+            raise ValueError("hcs.action must be 'rollback_to_clean_anchor'")
+        if self.max_hcs_rollbacks_per_problem < 0:
+            raise ValueError("hcs.max_hcs_rollbacks_per_problem must be >= 0")
+
+
+@dataclass
+class HCSRecoveryConfig:
+    generator: str = "llm"
+    prompt_type: str = "normal_continuation"
+    mention_stagnation: bool = False
+    mention_repetition: bool = False
+    max_llm_steps: int = 2
+    max_tokens_per_step: int = 128
+    return_to_slm_after_recovery: bool = True
+
+    def __post_init__(self) -> None:
+        if self.generator != "llm":
+            raise ValueError("hcs_recovery.generator must be 'llm'")
+        if self.prompt_type != "normal_continuation":
+            raise ValueError("hcs_recovery.prompt_type must be 'normal_continuation'")
+        if self.mention_stagnation:
+            raise ValueError("hcs_recovery.mention_stagnation must remain false")
+        if self.mention_repetition:
+            raise ValueError("hcs_recovery.mention_repetition must remain false")
+        if self.max_llm_steps < 1:
+            raise ValueError("hcs_recovery.max_llm_steps must be >= 1")
+        if self.max_tokens_per_step < 1:
+            raise ValueError("hcs_recovery.max_tokens_per_step must be >= 1")
+
+
+@dataclass
+class LowConfidenceConfig:
+    useful_exploration_grace_blocks: int = 2
+    collapse_patience_blocks: int = 3
+    action_after_patience: str = "existing_rollback_recovery"
+
+    def __post_init__(self) -> None:
+        if self.useful_exploration_grace_blocks < 0:
+            raise ValueError("low_confidence.useful_exploration_grace_blocks must be >= 0")
+        if self.collapse_patience_blocks < 1:
+            raise ValueError("low_confidence.collapse_patience_blocks must be >= 1")
+        if self.collapse_patience_blocks <= self.useful_exploration_grace_blocks:
+            raise ValueError("low_confidence.collapse_patience_blocks must be > useful_exploration_grace_blocks")
+        if self.action_after_patience != "existing_rollback_recovery":
+            raise ValueError("low_confidence.action_after_patience must be 'existing_rollback_recovery'")
+
+
+@dataclass
+class StartupGuardConfig:
+    hcs_enabled: bool = False
+    enable_hcs_after_clean_anchor: bool = True
+
+
+@dataclass
+class BudgetConfig:
+    max_total_hcs_llm_tokens_per_problem: int = 512
+    max_total_llm_recovery_tokens_per_problem: int = 1024
+
+    def __post_init__(self) -> None:
+        if self.max_total_hcs_llm_tokens_per_problem < 0:
+            raise ValueError("budget.max_total_hcs_llm_tokens_per_problem must be >= 0")
+        if self.max_total_llm_recovery_tokens_per_problem < 0:
+            raise ValueError("budget.max_total_llm_recovery_tokens_per_problem must be >= 0")
 
 
 @dataclass
@@ -173,7 +338,7 @@ class RuntimeConfig:
 
 @dataclass
 class SARRConfig:
-    method: str = "sarr_code_aggressive_prefix"
+    method: str = "sarr_code_v2_raw_hcs_confirmed_rollback"
     metadata: dict[str, Any] = field(default_factory=dict)
     slm: ModelRuntimeConfig = field(default_factory=lambda: ModelRuntimeConfig(model_path=""))
     llm: ModelRuntimeConfig = field(default_factory=lambda: ModelRuntimeConfig(model_path="", backend="openai"))
@@ -181,9 +346,18 @@ class SARRConfig:
     dataset_paths: dict[str, str] = field(default_factory=dict)
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
+    calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
+    readiness: ReadinessConfig = field(default_factory=ReadinessConfig)
+    stagnation: StagnationConfig = field(default_factory=StagnationConfig)
+    anchor: AnchorConfig = field(default_factory=AnchorConfig)
+    hcs: HCSConfig = field(default_factory=HCSConfig)
+    hcs_recovery: HCSRecoveryConfig = field(default_factory=HCSRecoveryConfig)
+    low_confidence: LowConfidenceConfig = field(default_factory=LowConfidenceConfig)
+    startup_guard: StartupGuardConfig = field(default_factory=StartupGuardConfig)
     startup: StartupConfig = field(default_factory=StartupConfig)
     stable: StableConfig = field(default_factory=StableConfig)
     rollback: RollbackConfig = field(default_factory=RollbackConfig)
+    budget: BudgetConfig = field(default_factory=BudgetConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
@@ -207,15 +381,28 @@ class SARRConfig:
         for key, cls_ in [
             ("generation", GenerationConfig),
             ("confidence", ConfidenceConfig),
+            ("calibration", CalibrationConfig),
+            ("readiness", ReadinessConfig),
+            ("stagnation", StagnationConfig),
+            ("anchor", AnchorConfig),
+            ("hcs", HCSConfig),
+            ("hcs_recovery", HCSRecoveryConfig),
+            ("low_confidence", LowConfidenceConfig),
+            ("startup_guard", StartupGuardConfig),
             ("startup", StartupConfig),
             ("stable", StableConfig),
             ("rollback", RollbackConfig),
+            ("budget", BudgetConfig),
             ("logging", LoggingConfig),
             ("runtime", RuntimeConfig),
         ]:
             if isinstance(kwargs.get(key), dict):
                 kwargs[key] = cls_(**kwargs[key])
         cfg = cls(**kwargs)
+        if cfg.confidence.percentile_normalization:
+            raise ValueError("This experiment disables calibration; confidence.percentile_normalization must be false")
+        if cfg.confidence.calibration_path:
+            raise ValueError("This experiment disables calibration; confidence.calibration_path must be null")
         if cfg.slm.backend != "transformers":
             raise ValueError("SARR-CoDE requires slm.backend='transformers' for local logits diagnostics.")
         if cfg.llm.backend == "transformers":

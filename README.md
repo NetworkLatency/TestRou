@@ -6,7 +6,7 @@ The active new experiment path is **SARR-CoDE: Stability-Aware Rollback Routing 
 python scripts/run_sarr_code.py --config configs/sarr_code_aggressive.json --mode run --dataset aime25
 ```
 
-See `docs/sarr_code.md` for the offline server workflow, local transformers SLM setup, vLLM LLM startup, percentile calibration, and JSONL log outputs.
+See `docs/sarr_code.md` for the offline server workflow, local transformers SLM setup, vLLM LLM startup, raw-readiness HCS configuration, and JSONL log outputs.
 
 The older compact validation path is still present for reference:
 

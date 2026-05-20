@@ -29,6 +29,22 @@ class StepRecord:
     c_raw: float | None = None
     c_norm: float | None = None
     c_smooth: float | None = None
+    readiness_raw: float | None = None
+    readiness_raw_smooth: float | None = None
+    readiness_source: str = "raw"
+    calibration_enabled: bool = False
+    readiness: float | None = None
+    readiness_high: bool = False
+    readiness_low: bool = False
+    stagnation_score: float = 0.0
+    stagnation_high: bool = False
+    hcs_suspect: bool = False
+    hcs_suspect_run: int = 0
+    hcs_confirmed: bool = False
+    clean_autonomy_anchor: int | None = None
+    anchor_refresh_allowed: bool = False
+    anchor_refresh_blocked_reason: str | None = None
+    autonomy_state: str | None = None
 
     state_before: str | None = None
     state_after: str | None = None
@@ -84,3 +100,11 @@ class RollbackEvent:
     long_span_recovery_limited: bool = False
     force_next_step_slm: bool = True
     force_slm_after_recovery_failed: bool | None = None
+    event: str | None = None
+    clean_anchor_step: int | None = None
+    hcs_rollback_count: int = 0
+    readiness_source: str | None = None
+    calibration_enabled: bool | None = None
+    llm_recovery_prompt_type: str | None = None
+    mention_stagnation: bool | None = None
+    return_to_slm: bool | None = None
