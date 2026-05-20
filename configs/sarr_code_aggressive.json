@@ -66,7 +66,11 @@
     "force_slm_after_recovery": true,
     "long_span_policy": "fallback_once_then_rollback",
     "max_long_span_fallbacks_per_anchor": 1,
-    "long_span_recovery_steps": 1
+    "long_span_recovery_steps": 1,
+    "anchor_repeat_backoff_after": 1,
+    "anchor_repeat_backoff_steps": 1,
+    "max_root_rollbacks": 2,
+    "root_rollback_action": "force_close_think"
   },
   "logging": {
     "save_step_records": true,

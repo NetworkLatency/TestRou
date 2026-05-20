@@ -71,6 +71,9 @@ class RollbackEvent:
     recovery_max_steps: int
     recovery_actual_steps: int
     recovery_c_norm: list[float]
+    requested_anchor_step: int | None = None
+    anchor_repeat_count_before: int = 0
+    anchor_backoff_steps: int = 0
     fallback_no_delete: bool = False
     long_span: bool = False
     long_span_policy: str | None = None

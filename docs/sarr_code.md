@@ -152,7 +152,38 @@ Use `--dry-run` to print the commands without launching model runs.
 
 Only the `<think>...</think>` portion uses SARR-CoDE collaboration. There is no step-count limit; thinking stops by natural `</think>`/EOS, context exhaustion, or the configurable thinking token budget. If the token budget is hit, `generation.force_close_think_on_budget` controls whether the script appends the configured `</think>` bridge. The final answer is then generated with `generation.final_answer_generator` and does not feed back into routing or rollback decisions.
 
-## 7. Summary Metrics
+## 7. Rollback Convergence Guards
+
+The thinking token budget is measured on the active retained prefix. Rollback can delete suffix steps, so repeated rollback at the same prefix position can prevent the active prefix from monotonically reaching the budget. To avoid anchor-level cycles without restoring a global `max_steps` limit, rollback records include:
+
+```json
+{
+  "requested_anchor_step": 38,
+  "anchor_step": 37,
+  "anchor_repeat_count_before": 1,
+  "anchor_backoff_steps": 1
+}
+```
+
+Configured behavior:
+
+```json
+{
+  "rollback": {
+    "long_span_policy": "fallback_once_then_rollback",
+    "max_long_span_fallbacks_per_anchor": 1,
+    "long_span_recovery_steps": 1,
+    "anchor_repeat_backoff_after": 1,
+    "anchor_repeat_backoff_steps": 1,
+    "max_root_rollbacks": 2,
+    "root_rollback_action": "force_close_think"
+  }
+}
+```
+
+The first repeated rollback request at the same anchor backs off the effective rollback anchor by one step; further repeats back off farther. If the requested anchor is already root and repeats beyond `max_root_rollbacks`, the run closes `<think>` and proceeds to final-answer generation.
+
+## 8. Summary Metrics
 
 `summary_metrics.json` records:
 

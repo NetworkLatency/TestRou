@@ -373,6 +373,7 @@ def run_sarr_code(
     force_next_step_slm = False
     pending_force_recovery_event_idx: int | None = None
     long_span_fallback_counts: dict[int, int] = {}
+    rollback_anchor_counts: dict[int, int] = {}
     startup_monitor_steps = 0
     attempt_id = 1
     stop_reason: str | None = None
@@ -517,6 +518,37 @@ def run_sarr_code(
                 continue
 
             current_step_id = len(active_records)
+            requested_anchor = anchor
+            anchor_repeat_count_before = rollback_anchor_counts.get(requested_anchor, 0)
+            if (
+                requested_anchor == 0
+                and cfg.rollback.root_rollback_action == "force_close_think"
+                and anchor_repeat_count_before >= cfg.rollback.max_root_rollbacks
+            ):
+                record.action = "ROOT_ROLLBACK_FORCE_CLOSE_THINK"
+                record.extra["root_rollback_count_before"] = anchor_repeat_count_before
+                if step_logs:
+                    step_logs[-1] = _serialize_step(record)
+                state.trace.append(
+                    TraceEvent(
+                        current_step_id,
+                        "root_rollback_limit",
+                        {
+                            "requested_anchor_step": requested_anchor,
+                            "root_rollback_count_before": anchor_repeat_count_before,
+                            "max_root_rollbacks": cfg.rollback.max_root_rollbacks,
+                        },
+                    )
+                )
+                stop_reason = "root_rollback_limit"
+                break
+
+            anchor_backoff_steps = 0
+            if anchor_repeat_count_before >= cfg.rollback.anchor_repeat_backoff_after:
+                repeats_after_threshold = anchor_repeat_count_before - cfg.rollback.anchor_repeat_backoff_after + 1
+                anchor_backoff_steps = repeats_after_threshold * cfg.rollback.anchor_repeat_backoff_steps
+                anchor = max(0, requested_anchor - anchor_backoff_steps)
+
             rollback_context, kept, removed, span = rollback_to_anchor(
                 state.problem_text,
                 active_records,
@@ -524,7 +556,7 @@ def run_sarr_code(
                 current_step_id,
             )
             long_span = span > cfg.rollback.M_max
-            long_span_fallback_count_before = long_span_fallback_counts.get(anchor, 0)
+            long_span_fallback_count_before = long_span_fallback_counts.get(requested_anchor, 0)
             allow_long_span_delete = False
             if long_span:
                 if cfg.rollback.long_span_policy == "rollback_to_anchor":
@@ -536,7 +568,7 @@ def run_sarr_code(
             fallback_no_delete = span <= 0 or (long_span and not allow_long_span_delete)
             if fallback_no_delete:
                 if long_span:
-                    long_span_fallback_counts[anchor] = long_span_fallback_count_before + 1
+                    long_span_fallback_counts[requested_anchor] = long_span_fallback_count_before + 1
                 rollback_context = state.assistant_prefix_text
                 kept = list(active_records)
                 removed = []
@@ -579,6 +611,9 @@ def run_sarr_code(
                 trigger_step=current_step_id,
                 anchor_step=anchor,
                 rollback_span=span,
+                requested_anchor_step=requested_anchor,
+                anchor_repeat_count_before=anchor_repeat_count_before,
+                anchor_backoff_steps=anchor_backoff_steps,
                 removed_steps=_serialize_removed(removed),
                 recovery_steps=[_serialize_step(r) for r in rec_records],
                 stop_reason=rec_stop_reason,
@@ -593,6 +628,7 @@ def run_sarr_code(
                 force_next_step_slm=cfg.rollback.force_slm_after_recovery,
             )
             rollback_events.append(event)
+            rollback_anchor_counts[requested_anchor] = anchor_repeat_count_before + 1
             if cfg.rollback.force_slm_after_recovery:
                 pending_force_recovery_event_idx = len(rollback_events) - 1
             state.trace.append(TraceEvent(current_step_id, "rollback_event", asdict(event)))
@@ -636,7 +672,7 @@ def run_sarr_code(
         rollback_events[pending_force_recovery_event_idx].force_slm_after_recovery_failed = False
         pending_force_recovery_event_idx = None
 
-    if stop_reason == "think_token_budget":
+    if stop_reason in {"think_token_budget", "root_rollback_limit"}:
         should_force = cfg.generation.force_close_think_on_budget
         if should_force and not has_close_think_tag(state.assistant_prefix_text):
             state.assistant_prefix_text += cfg.generation.force_close_think_text

@@ -104,6 +104,10 @@ class RollbackConfig:
     long_span_policy: str = "fallback_once_then_rollback"
     max_long_span_fallbacks_per_anchor: int = 1
     long_span_recovery_steps: int = 1
+    anchor_repeat_backoff_after: int = 1
+    anchor_repeat_backoff_steps: int = 1
+    max_root_rollbacks: int = 2
+    root_rollback_action: str = "force_close_think"
 
     def __post_init__(self) -> None:
         if self.M_max < 1:
@@ -119,6 +123,14 @@ class RollbackConfig:
             raise ValueError("rollback.max_long_span_fallbacks_per_anchor must be >= 0")
         if self.long_span_recovery_steps < 1:
             raise ValueError("rollback.long_span_recovery_steps must be >= 1")
+        if self.anchor_repeat_backoff_after < 1:
+            raise ValueError("rollback.anchor_repeat_backoff_after must be >= 1")
+        if self.anchor_repeat_backoff_steps < 0:
+            raise ValueError("rollback.anchor_repeat_backoff_steps must be >= 0")
+        if self.max_root_rollbacks < 0:
+            raise ValueError("rollback.max_root_rollbacks must be >= 0")
+        if self.root_rollback_action not in {"force_close_think", "allow"}:
+            raise ValueError("rollback.root_rollback_action must be 'force_close_think' or 'allow'")
 
 
 @dataclass
@@ -167,11 +179,6 @@ class SARRConfig:
         if unknown:
             raise ValueError(f"Unknown SARRConfig keys: {unknown}")
         kwargs = dict(data)
-        if isinstance(kwargs.get("generation"), dict):
-            # Compatibility with configs materialized by the short-lived
-            # compute-budget guard. The guard was removed; stale sweep configs
-            # should not fail before model loading.
-            kwargs["generation"].pop("max_total_thinking_decode_tokens", None)
         if isinstance(kwargs.get("slm"), dict):
             kwargs["slm"] = ModelRuntimeConfig(**kwargs["slm"])
         if isinstance(kwargs.get("llm"), dict):
