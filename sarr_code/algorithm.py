@@ -372,6 +372,7 @@ def run_sarr_code(
     c_smooth_history: list[float] = []
     force_next_step_slm = False
     pending_force_recovery_event_idx: int | None = None
+    long_span_fallback_counts: dict[int, int] = {}
     startup_monitor_steps = 0
     attempt_id = 1
     stop_reason: str | None = None
@@ -522,8 +523,20 @@ def run_sarr_code(
                 anchor,
                 current_step_id,
             )
-            fallback_no_delete = span <= 0 or span > cfg.rollback.M_max
+            long_span = span > cfg.rollback.M_max
+            long_span_fallback_count_before = long_span_fallback_counts.get(anchor, 0)
+            allow_long_span_delete = False
+            if long_span:
+                if cfg.rollback.long_span_policy == "rollback_to_anchor":
+                    allow_long_span_delete = True
+                elif cfg.rollback.long_span_policy == "fallback_once_then_rollback":
+                    allow_long_span_delete = (
+                        long_span_fallback_count_before >= cfg.rollback.max_long_span_fallbacks_per_anchor
+                    )
+            fallback_no_delete = span <= 0 or (long_span and not allow_long_span_delete)
             if fallback_no_delete:
+                if long_span:
+                    long_span_fallback_counts[anchor] = long_span_fallback_count_before + 1
                 rollback_context = state.assistant_prefix_text
                 kept = list(active_records)
                 removed = []
@@ -531,7 +544,10 @@ def run_sarr_code(
                 recovery_start_step_id = len(kept) + 1
             else:
                 _mark_removed(removed)
-                max_recovery = span + 1
+                if long_span:
+                    max_recovery = min(span + 1, cfg.rollback.long_span_recovery_steps)
+                else:
+                    max_recovery = span + 1
                 recovery_start_step_id = anchor + 1
 
             rec_context, rec_records, rec_stop_reason, attempt_id = confidence_gated_recovery(
@@ -570,6 +586,10 @@ def run_sarr_code(
                 recovery_actual_steps=len(rec_records),
                 recovery_c_norm=[float(r.c_norm) for r in rec_records if r.c_norm is not None],
                 fallback_no_delete=fallback_no_delete,
+                long_span=long_span,
+                long_span_policy=cfg.rollback.long_span_policy if long_span else None,
+                long_span_fallback_count_before=long_span_fallback_count_before,
+                long_span_recovery_limited=bool(long_span and not fallback_no_delete and max_recovery < span + 1),
                 force_next_step_slm=cfg.rollback.force_slm_after_recovery,
             )
             rollback_events.append(event)

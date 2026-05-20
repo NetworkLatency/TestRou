@@ -39,13 +39,14 @@ The SLM is loaded by transformers in the experiment process so later diagnostics
 Example:
 
 ```bash
-MODEL=/local/path/to/Qwen-32B \
-SERVED_MODEL_NAME=Qwen-32B \
-CUDA_DEVICE=1 \
+MODEL=/home/lhyang/Documents/code/reasoning_boundary/models/qwen3-4B \
+SERVED_MODEL_NAME=qwen3-4B \
+CUDA_DEVICE=0 \
 PORT=8000 \
 CHAT_TEMPLATE=server/template/qwen3.jinja \
 TRUST_REMOTE_CODE=1 \
 ENABLE_PREFIX_CACHING=1 \
+GPU_MEMORY_UTILIZATION=0.6 \
 bash server/serve.sh
 ```
 

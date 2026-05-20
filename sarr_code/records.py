@@ -72,5 +72,9 @@ class RollbackEvent:
     recovery_actual_steps: int
     recovery_c_norm: list[float]
     fallback_no_delete: bool = False
+    long_span: bool = False
+    long_span_policy: str | None = None
+    long_span_fallback_count_before: int = 0
+    long_span_recovery_limited: bool = False
     force_next_step_slm: bool = True
     force_slm_after_recovery_failed: bool | None = None

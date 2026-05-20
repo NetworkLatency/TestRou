@@ -1,42 +1,42 @@
 {
   "method": "sarr_code_aggressive_prefix",
   "slm": {
-    "model_path": "/path/to/local/DeepSeek-R1-Distill-Qwen-1.5B",
+    "model_path": "/home/lhyang/Documents/code/reasoning_boundary/models/deepseek-aiDeepSeek-R1-Distill-Qwen-1.5B/",
     "tokenizer_path": null,
     "chat_template_path": "server/template/deepseekr1.jinja",
-    "device": "cuda:0",
+    "device": "cuda:1",
     "dtype": "bfloat16",
     "trust_remote_code": true,
     "local_files_only": true,
     "backend": "transformers"
   },
   "llm": {
-    "model_path": "/path/to/local/Qwen-or-DeepSeek-LLM-tokenizer",
+    "model_path": "/home/lhyang/Documents/code/reasoning_boundary/models/qwen3-4B/",
     "tokenizer_path": null,
     "chat_template_path": "server/template/qwen3.jinja",
-    "device": "cuda:1",
+    "device": "cuda:0",
     "dtype": "auto",
     "trust_remote_code": true,
     "local_files_only": true,
     "backend": "openai",
     "api_base_url": "http://127.0.0.1:8000/v1",
     "api_key": "EMPTY",
-    "api_model": "Qwen-32B",
+    "api_model": "qwen3-4B",
     "engine_kwargs": {}
   },
   "output_dir": "sarr_results",
   "dataset_paths": {
     "math500": "data/math500.jsonl",
     "aime24": "data/aime24.jsonl",
-    "aime25": "data/aime25.parquet",
+    "aime25": "/home/lhyang/Documents/code/reasoning_boundary/data/aime2025/aime2025.jsonl",
     "gpqa": "data/gpqa_diamond.jsonl",
     "gpqa_diamond": "data/gpqa_diamond.jsonl"
   },
   "generation": {
     "step_delimiters": ["\n\n"],
-    "max_new_tokens_per_step": 256,
-    "think_token_budget": 8192,
-    "answer_token_budget": 2048,
+    "max_new_tokens_per_step": 512,
+    "think_token_budget": 12288,
+    "answer_token_budget": 4096,
     "final_answer_generator": "llm",
     "force_close_think_on_budget": true,
     "force_close_think_text": "\nWe are out of reliable reasoning budget. Stop reasoning now. Do not restart the solution after </think>. After </think>, give only the final answer using the strongest conclusion above; if uncertain, make the best concise guess.\n</think>\n\n"
@@ -71,7 +71,7 @@
     "save_transition_stats": true
   },
   "runtime": {
-    "max_model_len": 16384,
+    "max_model_len": 20000,
     "reset_prefix_cache_after_problem": true
   }
 }

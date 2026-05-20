@@ -10,6 +10,7 @@ data/lcbv5/
 data/lcbv6/
 nohup*.out
 server/vllm_logs
+server/vllm_logs
 <<<<<<< HEAD
 bpa_results
 =======

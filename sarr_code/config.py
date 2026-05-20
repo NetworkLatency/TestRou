@@ -101,12 +101,24 @@ class RollbackConfig:
     recovery_max_policy: str = "m_plus_1"
     confidence_gated_recovery: bool = True
     force_slm_after_recovery: bool = True
+    long_span_policy: str = "fallback_once_then_rollback"
+    max_long_span_fallbacks_per_anchor: int = 1
+    long_span_recovery_steps: int = 1
 
     def __post_init__(self) -> None:
         if self.M_max < 1:
             raise ValueError("rollback.M_max must be >= 1")
         if self.recovery_max_policy != "m_plus_1":
             raise ValueError("Only rollback.recovery_max_policy='m_plus_1' is implemented.")
+        if self.long_span_policy not in {"fallback_no_delete", "rollback_to_anchor", "fallback_once_then_rollback"}:
+            raise ValueError(
+                "rollback.long_span_policy must be one of "
+                "'fallback_no_delete', 'rollback_to_anchor', or 'fallback_once_then_rollback'."
+            )
+        if self.max_long_span_fallbacks_per_anchor < 0:
+            raise ValueError("rollback.max_long_span_fallbacks_per_anchor must be >= 0")
+        if self.long_span_recovery_steps < 1:
+            raise ValueError("rollback.long_span_recovery_steps must be >= 1")
 
 
 @dataclass
