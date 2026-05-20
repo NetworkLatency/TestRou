@@ -367,7 +367,12 @@ def run_sarr_code(
     monitor_state = "STARTUP"
     D_start = 0
     D_post = 0
+    D_suspect = 0
     stable_anchor: int | None = None
+    suspect_anchor: int | None = None
+    suspect_start_step: int | None = None
+    suspect_steps = 0
+    suspect_max_c_smooth: float | None = None
     c_norm_history: list[float] = []
     c_smooth_history: list[float] = []
     force_next_step_slm = False
@@ -451,14 +456,21 @@ def run_sarr_code(
                 stable_anchor = step_id
                 D_start = 0
                 D_post = 0
+                D_suspect = 0
+                suspect_anchor = None
+                suspect_start_step = None
+                suspect_steps = 0
+                suspect_max_c_smooth = None
                 if pending_force_recovery_event_idx is not None:
                     rollback_events[pending_force_recovery_event_idx].force_slm_after_recovery_failed = False
                     pending_force_recovery_event_idx = None
-                record.action = "REFRESH_STABLE_ANCHOR"
+                record.action = "SUSPECT_RECOVERED" if state_before == "SUSPECT" else "REFRESH_STABLE_ANCHOR"
                 record.state_after = monitor_state
                 record.D_start = D_start
                 record.D_post = D_post
                 record.stable_anchor = stable_anchor
+                if state_before == "SUSPECT":
+                    record.extra["suspect_recovered"] = True
                 step_logs.append(_serialize_step(record))
                 if thinking_stop is not None:
                     stop_reason = thinking_stop
@@ -500,12 +512,58 @@ def run_sarr_code(
                 D_post += v
                 record.D_post = D_post
                 if D_post >= cfg.stable.tau_D:
+                    if cfg.rollback.post_stable_intervention_policy == "suspect_confirmed_rollback":
+                        monitor_state = "SUSPECT"
+                        suspect_anchor = stable_anchor if stable_anchor is not None else 0
+                        suspect_start_step = step_id
+                        suspect_steps = 0
+                        D_suspect = 0
+                        suspect_max_c_smooth = c_smooth
+                        record.action = "ENTER_SUSPECT"
+                        record.extra["suspect_anchor"] = suspect_anchor
+                        record.extra["suspect_start_step"] = suspect_start_step
+                    else:
+                        monitor_state = "DEGENERATED"
+                        should_rollback = True
+                        rollback_type = "POST_STABLE_ROLLBACK"
+                        rollback_reason = "POST_STABLE_DEGENERATION"
+                        anchor = stable_anchor if stable_anchor is not None else 0
+                        record.action = "POST_STABLE_ROLLBACK"
+            elif monitor_state == "SUSPECT":
+                suspect_steps += 1
+                D_suspect += v
+                suspect_max_c_smooth = (
+                    c_smooth
+                    if suspect_max_c_smooth is None
+                    else max(float(suspect_max_c_smooth), float(c_smooth))
+                )
+                record.extra["suspect_anchor"] = suspect_anchor
+                record.extra["suspect_start_step"] = suspect_start_step
+                record.extra["suspect_steps"] = suspect_steps
+                record.extra["D_suspect"] = D_suspect
+                confirmed_by_trend = (
+                    suspect_steps >= cfg.rollback.suspect_confirm_steps
+                    and D_suspect >= cfg.rollback.tau_confirm
+                )
+                confirmed_by_timeout = (
+                    suspect_steps >= cfg.rollback.suspect_max_steps
+                    and suspect_max_c_smooth < cfg.stable.theta_s
+                )
+                if confirmed_by_trend or confirmed_by_timeout:
                     monitor_state = "DEGENERATED"
                     should_rollback = True
                     rollback_type = "POST_STABLE_ROLLBACK"
-                    rollback_reason = "POST_STABLE_DEGENERATION"
-                    anchor = stable_anchor if stable_anchor is not None else 0
-                    record.action = "POST_STABLE_ROLLBACK"
+                    rollback_reason = (
+                        "POST_STABLE_CONFIRMED_DEGENERATION"
+                        if confirmed_by_trend
+                        else "POST_STABLE_SUSPECT_TIMEOUT"
+                    )
+                    anchor = suspect_anchor if suspect_anchor is not None else 0
+                    record.action = rollback_reason
+                    record.extra["confirmed_by_trend"] = confirmed_by_trend
+                    record.extra["confirmed_by_timeout"] = confirmed_by_timeout
+                else:
+                    record.action = "SUSPECT_OBSERVE"
 
             record.state_after = monitor_state
             step_logs.append(_serialize_step(record))
@@ -520,6 +578,7 @@ def run_sarr_code(
             current_step_id = len(active_records)
             requested_anchor = anchor
             anchor_repeat_count_before = rollback_anchor_counts.get(requested_anchor, 0)
+
             if (
                 requested_anchor == 0
                 and cfg.rollback.root_rollback_action == "force_close_think"
@@ -544,11 +603,52 @@ def run_sarr_code(
                 break
 
             anchor_backoff_steps = 0
-            if anchor_repeat_count_before >= cfg.rollback.anchor_repeat_backoff_after:
+            if anchor_repeat_count_before > 0 and cfg.rollback.anchor_repeat_policy == "suppress":
+                rollback_anchor_counts[requested_anchor] = anchor_repeat_count_before + 1
+                record.action = f"SUPPRESS_REPEATED_{rollback_type}"
+                record.extra["suppressed_rollback"] = True
+                record.extra["requested_anchor_step"] = requested_anchor
+                record.extra["anchor_repeat_count_before"] = anchor_repeat_count_before
+                monitor_state = "STABLE"
+                stable_anchor = current_step_id
+                D_start = 0
+                D_post = 0
+                D_suspect = 0
+                suspect_anchor = None
+                suspect_start_step = None
+                suspect_steps = 0
+                suspect_max_c_smooth = None
+                c_norm_history = []
+                c_smooth_history = []
+                startup_monitor_steps = 0
+                record.state_after = monitor_state
+                record.stable_anchor = stable_anchor
+                record.D_start = D_start
+                record.D_post = D_post
+                if step_logs:
+                    step_logs[-1] = _serialize_step(record)
+                state.trace.append(
+                    TraceEvent(
+                        current_step_id,
+                        "suppressed_repeated_rollback",
+                        {
+                            "type": rollback_type,
+                            "requested_anchor_step": requested_anchor,
+                            "anchor_repeat_count_before": anchor_repeat_count_before,
+                        },
+                    )
+                )
+                continue
+
+            if (
+                cfg.rollback.anchor_repeat_policy == "backoff"
+                and anchor_repeat_count_before >= cfg.rollback.anchor_repeat_backoff_after
+            ):
                 repeats_after_threshold = anchor_repeat_count_before - cfg.rollback.anchor_repeat_backoff_after + 1
                 anchor_backoff_steps = repeats_after_threshold * cfg.rollback.anchor_repeat_backoff_steps
                 anchor = max(0, requested_anchor - anchor_backoff_steps)
 
+            long_span_fallback_count_before = long_span_fallback_counts.get(requested_anchor, 0)
             rollback_context, kept, removed, span = rollback_to_anchor(
                 state.problem_text,
                 active_records,
@@ -556,7 +656,6 @@ def run_sarr_code(
                 current_step_id,
             )
             long_span = span > cfg.rollback.M_max
-            long_span_fallback_count_before = long_span_fallback_counts.get(requested_anchor, 0)
             allow_long_span_delete = False
             if long_span:
                 if cfg.rollback.long_span_policy == "rollback_to_anchor":
@@ -614,6 +713,9 @@ def run_sarr_code(
                 requested_anchor_step=requested_anchor,
                 anchor_repeat_count_before=anchor_repeat_count_before,
                 anchor_backoff_steps=anchor_backoff_steps,
+                suspect_start_step=suspect_start_step,
+                suspect_steps=suspect_steps,
+                D_suspect=D_suspect,
                 removed_steps=_serialize_removed(removed),
                 recovery_steps=[_serialize_step(r) for r in rec_records],
                 stop_reason=rec_stop_reason,
@@ -643,10 +745,20 @@ def run_sarr_code(
             monitor_state = "STARTUP"
             D_start = 0
             D_post = 0
+            D_suspect = 0
             stable_anchor = None
+            suspect_anchor = None
+            suspect_start_step = None
+            suspect_steps = 0
+            suspect_max_c_smooth = None
             c_norm_history = []
             c_smooth_history = []
             startup_monitor_steps = 0
+            if rec_stop_reason == "SLM_READY" and rec_records:
+                monitor_state = "STABLE"
+                stable_anchor = rec_records[-1].step_id
+                ready_c_norm = rec_records[-1].c_norm
+                c_norm_history = [float(ready_c_norm)] if ready_c_norm is not None else []
             force_next_step_slm = cfg.rollback.force_slm_after_recovery
             if force_next_step_slm:
                 state.trace.append(

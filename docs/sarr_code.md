@@ -152,16 +152,27 @@ Use `--dry-run` to print the commands without launching model runs.
 
 Only the `<think>...</think>` portion uses SARR-CoDE collaboration. There is no step-count limit; thinking stops by natural `</think>`/EOS, context exhaustion, or the configurable thinking token budget. If the token budget is hit, `generation.force_close_think_on_budget` controls whether the script appends the configured `</think>` bridge. The final answer is then generated with `generation.final_answer_generator` and does not feed back into routing or rollback decisions.
 
-## 7. Rollback Convergence Guards
+## 7. Post-Stable SUSPECT Confirmation
 
-The thinking token budget is measured on the active retained prefix. Rollback can delete suffix steps, so repeated rollback at the same prefix position can prevent the active prefix from monotonically reaching the budget. To avoid anchor-level cycles without restoring a global `max_steps` limit, rollback records include:
+Post-stable destructive rollback is not triggered by a single CoDE-style degeneration event. A low continuation confidence after a generated step means the SLM is uncertain about the next continuation; it does not by itself prove that the already generated prefix is wrong.
+
+The post-stable monitor therefore uses:
+
+```text
+STARTUP -> STABLE -> SUSPECT -> DEGENERATED
+```
+
+When `STABLE` sees a degeneration event, the run enters `SUSPECT` and records the last stable anchor. SLM then generates confirmation steps. If confidence recovers to `theta_s`, the state returns to `STABLE`. If degeneration is confirmed by continued deterioration or by staying below `theta_s` through the suspect horizon, destructive rollback is applied to the recorded stable anchor.
+
+Rollback records include fields useful for diagnosing this path:
 
 ```json
 {
   "requested_anchor_step": 38,
-  "anchor_step": 37,
-  "anchor_repeat_count_before": 1,
-  "anchor_backoff_steps": 1
+  "anchor_step": 38,
+  "suspect_start_step": 39,
+  "suspect_steps": 1,
+  "D_suspect": 1
 }
 ```
 
@@ -173,6 +184,11 @@ Configured behavior:
     "long_span_policy": "fallback_once_then_rollback",
     "max_long_span_fallbacks_per_anchor": 1,
     "long_span_recovery_steps": 1,
+    "post_stable_intervention_policy": "suspect_confirmed_rollback",
+    "suspect_confirm_steps": 1,
+    "suspect_max_steps": 2,
+    "tau_confirm": 1,
+    "anchor_repeat_policy": "suppress",
     "anchor_repeat_backoff_after": 1,
     "anchor_repeat_backoff_steps": 1,
     "max_root_rollbacks": 2,
@@ -181,7 +197,9 @@ Configured behavior:
 }
 ```
 
-The first repeated rollback request at the same anchor backs off the effective rollback anchor by one step; further repeats back off farther. If the requested anchor is already root and repeats beyond `max_root_rollbacks`, the run closes `<think>` and proceeds to final-answer generation.
+If recovery returns `SLM_READY`, the main loop resumes from `STABLE` instead of discarding that signal and returning to startup monitoring.
+
+Repeated rollback requests at the same anchor are suppressed by default as a safety guard and the current prefix is treated as stable. To reproduce the older aggressive behavior, set `anchor_repeat_policy` to `backoff`; repeated requests then move the effective rollback anchor earlier. If the requested anchor is already root and repeats beyond `max_root_rollbacks`, the run closes `<think>` and proceeds to final-answer generation.
 
 ## 8. Summary Metrics
 

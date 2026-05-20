@@ -130,7 +130,37 @@ class SARRCodeTests(unittest.TestCase):
         self.assertIn("recovered", result.state.assistant_prefix_text)
         self.assertNotIn("bad\n\nrecovered", result.state.assistant_prefix_text)
 
-    def test_repeated_long_span_rollback_deletes_after_anchor_fallback(self):
+    def test_post_stable_suspect_recovers_without_rollback(self):
+        cfg = make_cfg()
+        slm = FakeEngine(
+            outputs=[
+                "stable-a\n\n",
+                "stable-b\n\n",
+                "correct-but-low-confidence\n\n",
+                "confirmation-step\n\n",
+                "</think>\n\n",
+            ],
+            confidences=[0.9, 0.9, 0.1, 0.9, 0.9],
+        )
+        llm = FakeEngine(outputs=["Final answer: 42."])
+
+        result, steps, rollbacks, _ = run_sarr_code(
+            problem_id="suspect-recover",
+            problem_text="Problem: test",
+            slm=slm,
+            llm=llm,
+            normalizer=IdentityNormalizer(),
+            cfg=cfg,
+        )
+
+        self.assertEqual(result.answer, "42")
+        self.assertEqual(len(rollbacks), 0)
+        self.assertFalse(any(row["removed_by_rollback"] for row in steps))
+        self.assertTrue(any(row["action"] == "ENTER_SUSPECT" for row in steps))
+        self.assertTrue(any(row["action"] == "SUSPECT_RECOVERED" for row in steps))
+        self.assertIn("correct-but-low-confidence", result.state.assistant_prefix_text)
+
+    def test_post_stable_suspect_confirms_then_rolls_back(self):
         cfg = SARRConfig(
             slm=ModelRuntimeConfig(model_path="unused", backend="transformers"),
             llm=ModelRuntimeConfig(model_path="unused", backend="openai", api_base_url="http://127.0.0.1:8000/v1"),
@@ -149,46 +179,34 @@ class SARRCodeTests(unittest.TestCase):
             startup=StartupConfig(B_min=2, B_max=3, tau_start=1),
             stable=StableConfig(theta_s=0.70, tau_D=1),
             rollback=RollbackConfig(
-                M_max=1,
-                long_span_policy="fallback_once_then_rollback",
-                max_long_span_fallbacks_per_anchor=1,
-                long_span_recovery_steps=1,
+                M_max=5,
+                suspect_confirm_steps=1,
+                suspect_max_steps=2,
+                tau_confirm=1,
             ),
             runtime=RuntimeConfig(max_model_len=4096),
         )
         slm = FakeEngine(
             outputs=[
-                "anchor-a\n\n",
-                "anchor-b\n\n",
-                "bad-1\n\n",
-                "bad-2\n\n",
-                "bad-3\n\n",
-                "bad-4\n\n",
-                "bad-5\n\n",
-                "bad-6\n\n",
-                "bad-7\n\n",
+                "stable-a\n\n",
+                "stable-b\n\n",
+                "bad-a\n\n",
+                "bad-b\n\n",
                 "</think>\n\n",
             ],
             confidences=[
                 0.9,
                 0.9,
                 0.1,
-                0.9,
-                0.1,
-                0.1,
-                0.1,
-                0.1,
-                0.1,
-                0.1,
-                0.1,
+                0.0,
                 0.8,
                 0.8,
             ],
         )
-        llm = FakeEngine(outputs=["fallback\n\n", "repair\n\n", "repair2\n\n", "Final answer: 42."])
+        llm = FakeEngine(outputs=["repair\n\n", "Final answer: 42."])
 
         result, steps, rollbacks, _ = run_sarr_code(
-            problem_id="long",
+            problem_id="suspect-confirm",
             problem_text="Problem: test",
             slm=slm,
             llm=llm,
@@ -196,13 +214,15 @@ class SARRCodeTests(unittest.TestCase):
             cfg=cfg,
         )
 
-        long_events = [row for row in rollbacks if row["long_span"]]
-        self.assertGreaterEqual(len(long_events), 2)
-        self.assertTrue(long_events[0]["fallback_no_delete"])
-        self.assertFalse(long_events[1]["fallback_no_delete"])
-        self.assertTrue(long_events[1]["long_span_recovery_limited"])
-        self.assertTrue(any(row["removed_by_rollback"] for row in steps))
-        self.assertNotIn("bad-1\n\nbad-2", result.state.assistant_prefix_text)
+        self.assertEqual(result.answer, "42")
+        self.assertEqual(len(rollbacks), 1)
+        self.assertEqual(rollbacks[0]["type"], "POST_STABLE_ROLLBACK")
+        self.assertEqual(rollbacks[0]["reason"], "POST_STABLE_CONFIRMED_DEGENERATION")
+        self.assertEqual(rollbacks[0]["suspect_steps"], 1)
+        removed_text = "".join(row["text"] for row in rollbacks[0]["removed_steps"])
+        self.assertIn("bad-a", removed_text)
+        self.assertIn("bad-b", removed_text)
+        self.assertNotIn("bad-a\n\nbad-b", result.state.assistant_prefix_text)
 
     def test_summary_metrics_include_required_sarr_fields(self):
         rows = [

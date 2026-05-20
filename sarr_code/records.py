@@ -74,6 +74,9 @@ class RollbackEvent:
     requested_anchor_step: int | None = None
     anchor_repeat_count_before: int = 0
     anchor_backoff_steps: int = 0
+    suspect_start_step: int | None = None
+    suspect_steps: int = 0
+    D_suspect: int = 0
     fallback_no_delete: bool = False
     long_span: bool = False
     long_span_policy: str | None = None

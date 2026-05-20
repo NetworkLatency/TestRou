@@ -104,6 +104,11 @@ class RollbackConfig:
     long_span_policy: str = "fallback_once_then_rollback"
     max_long_span_fallbacks_per_anchor: int = 1
     long_span_recovery_steps: int = 1
+    post_stable_intervention_policy: str = "suspect_confirmed_rollback"
+    suspect_confirm_steps: int = 1
+    suspect_max_steps: int = 2
+    tau_confirm: int = 1
+    anchor_repeat_policy: str = "suppress"
     anchor_repeat_backoff_after: int = 1
     anchor_repeat_backoff_steps: int = 1
     max_root_rollbacks: int = 2
@@ -123,6 +128,22 @@ class RollbackConfig:
             raise ValueError("rollback.max_long_span_fallbacks_per_anchor must be >= 0")
         if self.long_span_recovery_steps < 1:
             raise ValueError("rollback.long_span_recovery_steps must be >= 1")
+        if self.post_stable_intervention_policy not in {
+            "suspect_confirmed_rollback",
+            "rollback_to_anchor",
+        }:
+            raise ValueError(
+                "rollback.post_stable_intervention_policy must be "
+                "'suspect_confirmed_rollback' or 'rollback_to_anchor'"
+            )
+        if self.suspect_confirm_steps < 1:
+            raise ValueError("rollback.suspect_confirm_steps must be >= 1")
+        if self.suspect_max_steps < self.suspect_confirm_steps:
+            raise ValueError("rollback.suspect_max_steps must be >= suspect_confirm_steps")
+        if self.tau_confirm < 1:
+            raise ValueError("rollback.tau_confirm must be >= 1")
+        if self.anchor_repeat_policy not in {"suppress", "backoff", "allow"}:
+            raise ValueError("rollback.anchor_repeat_policy must be 'suppress', 'backoff', or 'allow'")
         if self.anchor_repeat_backoff_after < 1:
             raise ValueError("rollback.anchor_repeat_backoff_after must be >= 1")
         if self.anchor_repeat_backoff_steps < 0:
