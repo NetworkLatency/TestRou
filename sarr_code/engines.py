@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -16,19 +17,28 @@ from .config import ModelRuntimeConfig, RuntimeConfig
 from .records import StepOutput
 
 
+def _hf_source(path: str) -> str:
+    # A trailing slash can make transformers' dynamic remote-code module name
+    # resolve to an empty string for local paths with trust_remote_code=True.
+    if not path:
+        return path
+    return Path(path).as_posix().rstrip("/\\") or path
+
+
 def _read_chat_template(path: str | None) -> str | None:
     if not path:
         return None
-    template_path = Path(path)
+    template_path = Path(_hf_source(path))
     if not template_path.exists():
         raise FileNotFoundError(f"Chat template file not found: {template_path}")
     return template_path.read_text(encoding="utf-8")
 
 
 def _validate_local_path(path: str, *, label: str, local_files_only: bool) -> None:
-    if local_files_only and path and not Path(path).exists():
+    normalized = _hf_source(path)
+    if local_files_only and normalized and not Path(normalized).exists():
         raise FileNotFoundError(
-            f"{label} must be a local path when local_files_only=true: {path}"
+            f"{label} must be a local path when local_files_only=true: {normalized}"
         )
 
 
@@ -58,8 +68,9 @@ def _torch_dtype(dtype: str):
 def _load_tokenizer(cfg: ModelRuntimeConfig):
     from transformers import AutoTokenizer
 
-    source = cfg.tokenizer_path or cfg.model_path
+    source = _hf_source(cfg.tokenizer_path or cfg.model_path)
     _validate_local_path(source, label="tokenizer_path/model_path", local_files_only=cfg.local_files_only)
+    print(f"[sarr] loading tokenizer: {source}", file=sys.stderr, flush=True)
     tokenizer = AutoTokenizer.from_pretrained(
         source,
         trust_remote_code=cfg.trust_remote_code,
@@ -69,7 +80,49 @@ def _load_tokenizer(cfg: ModelRuntimeConfig):
     template = _read_chat_template(cfg.chat_template_path)
     if template is not None:
         tokenizer.chat_template = template
+        print(f"[sarr] loaded chat template: {cfg.chat_template_path}", file=sys.stderr, flush=True)
     return tokenizer
+
+
+def _load_causal_lm(model_path: str, cfg: ModelRuntimeConfig, dtype_value: Any):
+    from transformers import AutoModelForCausalLM
+
+    source = _hf_source(model_path)
+    kwargs = {
+        "trust_remote_code": cfg.trust_remote_code,
+        "local_files_only": cfg.local_files_only,
+    }
+    try:
+        return AutoModelForCausalLM.from_pretrained(
+            source,
+            dtype=dtype_value,
+            **kwargs,
+        )
+    except TypeError as exc:
+        if "dtype" not in str(exc):
+            raise
+        return AutoModelForCausalLM.from_pretrained(
+            source,
+            torch_dtype=dtype_value,
+            **kwargs,
+        )
+
+
+def _sanitize_greedy_generation_config(model: Any) -> None:
+    generation_config = getattr(model, "generation_config", None)
+    if generation_config is None:
+        return
+    for key in ("temperature", "top_p", "top_k", "typical_p"):
+        if hasattr(generation_config, key):
+            try:
+                setattr(generation_config, key, None)
+            except Exception:
+                pass
+    if hasattr(generation_config, "do_sample"):
+        try:
+            generation_config.do_sample = False
+        except Exception:
+            pass
 
 
 def _decode(tokenizer: Any, token_ids: list[int] | tuple[int, ...]) -> str:
@@ -124,20 +177,22 @@ class LocalTransformersSLM:
             self.tokenizer = _load_tokenizer(self.cfg)
         if self.model is None:
             import torch
-            from transformers import AutoModelForCausalLM
 
-            _validate_local_path(self.cfg.model_path, label="slm.model_path", local_files_only=self.cfg.local_files_only)
+            model_source = _hf_source(self.cfg.model_path)
+            _validate_local_path(model_source, label="slm.model_path", local_files_only=self.cfg.local_files_only)
             self.device = _device_string(self.cfg.device)
             if self.device.startswith("cuda") and not torch.cuda.is_available():
                 raise RuntimeError(f"Requested {self.device}, but torch.cuda.is_available() is false.")
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.cfg.model_path,
-                trust_remote_code=self.cfg.trust_remote_code,
-                torch_dtype=_torch_dtype(self.cfg.dtype),
-                local_files_only=self.cfg.local_files_only,
+            print(
+                f"[sarr] loading SLM model: {model_source} -> {self.device} dtype={self.cfg.dtype}",
+                file=sys.stderr,
+                flush=True,
             )
+            self.model = _load_causal_lm(model_source, self.cfg, _torch_dtype(self.cfg.dtype))
+            _sanitize_greedy_generation_config(self.model)
             self.model.to(self.device)
             self.model.eval()
+            print("[sarr] SLM model loaded", file=sys.stderr, flush=True)
         return self
 
     def ensure_tokenizer(self) -> Any:
@@ -192,6 +247,8 @@ class LocalTransformersSLM:
                 attention_mask=attention_mask,
                 max_new_tokens=max_tokens,
                 do_sample=False,
+                temperature=None,
+                top_p=None,
                 pad_token_id=pad_token_id,
                 eos_token_id=eos_token_id,
                 stopping_criteria=stopping,
@@ -327,12 +384,18 @@ class CompletionEngine:
                 "max_model_len": self.runtime.max_model_len,
                 **self.cfg.engine_kwargs,
             }
+            print(
+                f"[sarr] loading local vLLM engine: {self.cfg.model_path} device={self.cfg.device}",
+                file=sys.stderr,
+                flush=True,
+            )
             with _cuda_visible_devices(self.cfg.device):
                 self.llm = LLM(
                     model=self.cfg.model_path,
                     tokenizer=self.cfg.tokenizer_path or self.cfg.model_path,
                     **kwargs,
                 )
+            print("[sarr] local vLLM engine loaded", file=sys.stderr, flush=True)
         elif self._openai_client is None and self.cfg.backend == "openai":
             if not self.cfg.api_base_url:
                 raise RuntimeError("llm.backend='openai' requires llm.api_base_url.")
@@ -340,6 +403,11 @@ class CompletionEngine:
                 from openai import OpenAI
             except ImportError as exc:
                 raise RuntimeError("The openai package is required for OpenAI-compatible vLLM endpoints.") from exc
+            print(
+                f"[sarr] using OpenAI-compatible LLM endpoint: {self.cfg.api_base_url} model={self.cfg.api_model or self.cfg.model_path}",
+                file=sys.stderr,
+                flush=True,
+            )
             self._openai_client = OpenAI(api_key=self.cfg.api_key, base_url=self.cfg.api_base_url)
         return self
 

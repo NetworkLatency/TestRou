@@ -63,7 +63,10 @@
     "M_max": 5,
     "recovery_max_policy": "m_plus_1",
     "confidence_gated_recovery": true,
-    "force_slm_after_recovery": true
+    "force_slm_after_recovery": true,
+    "long_span_policy": "fallback_once_then_rollback",
+    "max_long_span_fallbacks_per_anchor": 1,
+    "long_span_recovery_steps": 1
   },
   "logging": {
     "save_step_records": true,

@@ -238,10 +238,13 @@ def run_calibration(args: argparse.Namespace, cfg: SARRConfig) -> None:
     problems = load_eval_dataset(args.dataset, cfg, max_problems=args.max_problems)
     output_path = Path(args.calibration_output or cfg.confidence.calibration_path or "sarr_calibration.json")
     trace_output = output_path.with_suffix(".traces.jsonl")
+    print(f"[sarr] loaded {len(problems)} calibration problem(s) from {args.dataset}", flush=True)
+    print(f"[sarr] calibration output: {output_path}", flush=True)
     slm = build_slm(cfg.slm, cfg.runtime)
 
     traces = []
     for problem in tqdm(problems, desc=f"calibrate:{args.dataset}"):
+        print(f"[sarr] calibrating problem_id={problem.problem_id}", flush=True)
         trace = collect_slm_calibration_trace(str(problem.problem_id), problem.problem_text, slm, cfg)
         traces.append(trace)
         if cfg.runtime.reset_prefix_cache_after_problem:
@@ -271,6 +274,12 @@ def run_experiment(args: argparse.Namespace, cfg: SARRConfig) -> None:
     variant = args.variant or DEFAULT_VARIANT
     output_root = Path(args.output_root) if args.output_root else Path(cfg.output_dir)
     problems = load_eval_dataset(args.dataset, cfg, max_problems=args.max_problems)
+    print(f"[sarr] loaded {len(problems)} problem(s) from {args.dataset}", flush=True)
+    print(f"[sarr] variant={variant} output_root={output_root}", flush=True)
+    print(
+        f"[sarr] slm_backend={cfg.slm.backend} slm_device={cfg.slm.device} llm_backend={cfg.llm.backend} llm_endpoint={cfg.llm.api_base_url}",
+        flush=True,
+    )
     summary_path = _summary_path(output_root, args.dataset, variant)
     existing_summary_rows = load_summary_rows(summary_path) if args.resume else {}
     rows_by_problem_id: dict[str, dict[str, Any]] = {}
@@ -292,6 +301,7 @@ def run_experiment(args: argparse.Namespace, cfg: SARRConfig) -> None:
         ]
 
     normalizer = _load_normalizer(cfg)
+    print(f"[sarr] normalizer loaded from {cfg.confidence.calibration_path or 'identity'}", flush=True)
     slm = build_slm(cfg.slm, cfg.runtime)
     llm = build_llm(cfg.llm, cfg.runtime)
 
@@ -302,6 +312,7 @@ def run_experiment(args: argparse.Namespace, cfg: SARRConfig) -> None:
             continue
 
         problem_start = time.time()
+        print(f"[sarr] running problem_id={problem_id}", flush=True)
         result, step_rows, rollback_rows, transition_rows = run_sarr_code(
             problem_id=problem_id,
             problem_text=problem.problem_text,

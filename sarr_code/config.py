@@ -167,6 +167,11 @@ class SARRConfig:
         if unknown:
             raise ValueError(f"Unknown SARRConfig keys: {unknown}")
         kwargs = dict(data)
+        if isinstance(kwargs.get("generation"), dict):
+            # Compatibility with configs materialized by the short-lived
+            # compute-budget guard. The guard was removed; stale sweep configs
+            # should not fail before model loading.
+            kwargs["generation"].pop("max_total_thinking_decode_tokens", None)
         if isinstance(kwargs.get("slm"), dict):
             kwargs["slm"] = ModelRuntimeConfig(**kwargs["slm"])
         if isinstance(kwargs.get("llm"), dict):
