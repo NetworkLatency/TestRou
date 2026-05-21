@@ -112,8 +112,6 @@ def run_variant(
         str(run_script),
         "--config",
         str(config_path),
-        "--mode",
-        "run",
         "--dataset",
         dataset,
         "--output-root",

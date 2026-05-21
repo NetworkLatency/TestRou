@@ -46,10 +46,18 @@
     "topk_entropy": 20,
     "percentile_normalization": false,
     "calibration_path": null,
-    "allow_identity_normalizer": false,
     "smooth_window": 2,
     "delta": 0.55,
     "capture_slm_token_entropy": false
+  },
+  "confidence_process": {
+    "lambda0": 0.002,
+    "alpha": 1.0,
+    "r0": 20,
+    "power": 2.0,
+    "high_threshold": 0.70,
+    "raw_low_threshold": 0.35,
+    "smooth_low_threshold": 0.35
   },
   "calibration": {
     "enabled": false,

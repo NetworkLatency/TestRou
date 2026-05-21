@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import time
+import math
 import re
+import time
 from dataclasses import asdict
 from typing import Any
 
@@ -13,6 +14,137 @@ from bpa.trace import BPAResult
 from .calibration import code_style_degeneration_event
 from .config import SARRConfig
 from .records import RollbackEvent, StepOutput, StepRecord
+
+
+RECOVERY_COMPLETE_TO_SLM = {
+    "SLM_READY",
+    "EXHAUSTED_FORCE_SLM",
+    "RECOVERY_BUDGET_EXCEEDED",
+    "ROUTING_BUDGET_EXCEEDED_CONTINUE_SLM",
+}
+
+
+class ConfidenceProcessTracker:
+    def __init__(self, cfg: SARRConfig) -> None:
+        self.cfg = cfg.confidence_process
+        self.raw_low_count = 0
+        self.smooth_low_count = 0
+        self.masked_uncertainty_count = 0
+        self.high_run_length = 0
+        self.high_run_start_step: int | None = None
+        self.masked_memory_at_high_run_start = 0
+        self.max_high_run_length = 0
+        self.max_ciod_risk = 0.0
+        self.ciod_shadow_trigger_count = 0
+        self.first_ciod_shadow_trigger_step: int | None = None
+        self._last_ciod_risk = 0.0
+        self._last_ciod_shadow_trigger = False
+
+    @property
+    def masked_uncertainty_gap(self) -> int:
+        return self.raw_low_count - self.smooth_low_count
+
+    def _ciod_risk(self) -> float:
+        dwell = max(0.0, float(self.high_run_length - self.cfg.r0))
+        if dwell <= 0.0:
+            return 0.0
+        hazard = (
+            self.cfg.lambda0
+            * ((1.0 + float(self.masked_memory_at_high_run_start)) ** self.cfg.alpha)
+            * (dwell ** self.cfg.power)
+        )
+        return float(1.0 - math.exp(-hazard))
+
+    def observe(self, record: StepRecord) -> dict[str, Any]:
+        scored = (
+            record.generator == "slm"
+            and record.active
+            and record.c_raw is not None
+            and record.readiness_value is not None
+        )
+        raw_low = False
+        smooth_low = False
+        masked_uncertainty = False
+        if scored:
+            c_raw = float(record.c_raw)
+            readiness_value = float(record.readiness_value)
+            raw_low = c_raw <= self.cfg.raw_low_threshold
+            smooth_low = readiness_value <= self.cfg.smooth_low_threshold
+            masked_uncertainty = raw_low and not smooth_low
+            masked_before_step = self.masked_uncertainty_count
+
+            if readiness_value >= self.cfg.high_threshold:
+                if self.high_run_length == 0:
+                    self.high_run_start_step = record.step_id
+                    self.masked_memory_at_high_run_start = masked_before_step
+                self.high_run_length += 1
+            else:
+                self.high_run_length = 0
+                self.high_run_start_step = None
+                self.masked_memory_at_high_run_start = 0
+
+            if raw_low:
+                self.raw_low_count += 1
+            if smooth_low:
+                self.smooth_low_count += 1
+            if masked_uncertainty:
+                self.masked_uncertainty_count += 1
+
+            self.max_high_run_length = max(self.max_high_run_length, self.high_run_length)
+            self._last_ciod_risk = self._ciod_risk()
+            self.max_ciod_risk = max(self.max_ciod_risk, self._last_ciod_risk)
+            self._last_ciod_shadow_trigger = self._last_ciod_risk > 0.0
+            if self._last_ciod_shadow_trigger:
+                self.ciod_shadow_trigger_count += 1
+                if self.first_ciod_shadow_trigger_step is None:
+                    self.first_ciod_shadow_trigger_step = record.step_id
+
+        return {
+            "scored": scored,
+            "raw_low": raw_low,
+            "smooth_low": smooth_low,
+            "masked_uncertainty": masked_uncertainty,
+            "raw_low_count": self.raw_low_count,
+            "smooth_low_count": self.smooth_low_count,
+            "masked_uncertainty_count": self.masked_uncertainty_count,
+            "masked_uncertainty_gap": self.masked_uncertainty_gap,
+            "high_run_length": self.high_run_length,
+            "high_run_start_step": self.high_run_start_step,
+            "masked_memory_at_high_run_start": self.masked_memory_at_high_run_start,
+            "ciod_risk": self._last_ciod_risk,
+            "ciod_shadow_trigger": self._last_ciod_shadow_trigger,
+        }
+
+    def current_snapshot(self) -> dict[str, Any]:
+        return {
+            "scored": False,
+            "raw_low": False,
+            "smooth_low": False,
+            "masked_uncertainty": False,
+            "raw_low_count": self.raw_low_count,
+            "smooth_low_count": self.smooth_low_count,
+            "masked_uncertainty_count": self.masked_uncertainty_count,
+            "masked_uncertainty_gap": self.masked_uncertainty_gap,
+            "high_run_length": self.high_run_length,
+            "high_run_start_step": self.high_run_start_step,
+            "masked_memory_at_high_run_start": self.masked_memory_at_high_run_start,
+            "ciod_risk": self._last_ciod_risk,
+            "ciod_shadow_trigger": self._last_ciod_shadow_trigger,
+        }
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "raw_low_count": self.raw_low_count,
+            "smooth_low_count": self.smooth_low_count,
+            "masked_uncertainty_count": self.masked_uncertainty_count,
+            "masked_uncertainty_gap": self.masked_uncertainty_gap,
+            "max_high_run_length": self.max_high_run_length,
+            "ciod_risk": self._last_ciod_risk,
+            "ciod_shadow_trigger": self._last_ciod_shadow_trigger,
+            "max_ciod_risk": self.max_ciod_risk,
+            "ciod_shadow_trigger_count": self.ciod_shadow_trigger_count,
+            "first_ciod_shadow_trigger_step": self.first_ciod_shadow_trigger_step,
+        }
 
 
 def _account_generation_cost(
@@ -433,7 +565,7 @@ def _generate_llm_step(
     return output
 
 
-def _confidence_for_prefix(slm, normalizer, cfg: SARRConfig, problem_text: str, assistant_prefix_text: str):
+def _confidence_for_prefix(slm, cfg: SARRConfig, problem_text: str, assistant_prefix_text: str):
     c_raw, c_info = slm.continuation_confidence(
         problem_text,
         assistant_prefix_text,
@@ -453,7 +585,6 @@ def confidence_gated_recovery(
     context: str,
     llm,
     slm,
-    normalizer,
     cfg: SARRConfig,
     max_recovery_steps: int,
     remaining_think_tokens: int,
@@ -475,7 +606,6 @@ def confidence_gated_recovery(
         local_context += output.text
         c_raw, c_norm, c_info = _confidence_for_prefix(
             slm,
-            normalizer,
             cfg,
             state.problem_text,
             local_context,
@@ -588,6 +718,7 @@ def _append_final_answer(
     slm,
     llm,
     cfg: SARRConfig,
+    confidence_process: dict[str, Any] | None = None,
 ) -> str | None:
     engine = llm if cfg.generation.final_answer_generator == "llm" else slm
     account = cfg.generation.final_answer_generator
@@ -615,6 +746,7 @@ def _append_final_answer(
         "finish_reason": output.finish_reason,
         "action": "FINAL_ANSWER",
         "is_final_answer": True,
+        "extra": {"confidence_process": confidence_process or {}},
     }
     step_logs.append(row)
     state.assistant_prefix_text = prefix + output.text
@@ -629,7 +761,6 @@ def run_sarr_code(
     problem_text: str,
     slm,
     llm,
-    normalizer,
     cfg: SARRConfig,
 ) -> tuple[BPAResult, list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     state = GenerationState(problem_text=problem_text, generation_protocol=cfg.method)
@@ -670,9 +801,66 @@ def run_sarr_code(
     startup_monitor_steps = 0
     attempt_id = 1
     stop_reason: str | None = None
+    state_enter_step = 0
+    recovery_context: str | None = None
+    pending_state_machine_action: str | None = None
+    pending_invalid_rollback_recovery_state = False
+    confidence_process = ConfidenceProcessTracker(cfg)
+
+    def state_duration(step_id: int) -> int:
+        return max(1, step_id - state_enter_step)
+
+    def recover_invalid_rollback_recovery_state(step_id: int) -> None:
+        nonlocal pending_invalid_rollback_recovery_state, pending_state_machine_action
+        if monitor_state != "ROLLBACK_RECOVERY" or recovery_context is not None:
+            return
+        pending_invalid_rollback_recovery_state = True
+        pending_state_machine_action = "STATE_RECOVERED_TO_SLM_ACTIVE"
+        event = {
+            "event": "state_machine_invariant",
+            "state": monitor_state,
+            "state_duration": state_duration(step_id),
+            "invalid_rollback_recovery_state": True,
+            "recovery_context_present": False,
+            "action": "STATE_RECOVERED_TO_SLM_ACTIVE",
+        }
+        transition_events.append({"problem_id": problem_id, "step_id": step_id, **event})
+        state.trace.append(TraceEvent(step_id, "state_machine_invariant", event))
+        transition_state(step_id, "SLM_ACTIVE", "STATE_RECOVERED_TO_SLM_ACTIVE")
+
+    def finalize_record(record: StepRecord) -> StepRecord:
+        nonlocal pending_invalid_rollback_recovery_state, pending_state_machine_action
+        if pending_state_machine_action is not None:
+            if record.action != pending_state_machine_action:
+                record.extra["action_before_state_machine_recovery"] = record.action
+            record.action = pending_state_machine_action
+            pending_state_machine_action = None
+        invalid = bool(
+            pending_invalid_rollback_recovery_state
+            or (monitor_state == "ROLLBACK_RECOVERY" and recovery_context is None)
+        )
+        record.invalid_rollback_recovery_state = invalid
+        record.state_duration = state_duration(record.step_id)
+        record.extra["state_duration"] = record.state_duration
+        record.extra["invalid_rollback_recovery_state"] = invalid
+        record.extra["anchor_refresh_blocked_reason"] = record.anchor_refresh_blocked_reason
+        record.extra["recovery_context_present"] = recovery_context is not None
+        if invalid:
+            record.extra["state_machine_action"] = "STATE_RECOVERED_TO_SLM_ACTIVE"
+        if "confidence_process" not in record.extra:
+            record.extra["confidence_process"] = confidence_process.observe(record)
+        pending_invalid_rollback_recovery_state = False
+        return record
+
+    def append_record(record: StepRecord) -> None:
+        step_logs.append(_serialize_step(finalize_record(record)))
+
+    def replace_last_record(record: StepRecord) -> None:
+        if step_logs:
+            step_logs[-1] = _serialize_step(finalize_record(record))
 
     def transition_state(step_id: int, new_state: str, reason: str) -> None:
-        nonlocal monitor_state, ever_left_startup
+        nonlocal monitor_state, ever_left_startup, state_enter_step
         old_state = monitor_state
         if old_state == new_state:
             return
@@ -697,11 +885,13 @@ def run_sarr_code(
         transition_events.append({"problem_id": problem_id, "step_id": step_id, **event})
         state.trace.append(TraceEvent(step_id, "state_transition", event))
         monitor_state = new_state
+        state_enter_step = step_id
 
     try:
         while state.phase != Phase.DONE:
             if monitor_state == "STARTUP" and ever_left_startup:
                 transition_state(state.step_count, "SLM_ACTIVE", "STARTUP_REENTRY_BLOCKED")
+            recover_invalid_rollback_recovery_state(state.step_count)
             visible_tokens = _visible_think_tokens(active_records)
             if visible_tokens >= cfg.generation.think_token_budget:
                 stop_reason = "think_token_budget"
@@ -750,13 +940,12 @@ def run_sarr_code(
                 startup_monitor_steps += 1
                 state.step_count = len(active_records)
                 record.state_after = monitor_state
-                step_logs.append(_serialize_step(record))
+                append_record(record)
                 stop_reason = thinking_stop
                 break
 
             c_raw, c_norm, c_info = _confidence_for_prefix(
                 slm,
-                normalizer,
                 cfg,
                 state.problem_text,
                 state.assistant_prefix_text,
@@ -854,6 +1043,10 @@ def run_sarr_code(
                 record.anchor_refresh_blocked_reason = "STAGNATION_SUSPECT"
             elif record.generator != "slm":
                 record.anchor_refresh_blocked_reason = "NOT_SLM_STEP"
+            elif monitor_state == "ROLLBACK_RECOVERY" and recovery_context is not None:
+                record.anchor_refresh_blocked_reason = "STATE_ROLLBACK_RECOVERY"
+            elif monitor_state == "ROLLBACK_RECOVERY":
+                record.anchor_refresh_blocked_reason = "STATE_RECOVERED_TO_SLM_ACTIVE"
             elif monitor_state != "SLM_ACTIVE":
                 record.anchor_refresh_blocked_reason = f"STATE_{monitor_state}"
             elif not record.readiness_high:
@@ -896,7 +1089,7 @@ def run_sarr_code(
                     record.state_after = monitor_state
                     record.extra["stop_reason"] = "STAGNATION_ROLLBACK_LIMIT"
                     record.extra["stagnation_rollback_count"] = stagnation_rollback_count
-                    step_logs.append(_serialize_step(record))
+                    append_record(record)
                     stop_reason = "STAGNATION_ROLLBACK_LIMIT"
                     break
                 elif total_rollback_count >= min(cfg.rollback.max_rollbacks_per_problem, cfg.budget.max_rollbacks_per_problem):
@@ -904,7 +1097,7 @@ def run_sarr_code(
                     record.action = "UNRECOVERABLE_ROLLBACK_LIMIT"
                     record.state_after = monitor_state
                     record.extra["stop_reason"] = "ROLLBACK_LIMIT"
-                    step_logs.append(_serialize_step(record))
+                    append_record(record)
                     stop_reason = "ROLLBACK_LIMIT"
                     break
                 else:
@@ -928,7 +1121,7 @@ def run_sarr_code(
                 if post_lease_observe_remaining <= 0:
                     transition_state(step_id, "SLM_ACTIVE", "POST_LEASE_OBSERVE_FINISHED")
                 record.state_after = monitor_state
-                step_logs.append(_serialize_step(record))
+                append_record(record)
                 continue
 
             if not should_rollback and record.readiness_high and not record.stagnation_suspect:
@@ -954,7 +1147,7 @@ def run_sarr_code(
                 record.stable_anchor = stable_anchor
                 if state_before == "SUSPECT":
                     record.extra["suspect_recovered"] = True
-                step_logs.append(_serialize_step(record))
+                append_record(record)
                 continue
 
             v = 0
@@ -1051,7 +1244,6 @@ def run_sarr_code(
                         record.extra["suspect_anchor"] = suspect_anchor
                         record.extra["suspect_start_step"] = suspect_start_step
                     else:
-                        transition_state(step_id, "ROLLBACK_RECOVERY", "POST_STABLE_DEGENERATION")
                         should_rollback = True
                         rollback_type = "POST_STABLE_ROLLBACK"
                         rollback_reason = "POST_STABLE_DEGENERATION"
@@ -1084,7 +1276,6 @@ def run_sarr_code(
                     )
                 )
                 if confirmed_by_trend or confirmed_by_timeout:
-                    transition_state(step_id, "ROLLBACK_RECOVERY", "CONFIDENCE_DEGENERATION_CONFIRMED")
                     should_rollback = True
                     rollback_type = "POST_STABLE_ROLLBACK"
                     rollback_reason = (
@@ -1103,11 +1294,7 @@ def run_sarr_code(
                     record.action = "SUSPECT_OBSERVE"
 
             record.state_after = monitor_state
-            step_logs.append(_serialize_step(record))
-
-            if thinking_stop is not None:
-                stop_reason = thinking_stop
-                break
+            append_record(record)
 
             if not should_rollback and lease_reason is None:
                 continue
@@ -1125,9 +1312,12 @@ def run_sarr_code(
                     llm_lease_token_count=llm_lease_token_count,
                     requested_steps=lease_steps,
                 ):
+                    record.action = "ROUTING_BUDGET_EXCEEDED_CONTINUE_SLM"
                     record.extra["routing_budget_exceeded"] = True
-                    if step_logs:
-                        step_logs[-1] = _serialize_step(record)
+                    recovery_context = None
+                    transition_state(current_step_id, "SLM_ACTIVE", "ROUTING_BUDGET_EXCEEDED_CONTINUE_SLM")
+                    record.state_after = monitor_state
+                    replace_last_record(record)
                     continue
                 transition_state(current_step_id, "LLM_LEASE", lease_reason)
                 lease_context, lease_records, lease_stop_reason, attempt_id = run_llm_lease(
@@ -1153,7 +1343,7 @@ def run_sarr_code(
                 state.assistant_prefix_text = lease_context
                 state.step_count = len(active_records)
                 for lease_record in lease_records:
-                    step_logs.append(_serialize_step(lease_record))
+                    append_record(lease_record)
                 event_tokens = sum(r.token_count for r in lease_records)
                 llm_lease_event_count += 1
                 llm_lease_token_count += event_tokens
@@ -1215,8 +1405,17 @@ def run_sarr_code(
             ):
                 record.action = "ROUTING_BUDGET_EXCEEDED_CONTINUE_SLM"
                 record.extra["routing_budget_exceeded"] = True
-                if step_logs:
-                    step_logs[-1] = _serialize_step(record)
+                recovery_context = None
+                transition_state(current_step_id, "SLM_ACTIVE", "ROUTING_BUDGET_EXCEEDED_CONTINUE_SLM")
+                D_suspect = 0
+                suspect_anchor = None
+                suspect_start_step = None
+                suspect_steps = 0
+                suspect_max_readiness = None
+                low_confidence_run = 0
+                readiness_low_run = 0
+                record.state_after = monitor_state
+                replace_last_record(record)
                 continue
             if pending_force_recovery_event_idx is not None:
                 rollback_events[pending_force_recovery_event_idx].force_slm_after_recovery_failed = True
@@ -1230,8 +1429,7 @@ def run_sarr_code(
             ):
                 record.action = "ROOT_ROLLBACK_FORCE_CLOSE_THINK"
                 record.extra["root_rollback_count_before"] = anchor_repeat_count_before
-                if step_logs:
-                    step_logs[-1] = _serialize_step(record)
+                replace_last_record(record)
                 state.trace.append(
                     TraceEvent(
                         current_step_id,
@@ -1274,8 +1472,7 @@ def run_sarr_code(
                 record.stable_anchor = stable_anchor
                 record.D_start = D_start
                 record.D_post = D_post
-                if step_logs:
-                    step_logs[-1] = _serialize_step(record)
+                replace_last_record(record)
                 state.trace.append(
                     TraceEvent(
                         current_step_id,
@@ -1343,6 +1540,7 @@ def run_sarr_code(
                 stagnation_rollback_count += 1
             total_rollback_count += 1
 
+            recovery_context = None if lease_reason is not None else rollback_context
             transition_state(current_step_id, "LLM_LEASE" if lease_reason is not None else "ROLLBACK_RECOVERY", rollback_reason)
             if lease_reason is not None:
                 rec_context, rec_records, rec_stop_reason, attempt_id = run_llm_lease(
@@ -1366,7 +1564,6 @@ def run_sarr_code(
                     context=rollback_context,
                     llm=llm,
                     slm=slm,
-                    normalizer=normalizer,
                     cfg=cfg,
                     max_recovery_steps=max_recovery,
                     remaining_think_tokens=max(1, cfg.generation.think_token_budget - _visible_think_tokens(kept)),
@@ -1374,6 +1571,12 @@ def run_sarr_code(
                 )
 
             new_active_records = kept + rec_records
+            recovery_state_after = "POST_LEASE_OBSERVE" if lease_reason is not None else "SLM_ACTIVE"
+            if rec_records and (lease_reason is not None or rec_stop_reason in RECOVERY_COMPLETE_TO_SLM):
+                rec_records[-1].state_after = recovery_state_after
+                rec_records[-1].extra["recovery_terminal_state_after"] = recovery_state_after
+            for rec in rec_records:
+                finalize_record(rec)
             for rec in rec_records:
                 all_records.append(rec)
             for idx in range(max(1, len(kept)), len(new_active_records)):
@@ -1421,7 +1624,7 @@ def run_sarr_code(
                 mention_uncertainty=cfg.llm_lease.mention_uncertainty if lease_reason is not None else None,
                 mention_repetition=cfg.llm_lease.mention_repetition if lease_reason is not None else None,
                 mention_error=cfg.llm_lease.mention_error if lease_reason is not None else None,
-                state_after="POST_LEASE_OBSERVE" if lease_reason is not None else None,
+                state_after=recovery_state_after,
                 clean_anchor_step=anchor if is_stagnation_rollback else None,
                 hcs_rollback_count=hcs_rollback_count if is_hcs_rollback else 0,
                 stagnation_rollback_count=stagnation_rollback_count if is_stagnation_rollback else 0,
@@ -1466,8 +1669,11 @@ def run_sarr_code(
             for rec in rec_records:
                 step_logs.append(_serialize_step(rec))
 
-            transition_state(state.step_count, "POST_LEASE_OBSERVE", "LEASE_FINISHED" if lease_reason is not None else "RECOVERY_FINISHED")
-            post_lease_observe_remaining = cfg.post_lease_observe.observe_slm_blocks
+            transition_state(state.step_count, recovery_state_after, "LEASE_FINISHED" if lease_reason is not None else rec_stop_reason)
+            recovery_context = None
+            post_lease_observe_remaining = (
+                cfg.post_lease_observe.observe_slm_blocks if recovery_state_after == "POST_LEASE_OBSERVE" else 0
+            )
             ever_left_startup = True
             D_start = 0
             D_post = 0
@@ -1542,6 +1748,7 @@ def run_sarr_code(
                 slm=slm,
                 llm=llm,
                 cfg=cfg,
+                confidence_process=confidence_process.current_snapshot(),
             )
         except ContextBudgetExceeded as exc:
             state.stop_reason = "context_budget_final_answer"
@@ -1560,6 +1767,7 @@ def run_sarr_code(
                 "num_intervention_events": len(rollback_events),
                 "num_transition_events": len(transition_events),
                 "stop_reason": state.stop_reason,
+                **confidence_process.summary(),
             },
         )
     )

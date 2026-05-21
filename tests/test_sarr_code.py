@@ -5,7 +5,9 @@ import unittest
 from sarr_code.algorithm import choose_best_prefix_anchor, run_sarr_code
 from sarr_code.calibration import PercentileNormalizer, code_style_degeneration_event, smooth_confidence
 from sarr_code.config import (
+    BudgetConfig,
     ConfidenceConfig,
+    ConfidenceProcessConfig,
     GenerationConfig,
     HCSConfig,
     HCSRecoveryConfig,
@@ -23,7 +25,7 @@ from sarr_code.config import (
     StartupConfig,
 )
 from sarr_code.records import StepOutput, StepRecord
-from scripts.run_sarr_code import _extra_sarr_metrics
+from scripts.run_sarr_code import _confidence_process_metrics, _extra_sarr_metrics
 from scripts.run_sarr_sweep import SWEEP_VARIANTS, apply_variant
 
 
@@ -73,7 +75,6 @@ def make_cfg() -> SARRConfig:
         confidence=ConfidenceConfig(
             topk_entropy=20,
             calibration_path=None,
-            allow_identity_normalizer=True,
             smooth_window=2,
             delta=0.55,
         ),
@@ -122,7 +123,6 @@ class SARRCodeTests(unittest.TestCase):
             problem_text="Problem: 6*7?",
             slm=slm,
             llm=llm,
-            normalizer=None,
             cfg=cfg,
         )
 
@@ -150,7 +150,6 @@ class SARRCodeTests(unittest.TestCase):
             problem_text="Problem: 6*7?",
             slm=slm,
             llm=llm,
-            normalizer=None,
             cfg=cfg,
         )
 
@@ -180,7 +179,6 @@ class SARRCodeTests(unittest.TestCase):
             problem_text="Problem: test",
             slm=slm,
             llm=llm,
-            normalizer=None,
             cfg=cfg,
         )
 
@@ -203,7 +201,6 @@ class SARRCodeTests(unittest.TestCase):
             confidence=ConfidenceConfig(
                 topk_entropy=20,
                 calibration_path=None,
-                allow_identity_normalizer=True,
                 smooth_window=2,
                 delta=0.55,
             ),
@@ -240,7 +237,6 @@ class SARRCodeTests(unittest.TestCase):
             problem_text="Problem: test",
             slm=slm,
             llm=llm,
-            normalizer=None,
             cfg=cfg,
         )
 
@@ -266,7 +262,6 @@ class SARRCodeTests(unittest.TestCase):
             confidence=ConfidenceConfig(
                 topk_entropy=20,
                 calibration_path=None,
-                allow_identity_normalizer=True,
                 smooth_window=1,
                 delta=0.55,
             ),
@@ -310,7 +305,6 @@ class SARRCodeTests(unittest.TestCase):
             problem_text="Problem: test",
             slm=slm,
             llm=llm,
-            normalizer=None,
             cfg=cfg,
         )
 
@@ -348,7 +342,7 @@ class SARRCodeTests(unittest.TestCase):
             slm=ModelRuntimeConfig(model_path="unused", backend="transformers"),
             llm=ModelRuntimeConfig(model_path="unused", backend="openai", api_base_url="http://127.0.0.1:8000/v1"),
             generation=GenerationConfig(max_new_tokens_per_step=64, think_token_budget=1024, answer_token_budget=64),
-            confidence=ConfidenceConfig(topk_entropy=20, calibration_path=None, allow_identity_normalizer=True),
+            confidence=ConfidenceConfig(topk_entropy=20, calibration_path=None),
             readiness=ReadinessConfig(smooth_window=1, high_threshold=0.70, low_threshold=0.35),
             startup=StartupConfig(B_min=1, B_max=5, tau_start=1),
             stagnation=StagnationConfig(
@@ -382,7 +376,6 @@ class SARRCodeTests(unittest.TestCase):
             problem_text="Problem: test",
             slm=slm,
             llm=llm,
-            normalizer=None,
             cfg=cfg,
         )
 
@@ -393,6 +386,141 @@ class SARRCodeTests(unittest.TestCase):
         self.assertTrue(mid_rows)
         self.assertTrue(any(row["autonomy_state"] == "MID_CONF_STAGNATION" for row in mid_rows))
         self.assertFalse(any(row["hcs_suspect"] for row in mid_rows))
+
+    def test_routing_budget_exceeded_returns_to_slm_active(self):
+        cfg = SARRConfig(
+            slm=ModelRuntimeConfig(model_path="unused", backend="transformers"),
+            llm=ModelRuntimeConfig(model_path="unused", backend="openai", api_base_url="http://127.0.0.1:8000/v1"),
+            generation=GenerationConfig(max_new_tokens_per_step=32, think_token_budget=512, answer_token_budget=64),
+            confidence=ConfidenceConfig(topk_entropy=20, calibration_path=None),
+            readiness=ReadinessConfig(smooth_window=1),
+            startup=StartupConfig(B_min=2, B_max=3, tau_start=1),
+            rollback=RollbackConfig(M_max=5, suspect_confirm_steps=1, suspect_max_steps=2),
+            low_readiness=LowReadinessConfig(useful_exploration_grace_steps=0),
+            low_confidence=LowConfidenceConfig(useful_exploration_grace_blocks=0, collapse_patience_blocks=1),
+            llm_lease=LLMLeaseConfig(low_conf_rollback_steps=2, max_events_per_problem=0),
+            budget=BudgetConfig(max_llm_lease_events_per_problem=0),
+            runtime=RuntimeConfig(max_model_len=4096),
+        )
+        slm = FakeEngine(
+            outputs=[
+                "stable-a\n\n",
+                "stable-b\n\n",
+                "drop-a\n\n",
+                "drop-b\n\n",
+                "drop-c\n\n",
+                "after-budget\n\n",
+                "</think>\n\n",
+            ],
+            confidences=[0.9, 0.9, 0.1, 0.1, 0.1, 0.9],
+        )
+        llm = FakeEngine(outputs=["Final answer: 42."])
+
+        result, steps, rollbacks, transitions = run_sarr_code(
+            problem_id="budget-exceeded",
+            problem_text="Problem: test",
+            slm=slm,
+            llm=llm,
+            cfg=cfg,
+        )
+
+        self.assertEqual(result.answer, "42")
+        self.assertEqual(rollbacks, [])
+        budget_rows = [row for row in steps if row["action"] == "ROUTING_BUDGET_EXCEEDED_CONTINUE_SLM"]
+        self.assertEqual(len(budget_rows), 1)
+        self.assertEqual(budget_rows[0]["state_after"], "SLM_ACTIVE")
+        self.assertTrue(budget_rows[0]["extra"]["routing_budget_exceeded"])
+        self.assertFalse(budget_rows[0]["invalid_rollback_recovery_state"])
+        next_row = steps[steps.index(budget_rows[0]) + 1]
+        self.assertEqual(next_row["state_before"], "SLM_ACTIVE")
+        self.assertNotEqual(next_row["anchor_refresh_blocked_reason"], "STATE_ROLLBACK_RECOVERY")
+        self.assertTrue(
+            any(
+                row.get("to") == "SLM_ACTIVE"
+                and row.get("reason") == "ROUTING_BUDGET_EXCEEDED_CONTINUE_SLM"
+                for row in transitions
+            )
+        )
+
+    def test_confidence_process_shadow_logging(self):
+        cfg = SARRConfig(
+            slm=ModelRuntimeConfig(model_path="unused", backend="transformers"),
+            llm=ModelRuntimeConfig(model_path="unused", backend="openai", api_base_url="http://127.0.0.1:8000/v1"),
+            generation=GenerationConfig(max_new_tokens_per_step=32, think_token_budget=512, answer_token_budget=64),
+            confidence=ConfidenceConfig(
+                topk_entropy=20,
+                calibration_path=None,
+                delta=0.0,
+            ),
+            confidence_process=ConfidenceProcessConfig(r0=2),
+            readiness=ReadinessConfig(smooth_window=3, high_threshold=0.70, low_threshold=0.35),
+            startup=StartupConfig(B_min=1, B_max=10, tau_start=1),
+            routing=RoutingConfig(enabled=False),
+            rollback=RollbackConfig(M_max=5),
+            low_confidence=LowConfidenceConfig(useful_exploration_grace_blocks=0, collapse_patience_blocks=1),
+            runtime=RuntimeConfig(max_model_len=4096),
+        )
+        slm = FakeEngine(
+            outputs=[
+                "h1\n\n",
+                "h2\n\n",
+                "masked\n\n",
+                "m1\n\n",
+                "m2\n\n",
+                "h3\n\n",
+                "h4\n\n",
+                "h5\n\n",
+                "</think>\n\n",
+            ],
+            confidences=[0.9, 0.9, 0.1, 0.9, 0.9, 0.9, 0.9, 0.9],
+        )
+        llm = FakeEngine(outputs=["Final answer: 42."])
+
+        result, steps, _, _ = run_sarr_code(
+            problem_id="confidence-process",
+            problem_text="Problem: test",
+            slm=slm,
+            llm=llm,
+            cfg=cfg,
+        )
+
+        self.assertEqual(result.answer, "42")
+        for row in steps:
+            self.assertIn("confidence_process", row["extra"])
+
+        masked = steps[2]["extra"]["confidence_process"]
+        self.assertTrue(masked["raw_low"])
+        self.assertFalse(masked["smooth_low"])
+        self.assertTrue(masked["masked_uncertainty"])
+        self.assertEqual(masked["masked_uncertainty_count"], 1)
+
+        triggered = [row for row in steps if row["extra"]["confidence_process"]["ciod_shadow_trigger"]]
+        self.assertTrue(triggered)
+        first_trigger = triggered[0]["extra"]["confidence_process"]
+        self.assertEqual(first_trigger["masked_memory_at_high_run_start"], 1)
+        self.assertGreater(first_trigger["ciod_risk"], 0.0)
+
+        summary = next(event.data for event in result.state.trace if event.event == "sarr_summary")
+        self.assertEqual(summary["raw_low_count"], 1)
+        self.assertEqual(summary["masked_uncertainty_count"], 1)
+        self.assertEqual(summary["masked_uncertainty_gap"], 1)
+        self.assertGreaterEqual(summary["max_high_run_length"], 3)
+        self.assertGreater(summary["max_ciod_risk"], 0.0)
+        self.assertEqual(summary["first_ciod_shadow_trigger_step"], triggered[0]["step_id"])
+
+        problem_metrics = _confidence_process_metrics(steps)
+        for key in [
+            "raw_low_count",
+            "smooth_low_count",
+            "masked_uncertainty_count",
+            "masked_uncertainty_gap",
+            "max_high_run_length",
+            "max_ciod_risk",
+            "ciod_shadow_trigger_count",
+            "first_ciod_shadow_trigger_step",
+        ]:
+            self.assertIn(key, problem_metrics)
+        self.assertGreater(problem_metrics["max_ciod_risk"], 0.0)
 
     def test_summary_metrics_include_required_sarr_fields(self):
         rows = [

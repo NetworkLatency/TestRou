@@ -1,25 +1,88 @@
 # SARR-CoDE v3 State-Aware Routing
 
-This path implements **SARR-CoDE with state-aware step routing and confirmed-stagnation rollback**. The main flow is still SLM-first:
+This implementation is an SLM-first continuation system with bounded LLM continuation leases, rollback to a clean autonomy anchor, and CI-OD shadow logging.
+
+The LLM role is intentionally narrow:
+
+```text
+LLM = continuation only
+LLM != verifier
+LLM != reset controller
+LLM != semantic parser
+LLM != judge
+```
+
+The method does not use calibration CDFs, percentile confidence, answer probes, embeddings, hidden states, LLM judges, or diverse sampling for routing.
+
+## 1. Current Flow
 
 ```text
 SLM default generation
--> raw continuation-confidence monitoring
--> optional short LLM lease without rollback
--> confirmed-stagnation rollback to clean autonomy anchor
--> short LLM lease
--> return to SLM
+-> raw continuation-confidence readiness
+-> optional short LLM continuation lease without rollback
+-> confirmed rollback when needed
+-> optional short LLM continuation after rollback
+-> return control to SLM
 ```
 
-The method does not use calibration CDFs, percentile confidence, LLM judges, answer probes, final-answer parsing, embeddings, hidden states, or diverse sampling.
+Recovery and lease are now separated:
 
-## 1. Calibration Is Disabled
+- Non-lease rollback recovery ends by returning directly to `SLM_ACTIVE`.
+- LLM leases return through `POST_LEASE_OBSERVE`.
+- `ROLLBACK_RECOVERY` is valid only while a real `recovery_context` exists.
+- If `ROLLBACK_RECOVERY` appears without `recovery_context`, the invariant guard logs it and restores `SLM_ACTIVE`.
 
-Do not run `--mode calibrate`. Formal runs should use:
+## 2. Run Commands
+
+Start the OpenAI-compatible LLM endpoint first. Its URL and served model name must match `llm.api_base_url` and `llm.api_model` in `configs/sarr_code_aggressive.json`.
+
+Smoke run:
+
+```powershell
+python scripts/run_sarr_code.py --config configs/sarr_code_aggressive.json --dataset aime25 --max-problems 1 --output-root sarr_results --variant sarr_code_v3_state_aware_routing_rollback
+```
+
+Resume a partial run:
+
+```powershell
+python scripts/run_sarr_code.py --config configs/sarr_code_aggressive.json --dataset aime25 --output-root sarr_results --variant sarr_code_v3_state_aware_routing_rollback --resume
+```
+
+Run the predefined D1-D8 sweep:
+
+```powershell
+python scripts/run_sarr_sweep.py --base-config configs/sarr_code_aggressive.json --dataset aime25 --output-root sarr_results --resume
+```
+
+Run tests:
+
+```powershell
+pytest tests/test_sarr_code.py
+pytest
+```
+
+Outputs are written under:
+
+```text
+sarr_results/<dataset>/<variant>/
+```
+
+Each problem directory contains:
+
+```text
+<problem_id>.problem.json
+<problem_id>.steps.jsonl
+<problem_id>.rollback_events.jsonl
+<problem_id>.transitions.jsonl
+<problem_id>.trace.json
+```
+
+## 3. Calibration
+
+Calibration is disabled for this method. Formal runs should keep:
 
 ```json
 {
-  "method": "sarr_code_v3_state_aware_routing_rollback",
   "calibration": {
     "enabled": false,
     "build_cdf": false,
@@ -29,55 +92,22 @@ Do not run `--mode calibrate`. Formal runs should use:
   "confidence": {
     "percentile_normalization": false,
     "calibration_path": null
+  },
+  "readiness": {
+    "normalization": "raw",
+    "use_calibration": false
   }
 }
 ```
 
-`c_norm` and `c_smooth` may remain in logs for compatibility, but strategy decisions use raw readiness only.
-
-## 2. Run
-
-Start the OpenAI-compatible vLLM server for the LLM, then run:
-
-```bash
-python scripts/run_sarr_code.py \
-  --config configs/sarr_code_aggressive.json \
-  --mode run \
-  --dataset aime25 \
-  --max-problems 30 \
-  --output-root sarr_results \
-  --resume
-```
-
-Outputs are written under:
-
-```text
-sarr_results/<dataset>/sarr_code_v3_state_aware_routing_rollback/
-```
-
-Per-problem logs include `steps.jsonl`, `rollback_events.jsonl`, `transitions.jsonl`, and `trace.json`.
-
-## 3. Thinking Stop
-
-SLM step generation still uses `\n\n` as the normal boundary. After a boundary, the local SLM can look ahead for `</think>`:
-
-```json
-{
-  "generation": {
-    "step_delimiters": ["\n\n"],
-    "close_tag_lookahead_tokens": 16
-  }
-}
-```
-
-If `</think>`, EOS, or an empty step is observed, thinking stops immediately and the final step skips continuation-confidence forward.
+The SARR runner validates this at startup. There is no calibration mode in the active entrypoint.
 
 ## 4. Readiness
 
-The strategy uses raw confidence with optional raw smoothing:
+Readiness is raw continuation confidence with optional raw smoothing:
 
 ```text
-readiness_value = readiness_raw_smooth if available else c_raw
+readiness_value = readiness_raw_smooth if configured and available else c_raw
 ```
 
 Recommended config:
@@ -96,11 +126,83 @@ Recommended config:
 }
 ```
 
-Each monitored SLM step records `c_raw`, `readiness_raw`, `readiness_raw_smooth`, `readiness_value`, `readiness_high`, `readiness_mid`, and `readiness_low`.
+Each scored SLM step records `c_raw`, `readiness_raw`, `readiness_raw_smooth`, `readiness_value`, `readiness_high`, `readiness_mid`, and `readiness_low`.
 
-## 5. States
+## 5. CI-OD Shadow Logging
 
-The routing state machine uses:
+CI-OD is shadow-only. It is recorded in traces and summaries, but it never routes to the LLM and never changes the active state machine.
+
+Per scored SLM step, `extra.confidence_process` records:
+
+```text
+raw_low
+smooth_low
+masked_uncertainty
+raw_low_count
+smooth_low_count
+masked_uncertainty_count
+masked_uncertainty_gap
+high_run_length
+high_run_start_step
+masked_memory_at_high_run_start
+ciod_risk
+ciod_shadow_trigger
+```
+
+Definitions:
+
+```text
+raw_low = c_raw <= 0.35
+smooth_low = readiness_value <= 0.35
+masked_uncertainty = raw_low and not smooth_low
+masked_uncertainty_gap = raw_low_count - smooth_low_count
+high_run_length = consecutive readiness_value >= 0.70
+```
+
+Risk uses a conditional hazard, not linear weighting:
+
+```text
+risk = 1 - exp(
+  -lambda0
+  * (1 + masked_memory_at_high_run_start)^alpha
+  * max(0, high_run_length - r0)^power
+)
+```
+
+Defaults:
+
+```json
+{
+  "confidence_process": {
+    "lambda0": 0.002,
+    "alpha": 1.0,
+    "r0": 20,
+    "power": 2.0,
+    "high_threshold": 0.70,
+    "raw_low_threshold": 0.35,
+    "smooth_low_threshold": 0.35
+  }
+}
+```
+
+Problem summaries include:
+
+```text
+raw_low_count
+smooth_low_count
+masked_uncertainty_count
+masked_uncertainty_gap
+max_high_run_length
+ciod_risk
+ciod_shadow_trigger
+max_ciod_risk
+ciod_shadow_trigger_count
+first_ciod_shadow_trigger_step
+```
+
+## 6. States
+
+The state machine uses:
 
 ```text
 STARTUP
@@ -111,38 +213,30 @@ ROLLBACK_RECOVERY
 UNRECOVERABLE
 ```
 
-`STARTUP` is only for the beginning of a problem. After the system has left STARTUP, recovery or LLM lease cannot send it back there. Lease and recovery both return through `POST_LEASE_OBSERVE`, which suppresses startup rollback and immediate rollback for a short observation window.
+State rules:
 
-## 6. Confirmed Stagnation
+- `STARTUP` is only for the beginning of a problem.
+- Once startup is left, attempted startup re-entry is blocked and mapped to `SLM_ACTIVE`.
+- `ROLLBACK_RECOVERY` is entered only for real rollback recovery with `recovery_context`.
+- Recovery stops such as `SLM_READY`, `EXHAUSTED_FORCE_SLM`, `RECOVERY_BUDGET_EXCEEDED`, and `ROUTING_BUDGET_EXCEEDED_CONTINUE_SLM` clear recovery context and return to `SLM_ACTIVE`.
+- `ROUTING_BUDGET_EXCEEDED_CONTINUE_SLM` must have `state_after=SLM_ACTIVE`.
+- `POST_LEASE_OBSERVE` is only the post-lease observation window.
 
-Surface stagnation uses word 3-gram Jaccard over recent active SLM steps or small blocks:
-
-```json
-{
-  "stagnation": {
-    "enabled": true,
-    "metric": "word_3gram_jaccard",
-    "repeat_window": 10,
-    "high_threshold": 0.85,
-    "patience": 3,
-    "block_min_tokens": 32,
-    "block_max_steps": 2,
-    "include_mid_readiness": true
-  }
-}
-```
-
-`hcs_suspect` is still logged for `readiness_high and stagnation_high`, but rollback now triggers on confirmed stagnation, including mid-confidence repeated tails.
-
-Autonomy states include:
+Invariant logs on every step include:
 
 ```text
-HIGH_CONF_STAGNATION
-MID_CONF_STAGNATION
-LOW_CONF_STAGNATION_COLLAPSE
+state_duration
+invalid_rollback_recovery_state
+anchor_refresh_blocked_reason
 ```
 
-Confirmed stagnation rolls back to `clean_autonomy_anchor`, not to the repetition onset.
+If `invalid_rollback_recovery_state` is true, the system records:
+
+```text
+action = STATE_RECOVERED_TO_SLM_ACTIVE
+```
+
+and restores `SLM_ACTIVE`.
 
 ## 7. Clean Anchor
 
@@ -156,18 +250,18 @@ and state == SLM_ACTIVE
 and current step is active
 ```
 
-LLM steps, recovery steps, POST_LEASE_OBSERVE steps, and any stagnation-suspect step do not refresh the anchor.
+LLM steps, lease observation steps, recovery steps, and stagnation-suspect steps do not refresh the anchor.
+
+`STATE_ROLLBACK_RECOVERY` is used as an anchor-refresh blocked reason only when a real `recovery_context` exists. A stale `ROLLBACK_RECOVERY` state is repaired to `SLM_ACTIVE` instead of blocking anchor refresh.
 
 ## 8. LLM Lease
 
-LLM can now appear without rollback when SLM has persistent low readiness and no confirmed stagnation:
+LLM lease is a short continuation-only handoff. It can happen without rollback for persistent low readiness, or after rollback for confirmed stagnation / confirmed low-confidence degeneration.
+
+Config:
 
 ```json
 {
-  "low_readiness": {
-    "useful_exploration_grace_steps": 2,
-    "persistent_low_after_grace_action": "llm_lease_no_rollback"
-  },
   "llm_lease": {
     "enabled": true,
     "prompt_type": "normal_continuation",
@@ -186,9 +280,9 @@ LLM can now appear without rollback when SLM has persistent low readiness and no
 }
 ```
 
-The lease prompt remains normal continuation. It must not mention uncertainty, stagnation, repetition, stuckness, strategy changes, or repair.
+The prompt remains normal continuation. It must not mention uncertainty, stagnation, repetition, stuckness, verification, reset, or repair.
 
-Lease events are logged as:
+Lease event example:
 
 ```json
 {
@@ -200,14 +294,44 @@ Lease events are logged as:
   "mention_uncertainty": false,
   "mention_stagnation": false,
   "mention_repetition": false,
+  "mention_error": false,
   "return_to_slm": true,
   "state_after": "POST_LEASE_OBSERVE"
 }
 ```
 
-For confirmed stagnation, the same event has `rollback_before_lease=true`, `reason=CONFIRMED_STAGNATION`, `rollback_anchor=<clean anchor>`, and `removed_steps=[...]`.
+## 9. Rollback And Recovery
 
-## 9. Budgets
+Confirmed stagnation uses word 3-gram Jaccard over recent active SLM steps or small blocks:
+
+```json
+{
+  "stagnation": {
+    "enabled": true,
+    "metric": "word_3gram_jaccard",
+    "repeat_window": 10,
+    "high_threshold": 0.85,
+    "patience": 3,
+    "block_min_tokens": 32,
+    "block_max_steps": 2,
+    "include_mid_readiness": true
+  }
+}
+```
+
+Autonomy states include:
+
+```text
+HIGH_CONF_STAGNATION
+MID_CONF_STAGNATION
+LOW_CONF_STAGNATION_COLLAPSE
+```
+
+Confirmed stagnation rolls back to `clean_autonomy_anchor`, not to the repetition onset.
+
+Recovery records normal continuation from the LLM and then returns to SLM. For non-lease recovery, `state_after` is `SLM_ACTIVE`.
+
+## 10. Budgets
 
 Problem-level budgets prevent LLM takeover:
 
@@ -222,24 +346,31 @@ Problem-level budgets prevent LLM takeover:
 }
 ```
 
-If lease budget is exhausted, the system records `routing_budget_exceeded` and falls back to the configured continue/close/unrecoverable policy instead of repeatedly calling LLM.
+If lease budget is exhausted, the system records:
 
-## 10. Checks
+```text
+action = ROUTING_BUDGET_EXCEEDED_CONTINUE_SLM
+extra.routing_budget_exceeded = true
+state_after = SLM_ACTIVE
+```
 
-For Problem 6 and Problem 0, inspect:
+No extra LLM route is created for this condition.
+
+## 11. Checks
+
+Useful checks in logs:
 
 ```text
 calibration_enabled=false
 readiness_source=raw
-readiness_value uses readiness_raw_smooth when available
+confidence_process exists in every step extra
+ciod_risk and ciod_shadow_trigger are shadow fields only
 LLM_LEASE can appear without rollback for persistent low readiness
 STAGNATION_ROLLBACK appears for confirmed stagnation
 MID_CONF_STAGNATION appears for mid-confidence repeated tails
-anchor_refresh_blocked_reason=STAGNATION_SUSPECT
-LLM steps do not refresh clean_autonomy_anchor
-state transitions include LLM_LEASE -> POST_LEASE_OBSERVE
+anchor_refresh_blocked_reason=STAGNATION_SUSPECT for stagnation suspects
+STATE_ROLLBACK_RECOVERY appears only with real recovery_context
+ROUTING_BUDGET_EXCEEDED_CONTINUE_SLM has state_after=SLM_ACTIVE
 no mature prefix re-enters STARTUP after lease or recovery
 llm lease counts and tokens stay within budget
 ```
-
-The expected behavior is bounded SLM-first collaboration: the LLM gets short continuation leases, confirmed polluted tails are removed back to the clean anchor, and control returns to SLM after the post-lease observation window.

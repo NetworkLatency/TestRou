@@ -3,7 +3,7 @@
 The active new experiment path is **SARR-CoDE: Stability-Aware Rollback Routing with Confidence-Degeneration Evidence**. It lives in `sarr_code/` with the entrypoint:
 
 ```bash
-python scripts/run_sarr_code.py --config configs/sarr_code_aggressive.json --mode run --dataset aime25
+python scripts/run_sarr_code.py --config configs/sarr_code_aggressive.json --dataset aime25
 ```
 
 See `docs/sarr_code.md` for the offline server workflow, local transformers SLM setup, vLLM LLM startup, raw-readiness HCS configuration, and JSONL log outputs.

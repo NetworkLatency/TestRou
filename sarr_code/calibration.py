@@ -32,11 +32,6 @@ class PercentileNormalizer:
         return cls(values)
 
 
-class IdentityNormalizer:
-    def transform(self, x: float) -> float:
-        return max(0.0, min(1.0, float(x)))
-
-
 def smooth_confidence(c_norm_history: list[float], W: int = 2) -> float | None:
     if len(c_norm_history) < W:
         return None

@@ -59,7 +59,6 @@ class ConfidenceConfig:
     topk_entropy: int = 20
     percentile_normalization: bool = False
     calibration_path: str | None = None
-    allow_identity_normalizer: bool = False
     smooth_window: int = 2
     delta: float = 0.55
     capture_slm_token_entropy: bool = False
@@ -69,6 +68,31 @@ class ConfidenceConfig:
             raise ValueError("confidence.topk_entropy must be >= 2")
         if self.smooth_window < 1:
             raise ValueError("confidence.smooth_window must be >= 1")
+
+
+@dataclass
+class ConfidenceProcessConfig:
+    lambda0: float = 0.002
+    alpha: float = 1.0
+    r0: int = 20
+    power: float = 2.0
+    high_threshold: float = 0.70
+    raw_low_threshold: float = 0.35
+    smooth_low_threshold: float = 0.35
+
+    def __post_init__(self) -> None:
+        if self.lambda0 < 0.0:
+            raise ValueError("confidence_process.lambda0 must be >= 0")
+        if self.alpha < 0.0:
+            raise ValueError("confidence_process.alpha must be >= 0")
+        if self.r0 < 0:
+            raise ValueError("confidence_process.r0 must be >= 0")
+        if self.power < 0.0:
+            raise ValueError("confidence_process.power must be >= 0")
+        for name in ["high_threshold", "raw_low_threshold", "smooth_low_threshold"]:
+            value = getattr(self, name)
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"confidence_process.{name} must be in [0, 1]")
 
 
 @dataclass
@@ -474,6 +498,7 @@ class SARRConfig:
     dataset_paths: dict[str, str] = field(default_factory=dict)
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
+    confidence_process: ConfidenceProcessConfig = field(default_factory=ConfidenceProcessConfig)
     calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
     readiness: ReadinessConfig = field(default_factory=ReadinessConfig)
     stagnation: StagnationConfig = field(default_factory=StagnationConfig)
@@ -514,6 +539,7 @@ class SARRConfig:
         for key, cls_ in [
             ("generation", GenerationConfig),
             ("confidence", ConfidenceConfig),
+            ("confidence_process", ConfidenceProcessConfig),
             ("calibration", CalibrationConfig),
             ("readiness", ReadinessConfig),
             ("stagnation", StagnationConfig),

@@ -53,6 +53,8 @@ class StepRecord:
 
     state_before: str | None = None
     state_after: str | None = None
+    state_duration: int = 0
+    invalid_rollback_recovery_state: bool = False
 
     degeneration_event: int = 0
     D_start: int = 0

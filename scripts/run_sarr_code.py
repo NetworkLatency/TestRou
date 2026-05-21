@@ -20,7 +20,6 @@ from bpa.eval.datasets import load_eval_dataset
 from bpa.eval.main_benchmark import build_summary_metrics, load_summary_rows, write_summary_files
 from bpa.trace import result_summary, write_json, write_jsonl
 from sarr_code import SARRConfig, run_sarr_code
-from sarr_code.engines import build_llm, build_slm
 
 
 MATH_DATASETS = {"math500", "aime24", "aime25"}
@@ -121,6 +120,46 @@ def _num(value: Any) -> float:
     return float(value)
 
 
+def _confidence_process_metrics(step_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    process_rows: list[tuple[int, dict[str, Any]]] = []
+    for row in step_rows:
+        extra = row.get("extra")
+        if not isinstance(extra, dict):
+            continue
+        process = extra.get("confidence_process")
+        if isinstance(process, dict):
+            process_rows.append((int(row.get("step_id") or 0), process))
+
+    if not process_rows:
+        return {
+            "raw_low_count": 0,
+            "smooth_low_count": 0,
+            "masked_uncertainty_count": 0,
+            "masked_uncertainty_gap": 0,
+            "max_high_run_length": 0,
+            "ciod_risk": 0.0,
+            "ciod_shadow_trigger": False,
+            "max_ciod_risk": 0.0,
+            "ciod_shadow_trigger_count": 0,
+            "first_ciod_shadow_trigger_step": None,
+        }
+
+    latest = process_rows[-1][1]
+    trigger_steps = [step_id for step_id, process in process_rows if _truthy(process.get("ciod_shadow_trigger"))]
+    return {
+        "raw_low_count": int(_num(latest.get("raw_low_count"))),
+        "smooth_low_count": int(_num(latest.get("smooth_low_count"))),
+        "masked_uncertainty_count": int(_num(latest.get("masked_uncertainty_count"))),
+        "masked_uncertainty_gap": int(_num(latest.get("masked_uncertainty_gap"))),
+        "max_high_run_length": max(int(_num(process.get("high_run_length"))) for _, process in process_rows),
+        "ciod_risk": _num(latest.get("ciod_risk")),
+        "ciod_shadow_trigger": _truthy(latest.get("ciod_shadow_trigger")),
+        "max_ciod_risk": max(_num(process.get("ciod_risk")) for _, process in process_rows),
+        "ciod_shadow_trigger_count": len(trigger_steps),
+        "first_ciod_shadow_trigger_step": min(trigger_steps) if trigger_steps else None,
+    }
+
+
 def _problem_sarr_metrics(result, step_rows: list[dict[str, Any]], rollback_rows: list[dict[str, Any]]) -> dict[str, Any]:
     rollback_only_rows = [row for row in rollback_rows if row.get("type") != "LLM_LEASE"]
     llm_lease_count = sum(1 for row in rollback_rows if row.get("event") == "llm_lease")
@@ -146,6 +185,7 @@ def _problem_sarr_metrics(result, step_rows: list[dict[str, Any]], rollback_rows
     forced_close_think = str(result.state.stop_reason or "").endswith("_forced_close_think")
     summary = result_summary(result)
     llm_token_ratio = summary["llm_token_share"]
+    confidence_process_fields = _confidence_process_metrics(step_rows)
     return {
         "active_thinking_step_count": active_thinking_step_count,
         "generated_thinking_attempt_count": generated_thinking_attempt_count,
@@ -181,6 +221,7 @@ def _problem_sarr_metrics(result, step_rows: list[dict[str, Any]], rollback_rows
         if force_slm_after_recovery_count
         else 0.0,
         "llm_token_ratio": llm_token_ratio,
+        **confidence_process_fields,
     }
 
 
@@ -245,16 +286,11 @@ def _write_summary(summary_path: Path, dataset: str, variant: str, rows: list[di
     write_summary_files(summary_path, rows, metrics)
 
 
-def _load_normalizer(cfg: SARRConfig):
+def _validate_raw_readiness_config(cfg: SARRConfig) -> None:
     if cfg.calibration.enabled or cfg.calibration.load_cdf or cfg.calibration.use_percentile:
         raise RuntimeError("This experiment disables calibration; run with calibration.enabled=false.")
     if cfg.confidence.calibration_path:
         raise RuntimeError("This experiment disables calibration; remove confidence.calibration_path.")
-    return None
-
-
-def run_calibration(args: argparse.Namespace, cfg: SARRConfig) -> None:
-    raise RuntimeError("Calibration CDF construction is disabled for raw-readiness SARR-CoDE.")
 
 
 def run_experiment(args: argparse.Namespace, cfg: SARRConfig) -> None:
@@ -287,8 +323,10 @@ def run_experiment(args: argparse.Namespace, cfg: SARRConfig) -> None:
             if str(problem.problem_id) in rows_by_problem_id
         ]
 
-    normalizer = _load_normalizer(cfg)
+    _validate_raw_readiness_config(cfg)
     print("[sarr] readiness_source=raw calibration_enabled=false", flush=True)
+    from sarr_code.engines import build_llm, build_slm
+
     slm = build_slm(cfg.slm, cfg.runtime)
     llm = build_llm(cfg.llm, cfg.runtime)
 
@@ -305,7 +343,6 @@ def run_experiment(args: argparse.Namespace, cfg: SARRConfig) -> None:
             problem_text=problem.problem_text,
             slm=slm,
             llm=llm,
-            normalizer=normalizer,
             cfg=cfg,
         )
         if problem.gold_answer is not None:
@@ -364,20 +401,15 @@ def main() -> None:
     raise_csv_field_limit()
     parser = argparse.ArgumentParser(description="Run SARR-CoDE state-aware routing with confirmed-stagnation rollback.")
     parser.add_argument("--config", required=True, help="Path to SARRConfig JSON.")
-    parser.add_argument("--mode", choices=["run", "calibrate"], default="run")
     parser.add_argument("--dataset", default="aime25", choices=["math500", "aime24", "aime25", "gpqa", "gpqa_diamond"])
     parser.add_argument("--max-problems", type=int, default=None)
     parser.add_argument("--output-root", default=None)
     parser.add_argument("--variant", default=DEFAULT_VARIANT)
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--calibration-output", default=None)
     args = parser.parse_args()
 
     cfg = SARRConfig.from_json(args.config)
-    if args.mode == "calibrate":
-        run_calibration(args, cfg)
-    else:
-        run_experiment(args, cfg)
+    run_experiment(args, cfg)
 
 
 if __name__ == "__main__":
