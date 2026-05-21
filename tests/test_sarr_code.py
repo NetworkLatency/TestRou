@@ -244,7 +244,7 @@ class SARRCodeTests(unittest.TestCase):
         self.assertEqual(len(rollbacks), 1)
         self.assertEqual(rollbacks[0]["event"], "llm_lease")
         self.assertEqual(rollbacks[0]["type"], "LLM_LEASE")
-        self.assertEqual(rollbacks[0]["reason"], "PERSISTENT_UNCERTAINTY")
+        self.assertEqual(rollbacks[0]["reason"], "LLM_LEASE_BY_READINESS_LOW")
         self.assertFalse(rollbacks[0]["rollback_before_lease"])
         self.assertEqual(rollbacks[0]["recovery_actual_steps"], 2)
         self.assertFalse(any(row["removed_by_rollback"] for row in steps))
@@ -510,6 +510,10 @@ class SARRCodeTests(unittest.TestCase):
         first_trigger = triggered_v2[0]["extra"]["confidence_process"]
         self.assertGreater(first_trigger["post_masked_exposure"], 1.0)
         self.assertGreater(first_trigger["ciod_risk_v2"], 0.0)
+        ciod_events = [row for row in steps if row["extra"]["confidence_process"]["ciod_event_shadow"]]
+        self.assertTrue(ciod_events)
+        self.assertLess(len(ciod_events), len(triggered_v2))
+        self.assertEqual(ciod_events[0]["action"], "CIOD_EVENT_SHADOW_ONLY")
 
         summary = next(event.data for event in result.state.trace if event.event == "sarr_summary")
         self.assertEqual(summary["raw_low_count"], 1)
@@ -522,6 +526,9 @@ class SARRCodeTests(unittest.TestCase):
         self.assertEqual(summary["first_ciod_shadow_trigger_step_v2"], triggered_v2[0]["step_id"])
         self.assertIn("ciod_grid_summary", summary)
         self.assertGreaterEqual(len(summary["ciod_grid_summary"]), 5)
+        self.assertEqual(summary["first_ciod_event_step"], ciod_events[0]["step_id"])
+        self.assertEqual(summary["ciod_event_count"], len(ciod_events))
+        self.assertEqual(summary["ciod_active_lease_count"], 0)
 
         problem_metrics = _confidence_process_metrics(steps)
         for key in [
@@ -538,9 +545,75 @@ class SARRCodeTests(unittest.TestCase):
             "ciod_shadow_trigger_count_v2",
             "first_ciod_shadow_trigger_step_v2",
             "ciod_grid_summary",
+            "ciod_event_count",
+            "first_ciod_event_step",
+            "last_ciod_event_step",
+            "ciod_event_before_first_readiness_low",
+            "ciod_event_steps",
+            "ciod_active_lease_count",
         ]:
             self.assertIn(key, problem_metrics)
         self.assertGreater(problem_metrics["max_ciod_risk_v2"], 0.0)
+        self.assertEqual(problem_metrics["ciod_event_count"], len(ciod_events))
+
+    def test_ciod_event_can_trigger_single_active_lease_when_enabled(self):
+        cfg = SARRConfig(
+            slm=ModelRuntimeConfig(model_path="unused", backend="transformers"),
+            llm=ModelRuntimeConfig(model_path="unused", backend="openai", api_base_url="http://127.0.0.1:8000/v1"),
+            generation=GenerationConfig(max_new_tokens_per_step=32, think_token_budget=512, answer_token_budget=64),
+            confidence=ConfidenceConfig(
+                topk_entropy=20,
+                calibration_path=None,
+                delta=1.0,
+            ),
+            confidence_process=ConfidenceProcessConfig(
+                min_masked_memory=0.5,
+                exposure_e0=1.0,
+                lambda0=0.05,
+                risk_threshold=0.05,
+                ciod_event_on_threshold=0.05,
+                ciod_event_off_threshold=0.01,
+                enable_ciod_active_routing=True,
+                max_ciod_active_leases_per_problem=1,
+            ),
+            readiness=ReadinessConfig(smooth_window=3, high_threshold=0.70, low_threshold=0.35),
+            startup=StartupConfig(B_min=1, B_max=10, tau_start=1),
+            routing=RoutingConfig(enabled=True),
+            llm_lease=LLMLeaseConfig(persistent_uncertainty_steps=1, max_tokens_per_step=16),
+            rollback=RollbackConfig(M_max=5),
+            low_confidence=LowConfidenceConfig(useful_exploration_grace_blocks=10, collapse_patience_blocks=20),
+            runtime=RuntimeConfig(max_model_len=4096),
+        )
+        slm = FakeEngine(
+            outputs=[
+                "h1\n\n",
+                "h2\n\n",
+                "masked\n\n",
+                "m1\n\n",
+                "m2\n\n",
+                "h3\n\n",
+                "</think>\n\n",
+            ],
+            confidences=[0.9, 0.9, 0.1, 0.9, 0.9, 0.9],
+        )
+        llm = FakeEngine(outputs=["ciod lease\n\n", "Final answer: 42."])
+
+        result, steps, rollbacks, _ = run_sarr_code(
+            problem_id="ciod-active",
+            problem_text="Problem: test",
+            slm=slm,
+            llm=llm,
+            cfg=cfg,
+        )
+
+        self.assertEqual(result.answer, "42")
+        ciod_routes = [row for row in steps if row["action"] == "LLM_LEASE_BY_CIOD_EVENT"]
+        self.assertEqual(len(ciod_routes), 1)
+        self.assertEqual(len([r for r in rollbacks if r["reason"] == "LLM_LEASE_BY_CIOD_EVENT"]), 1)
+        self.assertEqual(rollbacks[0]["type"], "LLM_LEASE")
+        self.assertFalse(rollbacks[0]["rollback_before_lease"])
+        summary = next(event.data for event in result.state.trace if event.event == "sarr_summary")
+        self.assertEqual(summary["ciod_active_lease_count"], 1)
 
     def test_summary_metrics_include_required_sarr_fields(self):
         rows = [

@@ -154,6 +154,12 @@ def _confidence_process_metrics(step_rows: list[dict[str, Any]]) -> dict[str, An
             "ciod_shadow_trigger_count_v2": 0,
             "first_ciod_shadow_trigger_step_v2": None,
             "ciod_grid_summary": {},
+            "ciod_event_count": 0,
+            "first_ciod_event_step": None,
+            "last_ciod_event_step": None,
+            "ciod_event_before_first_readiness_low": False,
+            "ciod_event_steps": [],
+            "ciod_active_lease_count": 0,
         }
 
     latest = process_rows[-1][1]
@@ -166,6 +172,15 @@ def _confidence_process_metrics(step_rows: list[dict[str, Any]]) -> dict[str, An
     trigger_steps_v2 = [
         step_id for step_id, process in process_rows if _truthy(process.get("ciod_shadow_trigger_v2"))
     ]
+    ciod_event_steps = [
+        step_id for step_id, process in process_rows if _truthy(process.get("ciod_event_shadow"))
+    ]
+    readiness_low_steps = [
+        int(row.get("step_id") or 0)
+        for row in step_rows
+        if _truthy(row.get("readiness_low"))
+    ]
+    first_readiness_low_step = min(readiness_low_steps) if readiness_low_steps else None
     grid_summary: dict[str, dict[str, Any]] = {}
     for step_id, process in process_rows:
         risks = process.get("ciod_grid_risks")
@@ -214,6 +229,18 @@ def _confidence_process_metrics(step_rows: list[dict[str, Any]]) -> dict[str, An
         "ciod_shadow_trigger_count_v2": len(trigger_steps_v2),
         "first_ciod_shadow_trigger_step_v2": min(trigger_steps_v2) if trigger_steps_v2 else None,
         "ciod_grid_summary": grid_summary,
+        "ciod_event_count": len(ciod_event_steps),
+        "first_ciod_event_step": min(ciod_event_steps) if ciod_event_steps else None,
+        "last_ciod_event_step": max(ciod_event_steps) if ciod_event_steps else None,
+        "ciod_event_before_first_readiness_low": bool(
+            ciod_event_steps
+            and (
+                first_readiness_low_step is None
+                or min(ciod_event_steps) < first_readiness_low_step
+            )
+        ),
+        "ciod_event_steps": ciod_event_steps,
+        "ciod_active_lease_count": int(_num(latest.get("ciod_active_lease_count"))),
     }
 
 

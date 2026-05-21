@@ -1,20 +1,20 @@
 {
-  "method": "sarr_code_v3_state_aware_routing_rollback",
+  "method": "sarr_code_v3.1",
   "slm": {
-    "model_path": "/home/lhyang/Documents/code/reasoning_boundary/models/deepseek-aiDeepSeek-R1-Distill-Qwen-1.5B/",
+    "model_path": "/home/chenqi/code/Router/models/deepseek-aiDeepSeek-R1-Distill-Qwen-1.5B/",
     "tokenizer_path": null,
     "chat_template_path": "server/template/deepseekr1.jinja",
-    "device": "cuda:1",
+    "device": "cuda:3",
     "dtype": "bfloat16",
     "trust_remote_code": true,
     "local_files_only": true,
     "backend": "transformers"
   },
   "llm": {
-    "model_path": "/home/lhyang/Documents/code/reasoning_boundary/models/qwen3-4B/",
+    "model_path": "/home/chenqi/code/Router/models/qwen3-4B/",
     "tokenizer_path": null,
     "chat_template_path": "server/template/qwen3.jinja",
-    "device": "cuda:0",
+    "device": "cuda:2",
     "dtype": "auto",
     "trust_remote_code": true,
     "local_files_only": true,
@@ -28,7 +28,7 @@
   "dataset_paths": {
     "math500": "data/math500.jsonl",
     "aime24": "data/aime24.jsonl",
-    "aime25": "/home/lhyang/Documents/code/reasoning_boundary/data/aime2025/aime2025.jsonl",
+    "aime25": "/home/chenqi/code/Router/datasets/aime2025/aime2025.jsonl",
     "gpqa": "data/gpqa_diamond.jsonl",
     "gpqa_diamond": "data/gpqa_diamond.jsonl"
   },
@@ -64,6 +64,13 @@
     "min_masked_memory": 3.0,
     "exposure_e0": 4.0,
     "risk_threshold": 0.10,
+    "ciod_event_on_threshold": 0.10,
+    "ciod_event_off_threshold": 0.03,
+    "ciod_event_cooldown_steps": 32,
+    "min_new_masked_mass_for_retrigger": 2.0,
+    "min_new_exposure_for_retrigger": 4.0,
+    "max_ciod_active_leases_per_problem": 1,
+    "enable_ciod_active_routing": false,
     "v1_lambda0": 0.002,
     "ciod_grid": [
       {"exposure_e0": 3.0, "lambda0": 0.003, "risk_threshold": 0.10},

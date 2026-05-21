@@ -85,6 +85,13 @@ class ConfidenceProcessConfig:
     min_masked_memory: float = 3.0
     exposure_e0: float = 4.0
     risk_threshold: float = 0.10
+    ciod_event_on_threshold: float = 0.10
+    ciod_event_off_threshold: float = 0.03
+    ciod_event_cooldown_steps: int = 32
+    min_new_masked_mass_for_retrigger: float = 2.0
+    min_new_exposure_for_retrigger: float = 4.0
+    max_ciod_active_leases_per_problem: int = 1
+    enable_ciod_active_routing: bool = False
     v1_lambda0: float = 0.002
     ciod_grid: list[dict[str, float]] = field(
         default_factory=lambda: [
@@ -115,6 +122,8 @@ class ConfidenceProcessConfig:
             "masked_decay",
             "exposure_decay",
             "risk_threshold",
+            "ciod_event_on_threshold",
+            "ciod_event_off_threshold",
         ]:
             value = getattr(self, name)
             if not 0.0 <= value <= 1.0:
@@ -123,6 +132,16 @@ class ConfidenceProcessConfig:
             raise ValueError("confidence_process.min_masked_memory must be >= 0")
         if self.exposure_e0 < 0.0:
             raise ValueError("confidence_process.exposure_e0 must be >= 0")
+        if self.ciod_event_off_threshold > self.ciod_event_on_threshold:
+            raise ValueError("confidence_process.ciod_event_off_threshold must be <= ciod_event_on_threshold")
+        if self.ciod_event_cooldown_steps < 0:
+            raise ValueError("confidence_process.ciod_event_cooldown_steps must be >= 0")
+        if self.min_new_masked_mass_for_retrigger < 0.0:
+            raise ValueError("confidence_process.min_new_masked_mass_for_retrigger must be >= 0")
+        if self.min_new_exposure_for_retrigger < 0.0:
+            raise ValueError("confidence_process.min_new_exposure_for_retrigger must be >= 0")
+        if self.max_ciod_active_leases_per_problem < 0:
+            raise ValueError("confidence_process.max_ciod_active_leases_per_problem must be >= 0")
         normalized_grid = []
         for i, item in enumerate(self.ciod_grid):
             if not isinstance(item, dict):

@@ -130,8 +130,9 @@ Each scored SLM step records `c_raw`, `readiness_raw`, `readiness_raw_smooth`, `
 
 ## 5. CI-OD Shadow Logging
 
-CI-OD is shadow-only. It is recorded in traces and summaries, but it never routes to the LLM and never changes the active state machine.
+CI-OD is shadow-only by default. It is recorded in traces and summaries, and it changes routing only when `enable_ciod_active_routing=true`.
 The original consecutive high-run hazard is retained as `ciod_risk_v1` for comparison; the current CI-OD signal is `ciod_risk_v2`.
+`ciod_shadow_trigger_v2` is a sustained risk-state flag. `ciod_event_shadow` is the sparse event controller output intended for routing experiments.
 
 Per scored SLM step, `extra.confidence_process` records:
 
@@ -160,6 +161,12 @@ ciod_risk_v2
 ciod_shadow_trigger_v2
 ciod_grid_risks
 ciod_grid_triggers
+ciod_event_shadow
+ciod_episode_active
+ciod_episode_id
+ciod_cooldown_until_step
+new_masked_mass_since_last_ciod_event
+new_exposure_since_last_ciod_event
 ```
 
 Definitions:
@@ -190,6 +197,17 @@ else:
 
 Exposure increments by `1.0` when `readiness_value >= high_threshold`, by `0.5` when `readiness_value >= mid_high_threshold`, and by `0.0` otherwise. `ciod_shadow_trigger_v2 = ciod_risk_v2 >= risk_threshold`.
 
+The event controller converts the sustained risk flag into sparse events:
+
+```text
+on:  ciod_risk_v2 >= ciod_event_on_threshold
+off: ciod_risk_v2 <= ciod_event_off_threshold
+cooldown: no retrigger before ciod_cooldown_until_step
+retrigger: new masked mass >= 2.0 or new exposure >= 4.0
+```
+
+Default active routing is off. If `enable_ciod_active_routing=true`, only `ciod_event_shadow=True` may create `LLM_LEASE_BY_CIOD_EVENT`, capped by `max_ciod_active_leases_per_problem`. `ciod_shadow_trigger_v2` never directly routes, and readiness-low routing keeps priority on readiness-low steps.
+
 Defaults:
 
 ```json
@@ -208,6 +226,13 @@ Defaults:
     "min_masked_memory": 3.0,
     "exposure_e0": 4.0,
     "risk_threshold": 0.10,
+    "ciod_event_on_threshold": 0.10,
+    "ciod_event_off_threshold": 0.03,
+    "ciod_event_cooldown_steps": 32,
+    "min_new_masked_mass_for_retrigger": 2.0,
+    "min_new_exposure_for_retrigger": 4.0,
+    "max_ciod_active_leases_per_problem": 1,
+    "enable_ciod_active_routing": false,
     "v1_lambda0": 0.002,
     "ciod_grid": [
       {"exposure_e0": 3.0, "lambda0": 0.003, "risk_threshold": 0.10},
@@ -245,6 +270,12 @@ max_ciod_risk_v2
 ciod_shadow_trigger_count_v2
 first_ciod_shadow_trigger_step_v2
 ciod_grid_summary
+ciod_event_count
+first_ciod_event_step
+last_ciod_event_step
+ciod_event_before_first_readiness_low
+ciod_event_steps
+ciod_active_lease_count
 ```
 
 ## 6. States
@@ -334,7 +365,7 @@ Lease event example:
 ```json
 {
   "event": "llm_lease",
-  "reason": "PERSISTENT_UNCERTAINTY",
+  "reason": "LLM_LEASE_BY_READINESS_LOW",
   "rollback_before_lease": false,
   "lease_steps": 2,
   "prompt_type": "normal_continuation",
@@ -411,7 +442,8 @@ Useful checks in logs:
 calibration_enabled=false
 readiness_source=raw
 confidence_process exists in every step extra
-ciod_risk_v2 and ciod_shadow_trigger_v2 are shadow fields only
+ciod_shadow_trigger_v2 is a sustained risk flag, not a direct routing trigger
+ciod_event_shadow is sparse; active CI-OD routing is off unless explicitly enabled
 LLM_LEASE can appear without rollback for persistent low readiness
 STAGNATION_ROLLBACK appears for confirmed stagnation
 MID_CONF_STAGNATION appears for mid-confidence repeated tails

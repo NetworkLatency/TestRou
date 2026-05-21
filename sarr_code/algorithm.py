@@ -55,6 +55,20 @@ class ConfidenceProcessTracker:
         self.first_ciod_shadow_trigger_step_v2: int | None = None
         self._last_ciod_risk_v2 = 0.0
         self._last_ciod_shadow_trigger_v2 = False
+        self.ciod_episode_active = False
+        self.ciod_episode_id = 0
+        self.ciod_event_count = 0
+        self.first_ciod_event_step: int | None = None
+        self.last_ciod_event_step: int | None = None
+        self.ciod_cooldown_until_step: int | None = None
+        self.last_ciod_event_masked_memory = 0.0
+        self.last_ciod_event_exposure = 0.0
+        self.ciod_active_lease_count = 0
+        self.ciod_event_steps: list[int] = []
+        self.first_readiness_low_step: int | None = None
+        self._last_ciod_event_shadow = False
+        self._last_new_masked_mass_since_event = 0.0
+        self._last_new_exposure_since_event = 0.0
 
         self._grid_configs = [
             {
@@ -155,6 +169,18 @@ class ConfidenceProcessTracker:
             "ciod_shadow_trigger_v2": self._last_ciod_shadow_trigger_v2,
             "ciod_grid_risks": dict(self._last_ciod_grid_risks),
             "ciod_grid_triggers": dict(self._last_ciod_grid_triggers),
+            "ciod_event_shadow": self._last_ciod_event_shadow,
+            "ciod_episode_active": self.ciod_episode_active,
+            "ciod_episode_id": self.ciod_episode_id,
+            "ciod_event_count": self.ciod_event_count,
+            "first_ciod_event_step": self.first_ciod_event_step,
+            "last_ciod_event_step": self.last_ciod_event_step,
+            "ciod_cooldown_until_step": self.ciod_cooldown_until_step,
+            "new_masked_mass_since_last_ciod_event": self._last_new_masked_mass_since_event,
+            "new_exposure_since_last_ciod_event": self._last_new_exposure_since_event,
+            "last_ciod_event_masked_memory": self.last_ciod_event_masked_memory,
+            "last_ciod_event_exposure": self.last_ciod_event_exposure,
+            "ciod_active_lease_count": self.ciod_active_lease_count,
         }
 
     def _update_grid(self, step_id: int) -> None:
@@ -183,6 +209,60 @@ class ConfidenceProcessTracker:
     def _grid_summary(self) -> dict[str, dict[str, Any]]:
         return {key: dict(value) for key, value in self._ciod_grid_stats.items()}
 
+    def _record_ciod_event(self, step_id: int) -> None:
+        self._last_ciod_event_shadow = True
+        self.ciod_event_count += 1
+        self.last_ciod_event_step = step_id
+        if self.first_ciod_event_step is None:
+            self.first_ciod_event_step = step_id
+        self.ciod_event_steps.append(step_id)
+        self.last_ciod_event_masked_memory = self.masked_memory
+        self.last_ciod_event_exposure = self.post_masked_exposure
+        self.ciod_cooldown_until_step = step_id + self.cfg.ciod_event_cooldown_steps
+
+    def _update_ciod_event_controller(self, record: StepRecord) -> None:
+        self._last_ciod_event_shadow = False
+        self._last_new_masked_mass_since_event = self.masked_memory - self.last_ciod_event_masked_memory
+        self._last_new_exposure_since_event = self.post_masked_exposure - self.last_ciod_event_exposure
+
+        if self.first_readiness_low_step is None and record.readiness_low:
+            self.first_readiness_low_step = record.step_id
+
+        if not self.ciod_episode_active:
+            if self._last_ciod_risk_v2 >= self.cfg.ciod_event_on_threshold:
+                self.ciod_episode_active = True
+                self.ciod_episode_id += 1
+                self._record_ciod_event(record.step_id)
+            return
+
+        if self._last_ciod_risk_v2 <= self.cfg.ciod_event_off_threshold:
+            self.ciod_episode_active = False
+            return
+
+        cooldown_ready = (
+            self.ciod_cooldown_until_step is None
+            or record.step_id >= self.ciod_cooldown_until_step
+        )
+        enough_new_mass = (
+            self._last_new_masked_mass_since_event >= self.cfg.min_new_masked_mass_for_retrigger
+        )
+        enough_new_exposure = (
+            self._last_new_exposure_since_event >= self.cfg.min_new_exposure_for_retrigger
+        )
+        if (
+            cooldown_ready
+            and self._last_ciod_risk_v2 >= self.cfg.ciod_event_on_threshold
+            and (enough_new_mass or enough_new_exposure)
+        ):
+            self._record_ciod_event(record.step_id)
+
+    def ciod_active_route_available(self) -> bool:
+        return self.ciod_active_lease_count < self.cfg.max_ciod_active_leases_per_problem
+
+    def mark_ciod_active_lease(self) -> int:
+        self.ciod_active_lease_count += 1
+        return self.ciod_active_lease_count
+
     def observe(self, record: StepRecord) -> dict[str, Any]:
         scored = (
             record.generator == "slm"
@@ -193,6 +273,8 @@ class ConfidenceProcessTracker:
         raw_low = False
         smooth_low = False
         masked_uncertainty = False
+        if not scored:
+            self._last_ciod_event_shadow = False
         if scored:
             c_raw = float(record.c_raw)
             readiness_value = float(record.readiness_value)
@@ -262,6 +344,7 @@ class ConfidenceProcessTracker:
                     self.first_ciod_shadow_trigger_step_v2 = record.step_id
 
             self._update_grid(record.step_id)
+            self._update_ciod_event_controller(record)
 
         return self._confidence_process_snapshot(
             scored=scored,
@@ -271,12 +354,14 @@ class ConfidenceProcessTracker:
         )
 
     def current_snapshot(self) -> dict[str, Any]:
-        return self._confidence_process_snapshot(
+        snapshot = self._confidence_process_snapshot(
             scored=False,
             raw_low=False,
             smooth_low=False,
             masked_uncertainty=False,
         )
+        snapshot["ciod_event_shadow"] = False
+        return snapshot
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -308,6 +393,18 @@ class ConfidenceProcessTracker:
             "ciod_shadow_trigger_count_v2": self.ciod_shadow_trigger_count_v2,
             "first_ciod_shadow_trigger_step_v2": self.first_ciod_shadow_trigger_step_v2,
             "ciod_grid_summary": self._grid_summary(),
+            "ciod_event_count": self.ciod_event_count,
+            "first_ciod_event_step": self.first_ciod_event_step,
+            "last_ciod_event_step": self.last_ciod_event_step,
+            "ciod_event_before_first_readiness_low": bool(
+                self.first_ciod_event_step is not None
+                and (
+                    self.first_readiness_low_step is None
+                    or self.first_ciod_event_step < self.first_readiness_low_step
+                )
+            ),
+            "ciod_event_steps": list(self.ciod_event_steps),
+            "ciod_active_lease_count": self.ciod_active_lease_count,
         }
 
 
@@ -1013,6 +1110,26 @@ def run_sarr_code(
             record.extra["state_machine_action"] = "STATE_RECOVERED_TO_SLM_ACTIVE"
         if "confidence_process" not in record.extra:
             record.extra["confidence_process"] = confidence_process.observe(record)
+        confidence_snapshot = record.extra.get("confidence_process")
+        if isinstance(confidence_snapshot, dict) and confidence_snapshot.get("ciod_event_shadow"):
+            if record.action == "LLM_LEASE_BY_CIOD_EVENT":
+                record.extra["ciod_event_reason"] = "LLM_LEASE_BY_CIOD_EVENT"
+            elif record.action == "LLM_LEASE_BY_READINESS_LOW":
+                record.extra["ciod_event_reason"] = "LLM_LEASE_BY_READINESS_LOW"
+            else:
+                record.extra["ciod_event_reason"] = "CIOD_EVENT_SHADOW_ONLY"
+                passive_actions = {
+                    "TRUST",
+                    "REFRESH_STABLE_ANCHOR",
+                    "SUSPECT_RECOVERED",
+                    "USEFUL_EXPLORATION",
+                    "LOW_CONFIDENCE_OBSERVE",
+                    "SUSPECT_OBSERVE",
+                    "POST_LEASE_OBSERVE",
+                }
+                if record.action in passive_actions:
+                    record.extra.setdefault("action_without_ciod_event", record.action)
+                    record.action = "CIOD_EVENT_SHADOW_ONLY"
         pending_invalid_rollback_recovery_state = False
         return record
 
@@ -1156,6 +1273,7 @@ def run_sarr_code(
             lease_reason: str | None = None
             lease_steps = 0
             lease_rollback_before = False
+            lease_source: str | None = None
 
             record.readiness_value = readiness
             record.readiness = readiness
@@ -1166,6 +1284,7 @@ def run_sarr_code(
             )
             record.extra["readiness_value"] = readiness
             record.extra["readiness_field"] = cfg.readiness.value_field
+            record.extra["confidence_process"] = confidence_process.observe(record)
             record.stagnation_score = surface_stagnation_score(active_records, cfg)
             record.stagnation_high = bool(
                 cfg.stagnation.enabled and record.stagnation_score >= cfg.stagnation.high_threshold
@@ -1288,7 +1407,36 @@ def run_sarr_code(
                 append_record(record)
                 continue
 
-            if not should_rollback and record.readiness_high and not record.stagnation_suspect:
+            confidence_snapshot = record.extra.get("confidence_process", {})
+            ciod_event_shadow = bool(
+                isinstance(confidence_snapshot, dict)
+                and confidence_snapshot.get("ciod_event_shadow")
+            )
+            if (
+                not should_rollback
+                and lease_reason is None
+                and ciod_event_shadow
+                and monitor_state == "SLM_ACTIVE"
+            ):
+                record.extra["ciod_event_active_routing_enabled"] = cfg.confidence_process.enable_ciod_active_routing
+                if not cfg.confidence_process.enable_ciod_active_routing:
+                    record.extra["ciod_event_routing_decision"] = "CIOD_EVENT_SHADOW_ONLY"
+                elif record.readiness_low:
+                    record.extra["ciod_event_routing_decision"] = "CIOD_EVENT_DEFER_TO_READINESS_LOW"
+                elif not confidence_process.ciod_active_route_available():
+                    record.extra["ciod_event_routing_decision"] = "CIOD_EVENT_ACTIVE_LEASE_LIMIT"
+                elif not (cfg.routing.enabled and cfg.llm_lease.enabled):
+                    record.extra["ciod_event_routing_decision"] = "CIOD_EVENT_ROUTING_DISABLED"
+                else:
+                    lease_reason = "LLM_LEASE_BY_CIOD_EVENT"
+                    lease_steps = cfg.llm_lease.persistent_uncertainty_steps
+                    lease_rollback_before = False
+                    lease_source = "ciod_event"
+                    record.action = "LLM_LEASE_BY_CIOD_EVENT"
+                    record.autonomy_state = "CIOD_EVENT"
+                    record.extra["ciod_event_routing_decision"] = "LLM_LEASE_BY_CIOD_EVENT"
+
+            if not should_rollback and lease_reason is None and record.readiness_high and not record.stagnation_suspect:
                 if monitor_state == "STARTUP":
                     transition_state(step_id, "SLM_ACTIVE", "STARTUP_SLM_READY")
                 stable_anchor = step_id
@@ -1350,7 +1498,7 @@ def run_sarr_code(
                         pending_force_recovery_event_idx = None
                     anchor = choose_best_prefix_anchor(active_records, allow_zero=True)
                     record.action = rollback_reason
-            elif monitor_state == "SLM_ACTIVE":
+            elif monitor_state == "SLM_ACTIVE" and lease_reason is None:
                 D_post += v
                 record.D_post = D_post
                 low_confidence_signal = bool(record.readiness_low or v)
@@ -1383,10 +1531,11 @@ def run_sarr_code(
                         requested_steps=cfg.llm_lease.persistent_uncertainty_steps,
                     )
                 ):
-                    lease_reason = "PERSISTENT_UNCERTAINTY"
+                    lease_reason = "LLM_LEASE_BY_READINESS_LOW"
                     lease_steps = cfg.llm_lease.persistent_uncertainty_steps
                     lease_rollback_before = False
-                    record.action = "LLM_LEASE_PERSISTENT_UNCERTAINTY"
+                    lease_source = "readiness_low"
+                    record.action = "LLM_LEASE_BY_READINESS_LOW"
                 elif (
                     low_confidence_signal
                     and low_confidence_run <= cfg.low_confidence.useful_exploration_grace_blocks
@@ -1465,6 +1614,7 @@ def run_sarr_code(
 
             current_step_id = len(active_records)
             if lease_reason is not None and not should_rollback:
+                record.extra["lease_source"] = lease_source
                 lease_steps = _lease_steps_within_budget(
                     cfg=cfg,
                     llm_lease_token_count=llm_lease_token_count,
@@ -1476,6 +1626,8 @@ def run_sarr_code(
                     llm_lease_token_count=llm_lease_token_count,
                     requested_steps=lease_steps,
                 ):
+                    if lease_source == "ciod_event":
+                        record.extra["ciod_event_routing_decision"] = "CIOD_EVENT_ROUTING_BUDGET_EXCEEDED"
                     record.action = "ROUTING_BUDGET_EXCEEDED_CONTINUE_SLM"
                     record.extra["routing_budget_exceeded"] = True
                     recovery_context = None
@@ -1483,6 +1635,12 @@ def run_sarr_code(
                     record.state_after = monitor_state
                     replace_last_record(record)
                     continue
+                if lease_source == "ciod_event":
+                    ciod_active_lease_count = confidence_process.mark_ciod_active_lease()
+                    record.extra["ciod_active_lease_count"] = ciod_active_lease_count
+                    if isinstance(record.extra.get("confidence_process"), dict):
+                        record.extra["confidence_process"]["ciod_active_lease_count"] = ciod_active_lease_count
+                    replace_last_record(record)
                 transition_state(current_step_id, "LLM_LEASE", lease_reason)
                 lease_context, lease_records, lease_stop_reason, attempt_id = run_llm_lease(
                     problem_id=problem_id,
