@@ -35,6 +35,10 @@ def _account_generation_cost(
     state.llm_full_calls += 1
 
 
+def _actual_token_count(output: StepOutput) -> int:
+    return int(output.extra.get("actual_token_count") or output.token_count)
+
+
 def _ensure_step_terminator(step_text: str, finish_reason: str, delimiters: list[str]) -> str:
     if finish_reason == "eos":
         return step_text
@@ -81,7 +85,10 @@ def _serialize_removed(records: list[StepRecord]) -> list[dict[str, Any]]:
             "readiness_source": r.readiness_source,
             "calibration_enabled": r.calibration_enabled,
             "readiness": r.readiness,
+            "readiness_value": r.readiness_value,
             "stagnation_score": r.stagnation_score,
+            "stagnation_suspect": r.stagnation_suspect,
+            "stagnation_confirmed": r.stagnation_confirmed,
             "hcs_suspect": r.hcs_suspect,
         }
         for r in records
@@ -186,6 +193,8 @@ def update_raw_readiness(step: StepRecord, recent_steps: list[StepRecord], cfg: 
 def get_readiness(step: StepRecord, cfg: SARRConfig) -> float | None:
     if cfg.readiness.normalization != "raw" or cfg.readiness.use_calibration:
         raise ValueError("This experiment disables calibration; only raw readiness is allowed.")
+    if cfg.readiness.value_field == "c_raw":
+        return step.readiness_raw
     if cfg.readiness.smooth_window > 1:
         return step.readiness_raw_smooth
     return step.readiness_raw
@@ -198,11 +207,67 @@ def _latest_clean_autonomy_anchor(records: list[StepRecord]) -> int | None:
             and record.generator == "slm"
             and not record.is_recovery
             and record.readiness_high
-            and not record.hcs_suspect
+            and not record.stagnation_suspect
             and not record.removed_by_rollback
         ):
             return record.step_id
     return None
+
+
+def _rollback_anchor_for_stagnation(
+    active_records: list[StepRecord],
+    clean_autonomy_anchor: int | None,
+    cfg: SARRConfig,
+) -> int:
+    if clean_autonomy_anchor is not None:
+        return clean_autonomy_anchor
+    if cfg.rollback.fallback_if_no_clean_anchor == "zero" or cfg.anchor.fallback == "zero":
+        return 0
+    return choose_best_prefix_anchor(active_records, allow_zero=True)
+
+
+def _readiness_label(record: StepRecord) -> str:
+    if record.readiness_high:
+        return "HIGH_CONF"
+    if record.readiness_mid:
+        return "MID_CONF"
+    if record.readiness_low:
+        return "LOW_CONF"
+    return "UNKNOWN_CONF"
+
+
+def _lease_budget_exceeded(
+    *,
+    cfg: SARRConfig,
+    llm_lease_event_count: int,
+    llm_lease_token_count: int,
+    requested_steps: int,
+) -> bool:
+    if not cfg.routing.enabled or not cfg.llm_lease.enabled:
+        return True
+    if requested_steps <= 0:
+        return True
+    max_events = min(cfg.llm_lease.max_events_per_problem, cfg.budget.max_llm_lease_events_per_problem)
+    max_tokens = min(cfg.llm_lease.max_total_tokens_per_problem, cfg.budget.max_llm_lease_tokens_per_problem)
+    if llm_lease_event_count >= max_events:
+        return True
+    if llm_lease_token_count >= max_tokens:
+        return True
+    return False
+
+
+def _lease_steps_within_budget(
+    *,
+    cfg: SARRConfig,
+    llm_lease_token_count: int,
+    requested_steps: int,
+) -> int:
+    max_tokens = min(cfg.llm_lease.max_total_tokens_per_problem, cfg.budget.max_llm_lease_tokens_per_problem)
+    remaining_tokens = max_tokens - llm_lease_token_count
+    if remaining_tokens <= 0:
+        return 0
+    token_bounded_steps = remaining_tokens // cfg.llm_lease.max_tokens_per_step
+    return max(0, min(requested_steps, token_bounded_steps))
 
 
 def rollback_to_anchor(
@@ -324,13 +389,15 @@ def _generate_slm_step(
         stop_delimiters=cfg.generation.step_delimiters,
         capture_token_entropy=cfg.confidence.capture_slm_token_entropy,
         topk_entropy=cfg.confidence.topk_entropy,
+        close_tag_lookahead=CLOSE_THINK_TAG,
+        close_tag_lookahead_tokens=cfg.generation.close_tag_lookahead_tokens,
     )
     output.text = _ensure_step_terminator(output.text, output.finish_reason, cfg.generation.step_delimiters)
     _account_generation_cost(
         state,
         "slm",
         wall_time=output.wall_time,
-        token_count=output.token_count,
+        token_count=_actual_token_count(output),
         prompt_tokens=output.prompt_tokens,
     )
     return output
@@ -360,7 +427,7 @@ def _generate_llm_step(
         state,
         "llm",
         wall_time=output.wall_time,
-        token_count=output.token_count,
+        token_count=_actual_token_count(output),
         prompt_tokens=output.prompt_tokens,
     )
     return output
@@ -451,6 +518,68 @@ def confidence_gated_recovery(
     return local_context, records, "EXHAUSTED_FORCE_SLM", attempt_id
 
 
+def run_llm_lease(
+    *,
+    problem_id: str,
+    attempt_id_start: int,
+    start_step_id: int,
+    state: GenerationState,
+    context: str,
+    llm,
+    cfg: SARRConfig,
+    lease_steps: int,
+    remaining_think_tokens: int,
+    reason: str,
+) -> tuple[str, list[StepRecord], str, int]:
+    records: list[StepRecord] = []
+    attempt_id = attempt_id_start
+    local_context = context
+    for lease_idx in range(1, lease_steps + 1):
+        remaining = max(1, remaining_think_tokens - _visible_think_tokens(records))
+        output = _generate_llm_step(
+            llm,
+            state,
+            cfg,
+            assistant_prefix_text=local_context,
+            remaining_think_tokens=remaining,
+            max_new_tokens_override=cfg.llm_lease.max_tokens_per_step,
+        )
+        local_context += output.text
+        record = _make_record(
+            problem_id=problem_id,
+            attempt_id=attempt_id,
+            step_id=start_step_id + lease_idx - 1,
+            generator="llm",
+            output=output,
+            c_raw=None,
+            c_norm=None,
+            c_smooth=None,
+            state_before="LLM_LEASE",
+            D_start=0,
+            D_post=0,
+            stable_anchor=None,
+            action="LLM_LEASE_STEP",
+            c_info=None,
+            is_recovery=True,
+        )
+        record.readiness_source = "raw"
+        record.calibration_enabled = False
+        record.state_after = "LLM_LEASE"
+        record.autonomy_state = "LLM_LEASE"
+        record.extra["lease_step"] = lease_idx
+        record.extra["lease_reason"] = reason
+        record.extra["prompt_type"] = cfg.llm_lease.prompt_type
+        record.extra["mention_uncertainty"] = cfg.llm_lease.mention_uncertainty
+        record.extra["mention_stagnation"] = cfg.llm_lease.mention_stagnation
+        record.extra["mention_repetition"] = cfg.llm_lease.mention_repetition
+        record.extra["mention_error"] = cfg.llm_lease.mention_error
+        records.append(record)
+        attempt_id += 1
+        if _strict_thinking_stop_reason(output, output.text) is not None:
+            return local_context, records, "LEASE_FINISHED_THINKING_STOP", attempt_id
+    return local_context, records, "LEASE_FINISHED", attempt_id
+
+
 def _append_final_answer(
     *,
     problem_id: str,
@@ -513,6 +642,8 @@ def run_sarr_code(
     step_logs: list[dict[str, Any]] = []
 
     monitor_state = "STARTUP"
+    ever_left_startup = False
+    post_lease_observe_remaining = 0
     D_start = 0
     D_post = 0
     D_suspect = 0
@@ -523,8 +654,14 @@ def run_sarr_code(
     suspect_max_readiness: float | None = None
     clean_autonomy_anchor: int | None = None
     hcs_suspect_run = 0
+    stagnation_suspect_run = 0
     hcs_rollback_count = 0
+    stagnation_rollback_count = 0
+    total_rollback_count = 0
+    llm_lease_event_count = 0
+    llm_lease_token_count = 0
     low_confidence_run = 0
+    readiness_low_run = 0
     readiness_history: list[float] = []
     force_next_step_slm = False
     pending_force_recovery_event_idx: int | None = None
@@ -534,8 +671,37 @@ def run_sarr_code(
     attempt_id = 1
     stop_reason: str | None = None
 
+    def transition_state(step_id: int, new_state: str, reason: str) -> None:
+        nonlocal monitor_state, ever_left_startup
+        old_state = monitor_state
+        if old_state == new_state:
+            return
+        if old_state == "STARTUP":
+            ever_left_startup = True
+        if new_state == "STARTUP" and ever_left_startup:
+            event = {
+                "event": "startup_reentry_blocked",
+                "reason": "NEVER_REENTER_AFTER_RECOVERY_OR_LEASE",
+                "active_step_count": len(active_records),
+                "requested_state": new_state,
+            }
+            state.trace.append(TraceEvent(step_id, "startup_reentry_blocked", event))
+            transition_events.append({"problem_id": problem_id, **event})
+            new_state = "SLM_ACTIVE"
+        event = {
+            "event": "state_transition",
+            "from": old_state,
+            "to": new_state,
+            "reason": reason,
+        }
+        transition_events.append({"problem_id": problem_id, "step_id": step_id, **event})
+        state.trace.append(TraceEvent(step_id, "state_transition", event))
+        monitor_state = new_state
+
     try:
         while state.phase != Phase.DONE:
+            if monitor_state == "STARTUP" and ever_left_startup:
+                transition_state(state.step_count, "SLM_ACTIVE", "STARTUP_REENTRY_BLOCKED")
             visible_tokens = _visible_think_tokens(active_records)
             if visible_tokens >= cfg.generation.think_token_budget:
                 stop_reason = "think_token_budget"
@@ -553,6 +719,41 @@ def run_sarr_code(
             )
             state.assistant_prefix_text += output.text
             step_id = len(active_records) + 1
+            thinking_stop = _strict_thinking_stop_reason(output, output.text)
+            if thinking_stop is not None:
+                record = _make_record(
+                    problem_id=problem_id,
+                    attempt_id=attempt_id,
+                    step_id=step_id,
+                    generator="slm",
+                    output=output,
+                    c_raw=None,
+                    c_norm=None,
+                    c_smooth=None,
+                    state_before=state_before,
+                    D_start=D_start,
+                    D_post=D_post,
+                    stable_anchor=stable_anchor,
+                    action="FINISHED" if thinking_stop == "finished" else f"STOP_{thinking_stop.upper()}",
+                    c_info=None,
+                )
+                if forced_after_recovery:
+                    record.extra["forced_after_recovery"] = True
+                record.extra["confidence_skipped"] = True
+                record.extra["confidence_skipped_reason"] = thinking_stop
+                attempt_id += 1
+                active_records.append(record)
+                all_records.append(record)
+                transition = _apply_transition_metadata(active_records)
+                if transition is not None:
+                    transition_events.append({"problem_id": problem_id, **transition})
+                startup_monitor_steps += 1
+                state.step_count = len(active_records)
+                record.state_after = monitor_state
+                step_logs.append(_serialize_step(record))
+                stop_reason = thinking_stop
+                break
+
             c_raw, c_norm, c_info = _confidence_for_prefix(
                 slm,
                 normalizer,
@@ -593,126 +794,167 @@ def run_sarr_code(
             startup_monitor_steps += 1
             state.step_count = len(active_records)
 
-            thinking_stop = _strict_thinking_stop_reason(output, output.text)
             should_rollback = False
             rollback_type = ""
             rollback_reason = ""
             anchor = 0
             is_hcs_rollback = False
+            is_stagnation_rollback = False
+            lease_reason: str | None = None
+            lease_steps = 0
+            lease_rollback_before = False
 
+            record.readiness_value = readiness
+            record.readiness = readiness
             record.readiness_high = bool(readiness is not None and readiness >= cfg.readiness.high_threshold)
             record.readiness_low = bool(readiness is not None and readiness <= cfg.readiness.low_threshold)
+            record.readiness_mid = bool(
+                readiness is not None and not record.readiness_high and not record.readiness_low
+            )
+            record.extra["readiness_value"] = readiness
+            record.extra["readiness_field"] = cfg.readiness.value_field
             record.stagnation_score = surface_stagnation_score(active_records, cfg)
             record.stagnation_high = bool(
                 cfg.stagnation.enabled and record.stagnation_score >= cfg.stagnation.high_threshold
             )
-            hcs_detection_enabled = bool(
-                cfg.hcs.enabled
-                and cfg.stagnation.enabled
-                and (cfg.startup_guard.hcs_enabled or monitor_state != "STARTUP")
+            record.stagnation_suspect = bool(cfg.stagnation.enabled and record.stagnation_high)
+            stagnation_suspect_run = stagnation_suspect_run + 1 if record.stagnation_suspect else 0
+            record.stagnation_suspect_run = stagnation_suspect_run
+            record.stagnation_confirmed = bool(
+                record.stagnation_suspect and stagnation_suspect_run >= cfg.stagnation.patience
             )
+            hcs_detection_enabled = bool(cfg.hcs.enabled and cfg.stagnation.enabled)
             record.hcs_suspect = bool(hcs_detection_enabled and record.readiness_high and record.stagnation_high)
             hcs_suspect_run = hcs_suspect_run + 1 if record.hcs_suspect else 0
             record.hcs_suspect_run = hcs_suspect_run
-            hcs_can_confirm = hcs_suspect_run >= cfg.hcs.suspect_patience
-            if cfg.hcs.enable_after_clean_anchor and clean_autonomy_anchor is None:
-                hcs_can_confirm = False
-            if cfg.startup_guard.enable_hcs_after_clean_anchor and clean_autonomy_anchor is None:
-                hcs_can_confirm = False
-            record.hcs_confirmed = bool(record.hcs_suspect and hcs_can_confirm)
+            record.hcs_confirmed = bool(
+                record.hcs_suspect and hcs_suspect_run >= cfg.hcs.suspect_patience
+            )
 
-            refresh_has_stable_confidence = record.readiness_high
+            active_slm_steps = sum(1 for r in active_records if r.active and r.generator == "slm")
+            if monitor_state == "STARTUP":
+                if record.readiness_high and startup_monitor_steps >= cfg.startup.B_min:
+                    transition_state(step_id, "SLM_ACTIVE", "STARTUP_SLM_READY")
+                elif active_slm_steps > int(cfg.startup.max_steps or cfg.startup.B_max):
+                    transition_state(step_id, "SLM_ACTIVE", "STARTUP_MAX_STEPS_EXCEEDED")
+
             record.anchor_refresh_allowed = bool(
-                record.readiness_high
-                and not record.hcs_suspect
-                and refresh_has_stable_confidence
-                and not record.is_recovery
+                record.generator == "slm"
+                and record.readiness_high
+                and not record.stagnation_suspect
+                and monitor_state == "SLM_ACTIVE"
+                and record.active
             )
             if record.anchor_refresh_allowed:
                 clean_autonomy_anchor = step_id
                 record.anchor_refresh_blocked_reason = None
-            elif record.hcs_suspect:
-                record.anchor_refresh_blocked_reason = "HCS_SUSPECT"
+                if cfg.startup.never_reenter_after_clean_anchor and not ever_left_startup:
+                    ever_left_startup = True
+            elif record.stagnation_suspect:
+                record.anchor_refresh_blocked_reason = "STAGNATION_SUSPECT"
+            elif record.generator != "slm":
+                record.anchor_refresh_blocked_reason = "NOT_SLM_STEP"
+            elif monitor_state != "SLM_ACTIVE":
+                record.anchor_refresh_blocked_reason = f"STATE_{monitor_state}"
             elif not record.readiness_high:
                 record.anchor_refresh_blocked_reason = "READINESS_NOT_HIGH"
-            elif not refresh_has_stable_confidence:
-                record.anchor_refresh_blocked_reason = "NOT_STABLE_PREFIX"
             else:
-                record.anchor_refresh_blocked_reason = "IN_RECOVERY"
+                record.anchor_refresh_blocked_reason = "INACTIVE_STEP"
             record.clean_autonomy_anchor = clean_autonomy_anchor
-            if record.hcs_confirmed:
-                record.autonomy_state = "HCS_CONFIRMED"
-            elif record.hcs_suspect:
-                record.autonomy_state = "HCS_SUSPECT"
+
+            if record.stagnation_confirmed:
+                if record.readiness_high:
+                    record.autonomy_state = "HIGH_CONF_STAGNATION"
+                elif record.readiness_mid:
+                    record.autonomy_state = "MID_CONF_STAGNATION"
+                elif record.readiness_low:
+                    record.autonomy_state = "LOW_CONF_STAGNATION_COLLAPSE"
+                else:
+                    record.autonomy_state = "UNKNOWN_CONF_STAGNATION"
+            elif record.stagnation_suspect:
+                record.autonomy_state = f"{_readiness_label(record)}_STAGNATION_SUSPECT"
+            elif record.readiness_low:
+                record.autonomy_state = "LOW_READINESS"
             else:
                 record.autonomy_state = "NORMAL"
 
-            if record.hcs_confirmed:
-                if hcs_rollback_count >= cfg.hcs.max_hcs_rollbacks_per_problem:
-                    monitor_state = "UNRECOVERABLE_HCS"
-                    record.action = "UNRECOVERABLE_HCS"
-                    record.autonomy_state = "UNRECOVERABLE_HCS"
-                    record.state_after = monitor_state
-                    record.extra["stop_reason"] = "HCS_ROLLBACK_LIMIT"
-                    record.extra["hcs_rollback_count"] = hcs_rollback_count
-                    record.extra["max_hcs_rollbacks_per_problem"] = cfg.hcs.max_hcs_rollbacks_per_problem
-                    step_logs.append(_serialize_step(record))
-                    state.trace.append(
-                        TraceEvent(
-                            step_id,
-                            "unrecoverable_hcs",
-                            {
-                                "trigger_step": step_id,
-                                "clean_anchor_step": clean_autonomy_anchor,
-                                "hcs_rollback_count": hcs_rollback_count,
-                                "max_hcs_rollbacks_per_problem": cfg.hcs.max_hcs_rollbacks_per_problem,
-                            },
-                        )
+            if record.stagnation_confirmed:
+                if monitor_state == "POST_LEASE_OBSERVE" and cfg.post_lease_observe.suppress_immediate_rollback:
+                    record.action = "POST_LEASE_OBSERVE_STAGNATION_DEFERRED"
+                    record.extra["deferred_intervention"] = "CONFIRMED_STAGNATION"
+                elif (
+                    stagnation_rollback_count
+                    >= min(
+                        cfg.confirmed_stagnation.max_rollbacks_per_problem,
+                        cfg.budget.max_stagnation_rollbacks_per_problem,
+                        cfg.rollback.max_stagnation_rollbacks_per_problem,
                     )
-                    stop_reason = "HCS_ROLLBACK_LIMIT"
-                    break
-                if clean_autonomy_anchor is not None:
-                    should_rollback = True
-                    is_hcs_rollback = True
-                    rollback_type = "HCS_ROLLBACK"
-                    rollback_reason = "HCS_CONFIRMED_RAW_READINESS"
-                    anchor = clean_autonomy_anchor
-                    monitor_state = "HCS_CONFIRMED"
-                    record.action = "HCS_CONFIRMED_ROLLBACK"
+                ):
+                    transition_state(step_id, "UNRECOVERABLE", "STAGNATION_ROLLBACK_LIMIT")
+                    record.action = "UNRECOVERABLE_STAGNATION"
+                    record.autonomy_state = "UNRECOVERABLE"
                     record.state_after = monitor_state
+                    record.extra["stop_reason"] = "STAGNATION_ROLLBACK_LIMIT"
+                    record.extra["stagnation_rollback_count"] = stagnation_rollback_count
+                    step_logs.append(_serialize_step(record))
+                    stop_reason = "STAGNATION_ROLLBACK_LIMIT"
+                    break
+                elif total_rollback_count >= min(cfg.rollback.max_rollbacks_per_problem, cfg.budget.max_rollbacks_per_problem):
+                    transition_state(step_id, "UNRECOVERABLE", "ROLLBACK_LIMIT")
+                    record.action = "UNRECOVERABLE_ROLLBACK_LIMIT"
+                    record.state_after = monitor_state
+                    record.extra["stop_reason"] = "ROLLBACK_LIMIT"
+                    step_logs.append(_serialize_step(record))
+                    stop_reason = "ROLLBACK_LIMIT"
+                    break
+                else:
+                    should_rollback = True
+                    is_stagnation_rollback = True
+                    is_hcs_rollback = bool(record.hcs_suspect)
+                    rollback_type = "STAGNATION_ROLLBACK"
+                    rollback_reason = "CONFIRMED_STAGNATION"
+                    anchor = _rollback_anchor_for_stagnation(active_records, clean_autonomy_anchor, cfg)
+                    lease_reason = "CONFIRMED_STAGNATION"
+                    lease_steps = cfg.llm_lease.confirmed_stagnation_steps
+                    lease_rollback_before = True
+                    record.action = "CONFIRMED_STAGNATION_ROLLBACK"
                     record.extra["clean_anchor_step"] = clean_autonomy_anchor
-                    record.extra["llm_recovery_prompt_type"] = cfg.hcs_recovery.prompt_type
-                    record.extra["mention_stagnation"] = cfg.hcs_recovery.mention_stagnation
+                    record.extra["rollback_anchor"] = anchor
 
-            if not should_rollback and record.readiness_high:
-                monitor_state = "STABLE"
-                if not record.hcs_suspect:
-                    stable_anchor = step_id
+            if not should_rollback and monitor_state == "POST_LEASE_OBSERVE":
+                post_lease_observe_remaining = max(0, post_lease_observe_remaining - 1)
+                record.action = record.action if record.action != "TRUST" else "POST_LEASE_OBSERVE"
+                record.extra["post_lease_observe_remaining"] = post_lease_observe_remaining
+                if post_lease_observe_remaining <= 0:
+                    transition_state(step_id, "SLM_ACTIVE", "POST_LEASE_OBSERVE_FINISHED")
+                record.state_after = monitor_state
+                step_logs.append(_serialize_step(record))
+                continue
+
+            if not should_rollback and record.readiness_high and not record.stagnation_suspect:
+                if monitor_state == "STARTUP":
+                    transition_state(step_id, "SLM_ACTIVE", "STARTUP_SLM_READY")
+                stable_anchor = step_id
                 D_start = 0
                 D_post = 0
                 D_suspect = 0
                 low_confidence_run = 0
+                readiness_low_run = 0
                 suspect_anchor = None
                 suspect_start_step = None
                 suspect_steps = 0
                 suspect_max_readiness = None
-                if pending_force_recovery_event_idx is not None and not record.hcs_suspect:
+                if pending_force_recovery_event_idx is not None:
                     rollback_events[pending_force_recovery_event_idx].force_slm_after_recovery_failed = False
                     pending_force_recovery_event_idx = None
-                if record.hcs_suspect:
-                    record.action = "HCS_SUSPECT"
-                else:
-                    record.action = "SUSPECT_RECOVERED" if state_before == "SUSPECT" else "REFRESH_STABLE_ANCHOR"
+                record.action = "SUSPECT_RECOVERED" if state_before == "SUSPECT" else "REFRESH_STABLE_ANCHOR"
                 record.state_after = monitor_state
                 record.D_start = D_start
                 record.D_post = D_post
                 record.stable_anchor = stable_anchor
-                if state_before == "SUSPECT" and not record.hcs_suspect:
+                if state_before == "SUSPECT":
                     record.extra["suspect_recovered"] = True
                 step_logs.append(_serialize_step(record))
-                if thinking_stop is not None:
-                    stop_reason = thinking_stop
-                    break
                 continue
 
             v = 0
@@ -727,21 +969,31 @@ def run_sarr_code(
             if monitor_state == "STARTUP":
                 D_start += v
                 record.D_start = D_start
-                if startup_monitor_steps >= cfg.startup.B_min and D_start >= cfg.startup.tau_start:
+                startup_rollback_suppressed = bool(
+                    ever_left_startup and cfg.post_lease_observe.suppress_startup_rollback
+                )
+                if (
+                    not startup_rollback_suppressed
+                    and startup_monitor_steps >= cfg.startup.B_min
+                    and D_start >= cfg.startup.tau_start
+                ):
                     should_rollback = True
                     rollback_type = "STARTUP_ROLLBACK"
                     rollback_reason = "STARTUP_DEGENERATION"
-                if startup_monitor_steps >= cfg.startup.B_max:
+                if not startup_rollback_suppressed and startup_monitor_steps >= cfg.startup.B_max:
                     should_rollback = True
                     rollback_type = "STARTUP_ROLLBACK"
                     rollback_reason = "STARTUP_NOT_STABLE_WITHIN_BUDGET"
+                if startup_rollback_suppressed:
+                    record.extra["startup_rollback_suppressed"] = True
+                    transition_state(step_id, "SLM_ACTIVE", "STARTUP_ROLLBACK_SUPPRESSED_AFTER_LEASE")
                 if should_rollback:
                     if pending_force_recovery_event_idx is not None:
                         rollback_events[pending_force_recovery_event_idx].force_slm_after_recovery_failed = True
                         pending_force_recovery_event_idx = None
                     anchor = choose_best_prefix_anchor(active_records, allow_zero=True)
                     record.action = rollback_reason
-            elif monitor_state == "STABLE":
+            elif monitor_state == "SLM_ACTIVE":
                 D_post += v
                 record.D_post = D_post
                 low_confidence_signal = bool(record.readiness_low or v)
@@ -749,10 +1001,36 @@ def run_sarr_code(
                     low_confidence_run += 1
                 else:
                     low_confidence_run = 0
+                if record.readiness_low:
+                    readiness_low_run += 1
+                else:
+                    readiness_low_run = 0
                 record.extra["low_confidence_run"] = low_confidence_run
+                record.extra["readiness_low_run"] = readiness_low_run
+                record.extra["useful_exploration_grace_steps"] = cfg.low_readiness.useful_exploration_grace_steps
                 record.extra["useful_exploration_grace_blocks"] = cfg.low_confidence.useful_exploration_grace_blocks
                 record.extra["collapse_patience_blocks"] = cfg.low_confidence.collapse_patience_blocks
-                if (
+                if record.readiness_low and readiness_low_run <= cfg.low_readiness.useful_exploration_grace_steps:
+                    record.action = "USEFUL_EXPLORATION"
+                    record.autonomy_state = "USEFUL_EXPLORATION"
+                elif (
+                    record.readiness_low
+                    and readiness_low_run > cfg.low_readiness.useful_exploration_grace_steps
+                    and not record.stagnation_confirmed
+                    and cfg.routing.enabled
+                    and cfg.llm_lease.enabled
+                    and not _lease_budget_exceeded(
+                        cfg=cfg,
+                        llm_lease_event_count=llm_lease_event_count,
+                        llm_lease_token_count=llm_lease_token_count,
+                        requested_steps=cfg.llm_lease.persistent_uncertainty_steps,
+                    )
+                ):
+                    lease_reason = "PERSISTENT_UNCERTAINTY"
+                    lease_steps = cfg.llm_lease.persistent_uncertainty_steps
+                    lease_rollback_before = False
+                    record.action = "LLM_LEASE_PERSISTENT_UNCERTAINTY"
+                elif (
                     low_confidence_signal
                     and low_confidence_run <= cfg.low_confidence.useful_exploration_grace_blocks
                 ):
@@ -763,7 +1041,7 @@ def run_sarr_code(
                     record.autonomy_state = "LOW_CONFIDENCE_OBSERVE"
                 elif low_confidence_signal and D_post >= cfg.stable.tau_D:
                     if cfg.rollback.post_stable_intervention_policy == "suspect_confirmed_rollback":
-                        monitor_state = "SUSPECT"
+                        transition_state(step_id, "SUSPECT", "CONFIDENCE_DEGENERATION_SUSPECT")
                         suspect_anchor = stable_anchor if stable_anchor is not None else 0
                         suspect_start_step = step_id
                         suspect_steps = 0
@@ -773,12 +1051,15 @@ def run_sarr_code(
                         record.extra["suspect_anchor"] = suspect_anchor
                         record.extra["suspect_start_step"] = suspect_start_step
                     else:
-                        monitor_state = "DEGENERATED"
+                        transition_state(step_id, "ROLLBACK_RECOVERY", "POST_STABLE_DEGENERATION")
                         should_rollback = True
                         rollback_type = "POST_STABLE_ROLLBACK"
                         rollback_reason = "POST_STABLE_DEGENERATION"
                         anchor = stable_anchor if stable_anchor is not None else 0
                         record.action = "POST_STABLE_ROLLBACK"
+                        lease_reason = "LOW_CONF_ROLLBACK_RECOVERY"
+                        lease_steps = cfg.llm_lease.low_conf_rollback_steps
+                        lease_rollback_before = True
             elif monitor_state == "SUSPECT":
                 suspect_steps += 1
                 D_suspect += v
@@ -803,7 +1084,7 @@ def run_sarr_code(
                     )
                 )
                 if confirmed_by_trend or confirmed_by_timeout:
-                    monitor_state = "DEGENERATED"
+                    transition_state(step_id, "ROLLBACK_RECOVERY", "CONFIDENCE_DEGENERATION_CONFIRMED")
                     should_rollback = True
                     rollback_type = "POST_STABLE_ROLLBACK"
                     rollback_reason = (
@@ -815,6 +1096,9 @@ def run_sarr_code(
                     record.action = rollback_reason
                     record.extra["confirmed_by_trend"] = confirmed_by_trend
                     record.extra["confirmed_by_timeout"] = confirmed_by_timeout
+                    lease_reason = "LOW_CONF_ROLLBACK_RECOVERY"
+                    lease_steps = cfg.llm_lease.low_conf_rollback_steps
+                    lease_rollback_before = True
                 else:
                     record.action = "SUSPECT_OBSERVE"
 
@@ -825,18 +1109,121 @@ def run_sarr_code(
                 stop_reason = thinking_stop
                 break
 
-            if not should_rollback:
+            if not should_rollback and lease_reason is None:
                 continue
 
             current_step_id = len(active_records)
+            if lease_reason is not None and not should_rollback:
+                lease_steps = _lease_steps_within_budget(
+                    cfg=cfg,
+                    llm_lease_token_count=llm_lease_token_count,
+                    requested_steps=lease_steps,
+                )
+                if _lease_budget_exceeded(
+                    cfg=cfg,
+                    llm_lease_event_count=llm_lease_event_count,
+                    llm_lease_token_count=llm_lease_token_count,
+                    requested_steps=lease_steps,
+                ):
+                    record.extra["routing_budget_exceeded"] = True
+                    if step_logs:
+                        step_logs[-1] = _serialize_step(record)
+                    continue
+                transition_state(current_step_id, "LLM_LEASE", lease_reason)
+                lease_context, lease_records, lease_stop_reason, attempt_id = run_llm_lease(
+                    problem_id=problem_id,
+                    attempt_id_start=attempt_id,
+                    start_step_id=len(active_records) + 1,
+                    state=state,
+                    context=state.assistant_prefix_text,
+                    llm=llm,
+                    cfg=cfg,
+                    lease_steps=lease_steps,
+                    remaining_think_tokens=max(1, cfg.generation.think_token_budget - _visible_think_tokens(active_records)),
+                    reason=lease_reason,
+                )
+                for lease_record in lease_records:
+                    all_records.append(lease_record)
+                new_active_records = active_records + lease_records
+                for idx in range(max(1, len(active_records)), len(new_active_records)):
+                    transition = _apply_transition_metadata(new_active_records[: idx + 1])
+                    if transition is not None:
+                        transition_events.append({"problem_id": problem_id, **transition})
+                active_records = new_active_records
+                state.assistant_prefix_text = lease_context
+                state.step_count = len(active_records)
+                for lease_record in lease_records:
+                    step_logs.append(_serialize_step(lease_record))
+                event_tokens = sum(r.token_count for r in lease_records)
+                llm_lease_event_count += 1
+                llm_lease_token_count += event_tokens
+                event = RollbackEvent(
+                    problem_id=problem_id,
+                    type="LLM_LEASE",
+                    reason=lease_reason,
+                    trigger_step=current_step_id,
+                    anchor_step=-1,
+                    rollback_span=0,
+                    removed_steps=[],
+                    recovery_steps=[_serialize_step(r) for r in lease_records],
+                    stop_reason=lease_stop_reason,
+                    recovery_max_steps=lease_steps,
+                    recovery_actual_steps=len(lease_records),
+                    recovery_c_norm=[],
+                    force_next_step_slm=cfg.llm_lease.return_to_slm,
+                    event="llm_lease",
+                    rollback_before_lease=False,
+                    rollback_anchor=None,
+                    lease_steps=lease_steps,
+                    max_tokens_per_step=cfg.llm_lease.max_tokens_per_step,
+                    prompt_type=cfg.llm_lease.prompt_type,
+                    mention_uncertainty=cfg.llm_lease.mention_uncertainty,
+                    mention_stagnation=cfg.llm_lease.mention_stagnation,
+                    mention_repetition=cfg.llm_lease.mention_repetition,
+                    mention_error=cfg.llm_lease.mention_error,
+                    return_to_slm=cfg.llm_lease.return_to_slm,
+                    state_after="POST_LEASE_OBSERVE",
+                )
+                rollback_events.append(event)
+                state.trace.append(TraceEvent(current_step_id, "llm_lease", asdict(event)))
+                transition_state(state.step_count, "POST_LEASE_OBSERVE", "LEASE_FINISHED")
+                post_lease_observe_remaining = cfg.post_lease_observe.observe_slm_blocks
+                force_next_step_slm = cfg.llm_lease.return_to_slm
+                ever_left_startup = True
+                hcs_suspect_run = 0
+                stagnation_suspect_run = 0
+                low_confidence_run = 0
+                readiness_low_run = 0
+                if has_close_think_tag(state.assistant_prefix_text):
+                    stop_reason = "finished"
+                    break
+                continue
+
             requested_anchor = anchor
             anchor_repeat_count_before = rollback_anchor_counts.get(requested_anchor, 0)
+            if lease_reason is not None:
+                lease_steps = _lease_steps_within_budget(
+                    cfg=cfg,
+                    llm_lease_token_count=llm_lease_token_count,
+                    requested_steps=lease_steps,
+                )
+            if lease_reason is not None and _lease_budget_exceeded(
+                cfg=cfg,
+                llm_lease_event_count=llm_lease_event_count,
+                llm_lease_token_count=llm_lease_token_count,
+                requested_steps=lease_steps,
+            ):
+                record.action = "ROUTING_BUDGET_EXCEEDED_CONTINUE_SLM"
+                record.extra["routing_budget_exceeded"] = True
+                if step_logs:
+                    step_logs[-1] = _serialize_step(record)
+                continue
             if pending_force_recovery_event_idx is not None:
                 rollback_events[pending_force_recovery_event_idx].force_slm_after_recovery_failed = True
                 pending_force_recovery_event_idx = None
 
             if (
-                not is_hcs_rollback
+                not is_stagnation_rollback
                 and requested_anchor == 0
                 and cfg.rollback.root_rollback_action == "force_close_think"
                 and anchor_repeat_count_before >= cfg.rollback.max_root_rollbacks
@@ -861,7 +1248,7 @@ def run_sarr_code(
 
             anchor_backoff_steps = 0
             if (
-                not is_hcs_rollback
+                not is_stagnation_rollback
                 and anchor_repeat_count_before > 0
                 and cfg.rollback.anchor_repeat_policy == "suppress"
             ):
@@ -870,7 +1257,7 @@ def run_sarr_code(
                 record.extra["suppressed_rollback"] = True
                 record.extra["requested_anchor_step"] = requested_anchor
                 record.extra["anchor_repeat_count_before"] = anchor_repeat_count_before
-                monitor_state = "STABLE"
+                transition_state(current_step_id, "SLM_ACTIVE", "SUPPRESSED_REPEATED_ROLLBACK")
                 stable_anchor = current_step_id
                 D_start = 0
                 D_post = 0
@@ -880,6 +1267,8 @@ def run_sarr_code(
                 suspect_steps = 0
                 suspect_max_readiness = None
                 readiness_history = []
+                low_confidence_run = 0
+                readiness_low_run = 0
                 startup_monitor_steps = 0
                 record.state_after = monitor_state
                 record.stable_anchor = stable_anchor
@@ -901,7 +1290,7 @@ def run_sarr_code(
                 continue
 
             if (
-                not is_hcs_rollback
+                not is_stagnation_rollback
                 and cfg.rollback.anchor_repeat_policy == "backoff"
                 and anchor_repeat_count_before >= cfg.rollback.anchor_repeat_backoff_after
             ):
@@ -918,7 +1307,7 @@ def run_sarr_code(
             )
             long_span = span > cfg.rollback.M_max
             allow_long_span_delete = False
-            if is_hcs_rollback:
+            if is_stagnation_rollback:
                 allow_long_span_delete = True
             elif long_span:
                 if cfg.rollback.long_span_policy == "rollback_to_anchor":
@@ -938,7 +1327,9 @@ def run_sarr_code(
                 recovery_start_step_id = len(kept) + 1
             else:
                 _mark_removed(removed)
-                if is_hcs_rollback:
+                if lease_reason is not None:
+                    max_recovery = lease_steps
+                elif is_hcs_rollback:
                     max_recovery = cfg.hcs_recovery.max_llm_steps
                 elif long_span:
                     max_recovery = min(span + 1, cfg.rollback.long_span_recovery_steps)
@@ -948,21 +1339,39 @@ def run_sarr_code(
 
             if is_hcs_rollback:
                 hcs_rollback_count += 1
+            if is_stagnation_rollback:
+                stagnation_rollback_count += 1
+            total_rollback_count += 1
 
-            rec_context, rec_records, rec_stop_reason, attempt_id = confidence_gated_recovery(
-                problem_id=problem_id,
-                attempt_id_start=attempt_id,
-                start_step_id=recovery_start_step_id,
-                state=state,
-                context=rollback_context,
-                llm=llm,
-                slm=slm,
-                normalizer=normalizer,
-                cfg=cfg,
-                max_recovery_steps=max_recovery,
-                remaining_think_tokens=max(1, cfg.generation.think_token_budget - _visible_think_tokens(kept)),
-                max_tokens_per_step=cfg.hcs_recovery.max_tokens_per_step if is_hcs_rollback else None,
-            )
+            transition_state(current_step_id, "LLM_LEASE" if lease_reason is not None else "ROLLBACK_RECOVERY", rollback_reason)
+            if lease_reason is not None:
+                rec_context, rec_records, rec_stop_reason, attempt_id = run_llm_lease(
+                    problem_id=problem_id,
+                    attempt_id_start=attempt_id,
+                    start_step_id=recovery_start_step_id,
+                    state=state,
+                    context=rollback_context,
+                    llm=llm,
+                    cfg=cfg,
+                    lease_steps=max_recovery,
+                    remaining_think_tokens=max(1, cfg.generation.think_token_budget - _visible_think_tokens(kept)),
+                    reason=lease_reason,
+                )
+            else:
+                rec_context, rec_records, rec_stop_reason, attempt_id = confidence_gated_recovery(
+                    problem_id=problem_id,
+                    attempt_id_start=attempt_id,
+                    start_step_id=recovery_start_step_id,
+                    state=state,
+                    context=rollback_context,
+                    llm=llm,
+                    slm=slm,
+                    normalizer=normalizer,
+                    cfg=cfg,
+                    max_recovery_steps=max_recovery,
+                    remaining_think_tokens=max(1, cfg.generation.think_token_budget - _visible_think_tokens(kept)),
+                    max_tokens_per_step=cfg.hcs_recovery.max_tokens_per_step if is_hcs_rollback else None,
+                )
 
             new_active_records = kept + rec_records
             for rec in rec_records:
@@ -997,24 +1406,52 @@ def run_sarr_code(
                 long_span_fallback_count_before=long_span_fallback_count_before,
                 long_span_recovery_limited=bool(long_span and not fallback_no_delete and max_recovery < span + 1),
                 force_next_step_slm=(
-                    cfg.hcs_recovery.return_to_slm_after_recovery
+                    cfg.llm_lease.return_to_slm
+                    if lease_reason is not None
+                    else cfg.hcs_recovery.return_to_slm_after_recovery
                     if is_hcs_rollback
                     else cfg.rollback.force_slm_after_recovery
                 ),
-                event="hcs_rollback" if is_hcs_rollback else None,
-                clean_anchor_step=anchor if is_hcs_rollback else None,
+                event="llm_lease" if lease_reason is not None else "hcs_rollback" if is_hcs_rollback else None,
+                rollback_before_lease=lease_rollback_before if lease_reason is not None else None,
+                rollback_anchor=anchor if lease_reason is not None and lease_rollback_before else None,
+                lease_steps=max_recovery if lease_reason is not None else None,
+                max_tokens_per_step=cfg.llm_lease.max_tokens_per_step if lease_reason is not None else None,
+                prompt_type=cfg.llm_lease.prompt_type if lease_reason is not None else None,
+                mention_uncertainty=cfg.llm_lease.mention_uncertainty if lease_reason is not None else None,
+                mention_repetition=cfg.llm_lease.mention_repetition if lease_reason is not None else None,
+                mention_error=cfg.llm_lease.mention_error if lease_reason is not None else None,
+                state_after="POST_LEASE_OBSERVE" if lease_reason is not None else None,
+                clean_anchor_step=anchor if is_stagnation_rollback else None,
                 hcs_rollback_count=hcs_rollback_count if is_hcs_rollback else 0,
-                readiness_source="raw" if is_hcs_rollback else None,
-                calibration_enabled=False if is_hcs_rollback else None,
-                llm_recovery_prompt_type=cfg.hcs_recovery.prompt_type if is_hcs_rollback else None,
-                mention_stagnation=cfg.hcs_recovery.mention_stagnation if is_hcs_rollback else None,
-                return_to_slm=cfg.hcs_recovery.return_to_slm_after_recovery if is_hcs_rollback else None,
+                stagnation_rollback_count=stagnation_rollback_count if is_stagnation_rollback else 0,
+                readiness_source="raw" if is_stagnation_rollback or is_hcs_rollback else None,
+                calibration_enabled=False if is_stagnation_rollback or is_hcs_rollback else None,
+                llm_recovery_prompt_type=(
+                    cfg.llm_lease.prompt_type if lease_reason is not None else cfg.hcs_recovery.prompt_type if is_hcs_rollback else None
+                ),
+                mention_stagnation=(
+                    cfg.llm_lease.mention_stagnation if lease_reason is not None else cfg.hcs_recovery.mention_stagnation if is_hcs_rollback else None
+                ),
+                return_to_slm=(
+                    cfg.llm_lease.return_to_slm
+                    if lease_reason is not None
+                    else cfg.hcs_recovery.return_to_slm_after_recovery
+                    if is_hcs_rollback
+                    else None
+                ),
             )
             rollback_events.append(event)
-            if not is_hcs_rollback:
+            if lease_reason is not None:
+                event_tokens = sum(r.token_count for r in rec_records)
+                llm_lease_event_count += 1
+                llm_lease_token_count += event_tokens
+            if not is_stagnation_rollback:
                 rollback_anchor_counts[requested_anchor] = anchor_repeat_count_before + 1
             return_to_slm_after_recovery = (
-                cfg.hcs_recovery.return_to_slm_after_recovery
+                cfg.llm_lease.return_to_slm
+                if lease_reason is not None
+                else cfg.hcs_recovery.return_to_slm_after_recovery
                 if is_hcs_rollback
                 else cfg.rollback.force_slm_after_recovery
             )
@@ -1029,25 +1466,23 @@ def run_sarr_code(
             for rec in rec_records:
                 step_logs.append(_serialize_step(rec))
 
-            monitor_state = "STARTUP"
+            transition_state(state.step_count, "POST_LEASE_OBSERVE", "LEASE_FINISHED" if lease_reason is not None else "RECOVERY_FINISHED")
+            post_lease_observe_remaining = cfg.post_lease_observe.observe_slm_blocks
+            ever_left_startup = True
             D_start = 0
             D_post = 0
             D_suspect = 0
-            stable_anchor = None
+            stable_anchor = clean_autonomy_anchor
             suspect_anchor = None
             suspect_start_step = None
             suspect_steps = 0
             suspect_max_readiness = None
             readiness_history = []
-            startup_monitor_steps = 0
-            if rec_stop_reason == "SLM_READY" and rec_records:
-                monitor_state = "STABLE"
-                stable_anchor = rec_records[-1].step_id
-                ready_readiness = rec_records[-1].readiness
-                readiness_history = [float(ready_readiness)] if ready_readiness is not None else []
             clean_autonomy_anchor = _latest_clean_autonomy_anchor(active_records)
             hcs_suspect_run = 0
+            stagnation_suspect_run = 0
             low_confidence_run = 0
+            readiness_low_run = 0
             force_next_step_slm = return_to_slm_after_recovery
             if force_next_step_slm:
                 state.trace.append(
@@ -1073,7 +1508,13 @@ def run_sarr_code(
         rollback_events[pending_force_recovery_event_idx].force_slm_after_recovery_failed = False
         pending_force_recovery_event_idx = None
 
-    if stop_reason in {"think_token_budget", "root_rollback_limit", "HCS_ROLLBACK_LIMIT"}:
+    if stop_reason in {
+        "think_token_budget",
+        "root_rollback_limit",
+        "HCS_ROLLBACK_LIMIT",
+        "STAGNATION_ROLLBACK_LIMIT",
+        "ROLLBACK_LIMIT",
+    }:
         should_force = cfg.generation.force_close_think_on_budget
         if should_force and not has_close_think_tag(state.assistant_prefix_text):
             state.assistant_prefix_text += cfg.generation.force_close_think_text
@@ -1114,7 +1555,9 @@ def run_sarr_code(
             {
                 "num_active_steps": len(active_records),
                 "num_generated_thinking_attempts": len(all_records),
-                "num_rollbacks": len(rollback_events),
+                "num_rollbacks": sum(1 for event in rollback_events if event.type != "LLM_LEASE"),
+                "num_llm_lease_events": sum(1 for event in rollback_events if event.event == "llm_lease"),
+                "num_intervention_events": len(rollback_events),
                 "num_transition_events": len(transition_events),
                 "stop_reason": state.stop_reason,
             },

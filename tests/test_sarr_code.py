@@ -9,10 +9,13 @@ from sarr_code.config import (
     GenerationConfig,
     HCSConfig,
     HCSRecoveryConfig,
+    LLMLeaseConfig,
     LowConfidenceConfig,
+    LowReadinessConfig,
     ModelRuntimeConfig,
     ReadinessConfig,
     RollbackConfig,
+    RoutingConfig,
     RuntimeConfig,
     SARRConfig,
     StableConfig,
@@ -137,6 +140,27 @@ class SARRCodeTests(unittest.TestCase):
         self.assertIn("recovered", result.state.assistant_prefix_text)
         self.assertNotIn("bad\n\nrecovered", result.state.assistant_prefix_text)
 
+    def test_close_think_step_skips_confidence_forward(self):
+        cfg = make_cfg()
+        slm = FakeEngine(outputs=["Done.\n</think>\n\n"], confidences=[])
+        llm = FakeEngine(outputs=["Final answer: 42."])
+
+        result, steps, rollbacks, _ = run_sarr_code(
+            problem_id="close",
+            problem_text="Problem: 6*7?",
+            slm=slm,
+            llm=llm,
+            normalizer=None,
+            cfg=cfg,
+        )
+
+        self.assertEqual(result.answer, "42")
+        self.assertEqual(len(rollbacks), 0)
+        self.assertEqual(slm.confidence_calls, 0)
+        self.assertEqual(steps[0]["action"], "FINISHED")
+        self.assertTrue(steps[0]["extra"]["confidence_skipped"])
+        self.assertEqual(steps[0]["extra"]["confidence_skipped_reason"], "finished")
+
     def test_post_stable_suspect_recovers_without_rollback(self):
         cfg = make_cfg()
         slm = FakeEngine(
@@ -163,11 +187,11 @@ class SARRCodeTests(unittest.TestCase):
         self.assertEqual(result.answer, "42")
         self.assertEqual(len(rollbacks), 0)
         self.assertFalse(any(row["removed_by_rollback"] for row in steps))
-        self.assertTrue(any(row["action"] == "ENTER_SUSPECT" for row in steps))
-        self.assertTrue(any(row["action"] == "SUSPECT_RECOVERED" for row in steps))
+        self.assertTrue(any(row["action"] == "USEFUL_EXPLORATION" for row in steps))
+        self.assertTrue(any(row["action"] == "REFRESH_STABLE_ANCHOR" for row in steps))
         self.assertIn("correct-but-low-confidence", result.state.assistant_prefix_text)
 
-    def test_post_stable_suspect_confirms_then_rolls_back(self):
+    def test_persistent_low_readiness_triggers_llm_lease_without_rollback(self):
         cfg = SARRConfig(
             slm=ModelRuntimeConfig(model_path="unused", backend="transformers"),
             llm=ModelRuntimeConfig(model_path="unused", backend="openai", api_base_url="http://127.0.0.1:8000/v1"),
@@ -185,12 +209,10 @@ class SARRCodeTests(unittest.TestCase):
             ),
             startup=StartupConfig(B_min=2, B_max=3, tau_start=1),
             stable=StableConfig(theta_s=0.70, tau_D=1),
-            rollback=RollbackConfig(
-                M_max=5,
-                suspect_confirm_steps=1,
-                suspect_max_steps=2,
-                tau_confirm=1,
-            ),
+            readiness=ReadinessConfig(smooth_window=1),
+            low_readiness=LowReadinessConfig(useful_exploration_grace_steps=1),
+            llm_lease=LLMLeaseConfig(persistent_uncertainty_steps=2, max_tokens_per_step=16),
+            rollback=RollbackConfig(M_max=5),
             low_confidence=LowConfidenceConfig(useful_exploration_grace_blocks=0, collapse_patience_blocks=1),
             runtime=RuntimeConfig(max_model_len=4096),
         )
@@ -200,6 +222,7 @@ class SARRCodeTests(unittest.TestCase):
                 "stable-b\n\n",
                 "bad-a\n\n",
                 "bad-b\n\n",
+                "after-lease-observe\n\n",
                 "</think>\n\n",
             ],
             confidences=[
@@ -208,10 +231,9 @@ class SARRCodeTests(unittest.TestCase):
                 0.1,
                 0.0,
                 0.8,
-                0.8,
             ],
         )
-        llm = FakeEngine(outputs=["repair\n\n", "Final answer: 42."])
+        llm = FakeEngine(outputs=["lease-a\n\n", "lease-b\n\n", "Final answer: 42."])
 
         result, steps, rollbacks, _ = run_sarr_code(
             problem_id="suspect-confirm",
@@ -224,13 +246,13 @@ class SARRCodeTests(unittest.TestCase):
 
         self.assertEqual(result.answer, "42")
         self.assertEqual(len(rollbacks), 1)
-        self.assertEqual(rollbacks[0]["type"], "POST_STABLE_ROLLBACK")
-        self.assertEqual(rollbacks[0]["reason"], "POST_STABLE_CONFIRMED_DEGENERATION")
-        self.assertEqual(rollbacks[0]["suspect_steps"], 1)
-        removed_text = "".join(row["text"] for row in rollbacks[0]["removed_steps"])
-        self.assertIn("bad-a", removed_text)
-        self.assertIn("bad-b", removed_text)
-        self.assertNotIn("bad-a\n\nbad-b", result.state.assistant_prefix_text)
+        self.assertEqual(rollbacks[0]["event"], "llm_lease")
+        self.assertEqual(rollbacks[0]["type"], "LLM_LEASE")
+        self.assertEqual(rollbacks[0]["reason"], "PERSISTENT_UNCERTAINTY")
+        self.assertFalse(rollbacks[0]["rollback_before_lease"])
+        self.assertEqual(rollbacks[0]["recovery_actual_steps"], 2)
+        self.assertFalse(any(row["removed_by_rollback"] for row in steps))
+        self.assertIn("bad-a\n\nbad-b\n\nlease-a", result.state.assistant_prefix_text)
 
     def test_hcs_confirmed_rolls_back_to_clean_anchor_with_normal_recovery(self):
         cfg = SARRConfig(
@@ -259,6 +281,7 @@ class SARRCodeTests(unittest.TestCase):
             ),
             hcs=HCSConfig(enabled=True, suspect_patience=3, max_hcs_rollbacks_per_problem=2),
             hcs_recovery=HCSRecoveryConfig(max_llm_steps=2, max_tokens_per_step=16),
+            llm_lease=LLMLeaseConfig(confirmed_stagnation_steps=3, max_tokens_per_step=16),
             rollback=RollbackConfig(M_max=1, anchor_repeat_policy="suppress"),
             runtime=RuntimeConfig(max_model_len=4096),
         )
@@ -273,7 +296,14 @@ class SARRCodeTests(unittest.TestCase):
             ],
             confidences=[0.9, 0.9, 0.9, 0.9, 0.8, 0.8],
         )
-        llm = FakeEngine(outputs=["ordinary continuation\n\n", "Final answer: 42."])
+        llm = FakeEngine(
+            outputs=[
+                "ordinary continuation\n\n",
+                "second continuation\n\n",
+                "third continuation\n\n",
+                "Final answer: 42.",
+            ]
+        )
 
         result, steps, rollbacks, _ = run_sarr_code(
             problem_id="hcs",
@@ -287,9 +317,10 @@ class SARRCodeTests(unittest.TestCase):
         self.assertEqual(result.answer, "42")
         self.assertEqual(len(rollbacks), 1)
         rollback = rollbacks[0]
-        self.assertEqual(rollback["event"], "hcs_rollback")
-        self.assertEqual(rollback["type"], "HCS_ROLLBACK")
-        self.assertEqual(rollback["reason"], "HCS_CONFIRMED_RAW_READINESS")
+        self.assertEqual(rollback["event"], "llm_lease")
+        self.assertEqual(rollback["type"], "STAGNATION_ROLLBACK")
+        self.assertEqual(rollback["reason"], "CONFIRMED_STAGNATION")
+        self.assertTrue(rollback["rollback_before_lease"])
         self.assertEqual(rollback["readiness_source"], "raw")
         self.assertFalse(rollback["calibration_enabled"])
         self.assertEqual(rollback["anchor_step"], 1)
@@ -299,18 +330,69 @@ class SARRCodeTests(unittest.TestCase):
         self.assertEqual(rollback["llm_recovery_prompt_type"], "normal_continuation")
         self.assertFalse(rollback["mention_stagnation"])
         self.assertTrue(rollback["return_to_slm"])
-        self.assertLessEqual(rollback["recovery_actual_steps"], 2)
+        self.assertEqual(rollback["recovery_actual_steps"], 3)
 
         suspect_rows = [row for row in steps if row["hcs_suspect"]]
         self.assertEqual(len(suspect_rows), 3)
         self.assertFalse(suspect_rows[0]["anchor_refresh_allowed"])
-        self.assertEqual(suspect_rows[0]["anchor_refresh_blocked_reason"], "HCS_SUSPECT")
+        self.assertEqual(suspect_rows[0]["anchor_refresh_blocked_reason"], "STAGNATION_SUSPECT")
         self.assertEqual(suspect_rows[0]["clean_autonomy_anchor"], 1)
-        self.assertTrue(any(row["hcs_confirmed"] for row in suspect_rows))
+        self.assertTrue(any(row["stagnation_confirmed"] for row in suspect_rows))
         removed_text = "".join(row["text"] for row in rollback["removed_steps"])
         self.assertEqual(removed_text, repeated * 3)
         self.assertIn("ordinary continuation", result.state.assistant_prefix_text)
         self.assertNotIn(repeated * 2, result.state.assistant_prefix_text)
+
+    def test_mid_confidence_stagnation_confirms_and_rolls_back(self):
+        cfg = SARRConfig(
+            slm=ModelRuntimeConfig(model_path="unused", backend="transformers"),
+            llm=ModelRuntimeConfig(model_path="unused", backend="openai", api_base_url="http://127.0.0.1:8000/v1"),
+            generation=GenerationConfig(max_new_tokens_per_step=64, think_token_budget=1024, answer_token_budget=64),
+            confidence=ConfidenceConfig(topk_entropy=20, calibration_path=None, allow_identity_normalizer=True),
+            readiness=ReadinessConfig(smooth_window=1, high_threshold=0.70, low_threshold=0.35),
+            startup=StartupConfig(B_min=1, B_max=5, tau_start=1),
+            stagnation=StagnationConfig(
+                enabled=True,
+                block_min_tokens=8,
+                block_max_steps=1,
+                repeat_window=10,
+                high_threshold=0.85,
+                patience=3,
+            ),
+            llm_lease=LLMLeaseConfig(confirmed_stagnation_steps=3, max_tokens_per_step=16),
+            rollback=RollbackConfig(M_max=1),
+            runtime=RuntimeConfig(max_model_len=4096),
+        )
+        repeated = "repeat the same mid confidence derivation fragment again\n\n"
+        slm = FakeEngine(
+            outputs=[
+                "clean confident anchor step with enough unique tokens\n\n",
+                repeated,
+                repeated,
+                repeated,
+                repeated,
+                "</think>\n\n",
+            ],
+            confidences=[0.9, 0.6, 0.6, 0.6, 0.6, 0.8],
+        )
+        llm = FakeEngine(outputs=["lease one\n\n", "lease two\n\n", "lease three\n\n", "Final answer: 42."])
+
+        result, steps, rollbacks, _ = run_sarr_code(
+            problem_id="mid-stagnation",
+            problem_text="Problem: test",
+            slm=slm,
+            llm=llm,
+            normalizer=None,
+            cfg=cfg,
+        )
+
+        self.assertEqual(result.answer, "42")
+        self.assertEqual(rollbacks[0]["type"], "STAGNATION_ROLLBACK")
+        self.assertEqual(rollbacks[0]["anchor_step"], 1)
+        mid_rows = [row for row in steps if row["stagnation_suspect"] and row["readiness_mid"]]
+        self.assertTrue(mid_rows)
+        self.assertTrue(any(row["autonomy_state"] == "MID_CONF_STAGNATION" for row in mid_rows))
+        self.assertFalse(any(row["hcs_suspect"] for row in mid_rows))
 
     def test_summary_metrics_include_required_sarr_fields(self):
         rows = [

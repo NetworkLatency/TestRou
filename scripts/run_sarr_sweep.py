@@ -44,6 +44,8 @@ SUMMARY_KEYS = [
     "rollback_rate",
     "startup_rollback_rate",
     "post_stable_rollback_rate",
+    "avg_stagnation_rollback_count",
+    "avg_llm_lease_count",
     "avg_rollback_span",
     "avg_recovery_steps",
     "recovery_ready_rate",

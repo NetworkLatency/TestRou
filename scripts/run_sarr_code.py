@@ -24,7 +24,7 @@ from sarr_code.engines import build_llm, build_slm
 
 
 MATH_DATASETS = {"math500", "aime24", "aime25"}
-DEFAULT_VARIANT = "sarr_code_v2_raw_hcs_confirmed_rollback"
+DEFAULT_VARIANT = "sarr_code_v3_state_aware_routing_rollback"
 
 
 def _summary_path(output_root: Path, dataset: str, variant: str) -> Path:
@@ -122,17 +122,24 @@ def _num(value: Any) -> float:
 
 
 def _problem_sarr_metrics(result, step_rows: list[dict[str, Any]], rollback_rows: list[dict[str, Any]]) -> dict[str, Any]:
-    rollback_count = len(rollback_rows)
-    startup_rollback_count = sum(1 for row in rollback_rows if row.get("type") == "STARTUP_ROLLBACK")
-    post_stable_rollback_count = sum(1 for row in rollback_rows if row.get("type") == "POST_STABLE_ROLLBACK")
-    hcs_rollback_count = sum(1 for row in rollback_rows if row.get("type") == "HCS_ROLLBACK")
-    rollback_span_total = sum(int(row.get("rollback_span") or 0) for row in rollback_rows)
-    recovery_steps_total = sum(int(row.get("recovery_actual_steps") or 0) for row in rollback_rows)
-    recovery_ready_count = sum(1 for row in rollback_rows if row.get("stop_reason") == "SLM_READY")
-    recovery_exhausted_count = sum(1 for row in rollback_rows if row.get("stop_reason") == "EXHAUSTED_FORCE_SLM")
-    force_slm_after_recovery_count = sum(1 for row in rollback_rows if _truthy(row.get("force_next_step_slm")))
+    rollback_only_rows = [row for row in rollback_rows if row.get("type") != "LLM_LEASE"]
+    llm_lease_count = sum(1 for row in rollback_rows if row.get("event") == "llm_lease")
+    rollback_count = len(rollback_only_rows)
+    startup_rollback_count = sum(1 for row in rollback_only_rows if row.get("type") == "STARTUP_ROLLBACK")
+    post_stable_rollback_count = sum(1 for row in rollback_only_rows if row.get("type") == "POST_STABLE_ROLLBACK")
+    hcs_rollback_count = sum(
+        1
+        for row in rollback_only_rows
+        if row.get("type") == "HCS_ROLLBACK" or int(row.get("hcs_rollback_count") or 0) > 0
+    )
+    stagnation_rollback_count = sum(1 for row in rollback_only_rows if row.get("type") == "STAGNATION_ROLLBACK")
+    rollback_span_total = sum(int(row.get("rollback_span") or 0) for row in rollback_only_rows)
+    recovery_steps_total = sum(int(row.get("recovery_actual_steps") or 0) for row in rollback_only_rows)
+    recovery_ready_count = sum(1 for row in rollback_only_rows if row.get("stop_reason") == "SLM_READY")
+    recovery_exhausted_count = sum(1 for row in rollback_only_rows if row.get("stop_reason") == "EXHAUSTED_FORCE_SLM")
+    force_slm_after_recovery_count = sum(1 for row in rollback_only_rows if _truthy(row.get("force_next_step_slm")))
     force_slm_after_recovery_fail_count = sum(
-        1 for row in rollback_rows if row.get("force_slm_after_recovery_failed") is True
+        1 for row in rollback_only_rows if row.get("force_slm_after_recovery_failed") is True
     )
     active_thinking_step_count = sum(1 for row in step_rows if row.get("active") is True or str(row.get("active")).lower() == "true")
     generated_thinking_attempt_count = len(step_rows)
@@ -150,9 +157,13 @@ def _problem_sarr_metrics(result, step_rows: list[dict[str, Any]], rollback_rows
         "has_post_stable_rollback": post_stable_rollback_count > 0,
         "hcs_rollback_count": hcs_rollback_count,
         "has_hcs_rollback": hcs_rollback_count > 0,
+        "stagnation_rollback_count": stagnation_rollback_count,
+        "has_stagnation_rollback": stagnation_rollback_count > 0,
+        "llm_lease_count": llm_lease_count,
         "hcs_suspect_count": sum(1 for row in step_rows if _truthy(row.get("hcs_suspect"))),
         "hcs_confirmed_count": sum(1 for row in step_rows if _truthy(row.get("hcs_confirmed"))),
-        "anchor_zero_count": sum(1 for row in rollback_rows if row.get("anchor_step") == 0),
+        "stagnation_confirmed_count": sum(1 for row in step_rows if _truthy(row.get("stagnation_confirmed"))),
+        "anchor_zero_count": sum(1 for row in rollback_only_rows if row.get("anchor_step") == 0),
         "rollback_span_total": rollback_span_total,
         "avg_rollback_span": (rollback_span_total / rollback_count) if rollback_count else 0.0,
         "recovery_steps_total": recovery_steps_total,
@@ -183,6 +194,8 @@ def _extra_sarr_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     total_startup_rollbacks = sum(int(_num(row.get("startup_rollback_count"))) for row in rows)
     total_post_stable_rollbacks = sum(int(_num(row.get("post_stable_rollback_count"))) for row in rows)
     total_hcs_rollbacks = sum(int(_num(row.get("hcs_rollback_count"))) for row in rows)
+    total_stagnation_rollbacks = sum(int(_num(row.get("stagnation_rollback_count"))) for row in rows)
+    total_llm_leases = sum(int(_num(row.get("llm_lease_count"))) for row in rows)
     total_anchor_zero = sum(int(_num(row.get("anchor_zero_count"))) for row in rows)
     total_span = sum(_num(row.get("rollback_span_total")) for row in rows)
     total_recovery_steps = sum(_num(row.get("recovery_steps_total")) for row in rows)
@@ -201,10 +214,14 @@ def _extra_sarr_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_startup_rollback_count": avg("startup_rollback_count"),
         "avg_post_stable_rollback_count": avg("post_stable_rollback_count"),
         "avg_hcs_rollback_count": avg("hcs_rollback_count"),
+        "avg_stagnation_rollback_count": avg("stagnation_rollback_count"),
+        "avg_llm_lease_count": avg("llm_lease_count"),
         "total_rollback_count": total_rollbacks,
         "total_startup_rollback_count": total_startup_rollbacks,
         "total_post_stable_rollback_count": total_post_stable_rollbacks,
         "total_hcs_rollback_count": total_hcs_rollbacks,
+        "total_stagnation_rollback_count": total_stagnation_rollbacks,
+        "total_llm_lease_count": total_llm_leases,
         "anchor_zero_rate_per_rollback": (total_anchor_zero / total_rollbacks) if total_rollbacks else 0.0,
         "avg_rollback_span": (total_span / total_rollbacks) if total_rollbacks else 0.0,
         "avg_recovery_steps": (total_recovery_steps / total_rollbacks) if total_rollbacks else 0.0,
@@ -345,7 +362,7 @@ def raise_csv_field_limit() -> None:
 
 def main() -> None:
     raise_csv_field_limit()
-    parser = argparse.ArgumentParser(description="Run SARR-CoDE raw-readiness HCS confirmed rollback collaboration.")
+    parser = argparse.ArgumentParser(description="Run SARR-CoDE state-aware routing with confirmed-stagnation rollback.")
     parser.add_argument("--config", required=True, help="Path to SARRConfig JSON.")
     parser.add_argument("--mode", choices=["run", "calibrate"], default="run")
     parser.add_argument("--dataset", default="aime25", choices=["math500", "aime24", "aime25", "gpqa", "gpqa_diamond"])

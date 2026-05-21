@@ -1,29 +1,25 @@
-# SARR-CoDE v2 Raw HCS Confirmed Rollback
+# SARR-CoDE v3 State-Aware Routing
 
-This path implements **SARR-CoDE with raw-readiness High-Confidence Stagnation confirmed rollback**. The main flow remains:
-
-```text
-SLM first -> online confidence-dynamics monitoring -> rollback/recovery -> bounded LLM continuation -> return to SLM
-```
-
-The method no longer builds or reads calibration CDFs. Strategy decisions use raw SLM continuation confidence only:
+This path implements **SARR-CoDE with state-aware step routing and confirmed-stagnation rollback**. The main flow is still SLM-first:
 
 ```text
-R_k = c_raw_k
-R_smooth_k = mean(recent raw c_raw values)
+SLM default generation
+-> raw continuation-confidence monitoring
+-> optional short LLM lease without rollback
+-> confirmed-stagnation rollback to clean autonomy anchor
+-> short LLM lease
+-> return to SLM
 ```
 
-HCS is only an auxiliary failure mode. It does not turn the system into a repetition detector plus LLM bridge, and it does not use Hinit routing, LLM judging, answer probes, boxed-answer parsing, embeddings, hidden states, or diverse sampling.
+The method does not use calibration CDFs, percentile confidence, LLM judges, answer probes, final-answer parsing, embeddings, hidden states, or diverse sampling.
 
 ## 1. Calibration Is Disabled
 
-Formal runs should not set a calibration path and should not run calibration mode.
-
-Required config:
+Do not run `--mode calibrate`. Formal runs should use:
 
 ```json
 {
-  "method": "sarr_code_v2_raw_hcs_confirmed_rollback",
+  "method": "sarr_code_v3_state_aware_routing_rollback",
   "calibration": {
     "enabled": false,
     "build_cdf": false,
@@ -37,63 +33,11 @@ Required config:
 }
 ```
 
-`c_norm` and `c_smooth` may still appear as backward-compatible log fields, but they are not used for rollback, anchor refresh, HCS, startup, or low-confidence collapse. The run script does not load a normalizer during `--mode run`.
+`c_norm` and `c_smooth` may remain in logs for compatibility, but strategy decisions use raw readiness only.
 
-If `confidence.calibration_path` is set, or any `calibration.*` switch is enabled, the run fails fast.
+## 2. Run
 
-## 2. Local Assets
-
-Configure model and dataset paths in:
-
-```bash
-configs/sarr_code_aggressive.json
-```
-
-Important fields:
-
-```json
-{
-  "slm": {
-    "model_path": "/local/path/to/slm",
-    "chat_template_path": "server/template/deepseekr1.jinja",
-    "device": "cuda:0",
-    "backend": "transformers",
-    "local_files_only": true
-  },
-  "llm": {
-    "model_path": "/local/path/to/llm-tokenizer",
-    "chat_template_path": "server/template/qwen3.jinja",
-    "backend": "openai",
-    "api_base_url": "http://127.0.0.1:8000/v1",
-    "api_model": "qwen3-4B",
-    "local_files_only": true
-  }
-}
-```
-
-The SLM is loaded locally through transformers so the experiment can read next-token logits for raw continuation confidence. The LLM is expected to run as an OpenAI-compatible vLLM server.
-
-## 3. Start vLLM for the LLM
-
-Example:
-
-```bash
-MODEL=/home/lhyang/Documents/code/reasoning_boundary/models/qwen3-4B \
-SERVED_MODEL_NAME=qwen3-4B \
-CUDA_DEVICE=0 \
-PORT=8000 \
-CHAT_TEMPLATE=server/template/qwen3.jinja \
-TRUST_REMOTE_CODE=1 \
-ENABLE_PREFIX_CACHING=1 \
-GPU_MEMORY_UTILIZATION=0.6 \
-bash server/serve.sh
-```
-
-Use `server/template/deepseekr1.jinja` for DeepSeek-R1-style models and `server/template/qwen3.jinja` for Qwen3-style models.
-
-## 4. Run SARR-CoDE Raw HCS
-
-Do not run `--mode calibrate`. Run the experiment directly:
+Start the OpenAI-compatible vLLM server for the LLM, then run:
 
 ```bash
 python scripts/run_sarr_code.py \
@@ -108,29 +52,35 @@ python scripts/run_sarr_code.py \
 Outputs are written under:
 
 ```text
-sarr_results/<dataset>/sarr_code_v2_raw_hcs_confirmed_rollback/
+sarr_results/<dataset>/sarr_code_v3_state_aware_routing_rollback/
 ```
 
-Per problem:
+Per-problem logs include `steps.jsonl`, `rollback_events.jsonl`, `transitions.jsonl`, and `trace.json`.
+
+## 3. Thinking Stop
+
+SLM step generation still uses `\n\n` as the normal boundary. After a boundary, the local SLM can look ahead for `</think>`:
+
+```json
+{
+  "generation": {
+    "step_delimiters": ["\n\n"],
+    "close_tag_lookahead_tokens": 16
+  }
+}
+```
+
+If `</think>`, EOS, or an empty step is observed, thinking stops immediately and the final step skips continuation-confidence forward.
+
+## 4. Readiness
+
+The strategy uses raw confidence with optional raw smoothing:
 
 ```text
-<id>.problem.json
-<id>.steps.jsonl
-<id>.rollback_events.jsonl
-<id>.transitions.jsonl
-<id>.trace.json
+readiness_value = readiness_raw_smooth if available else c_raw
 ```
 
-Summary files:
-
-```text
-summary.csv
-summary_metrics.json
-```
-
-## 5. Raw Readiness
-
-Recommended defaults:
+Recommended config:
 
 ```json
 {
@@ -138,197 +88,158 @@ Recommended defaults:
     "signal": "continuation_confidence",
     "normalization": "raw",
     "use_calibration": false,
-    "value_field": "c_raw",
+    "value_field": "readiness_smooth_or_raw",
     "smooth_window": 3,
-    "high_threshold": 0.75,
+    "high_threshold": 0.70,
     "low_threshold": 0.35
   }
 }
 ```
 
-Each step records:
+Each monitored SLM step records `c_raw`, `readiness_raw`, `readiness_raw_smooth`, `readiness_value`, `readiness_high`, `readiness_mid`, and `readiness_low`.
 
-```json
-{
-  "calibration_enabled": false,
-  "readiness_source": "raw",
-  "c_raw": 0.83,
-  "readiness_raw": 0.83,
-  "readiness_raw_smooth": 0.79,
-  "readiness_high": true,
-  "readiness_low": false
-}
+## 5. States
+
+The routing state machine uses:
+
+```text
+STARTUP
+SLM_ACTIVE
+LLM_LEASE
+POST_LEASE_OBSERVE
+ROLLBACK_RECOVERY
+UNRECOVERABLE
 ```
 
-All strategy decisions read readiness through the raw readiness path. Do not use `c_norm` or old percentile-smoothed `c_smooth` for interpretation of current decisions.
+`STARTUP` is only for the beginning of a problem. After the system has left STARTUP, recovery or LLM lease cannot send it back there. Lease and recovery both return through `POST_LEASE_OBSERVE`, which suppresses startup rollback and immediate rollback for a short observation window.
 
-## 6. HCS Configuration
+## 6. Confirmed Stagnation
 
-Recommended defaults:
+Surface stagnation uses word 3-gram Jaccard over recent active SLM steps or small blocks:
 
 ```json
 {
   "stagnation": {
     "enabled": true,
-    "unit": "step_or_small_block",
-    "block_min_tokens": 32,
-    "block_max_steps": 2,
     "metric": "word_3gram_jaccard",
     "repeat_window": 10,
-    "high_threshold": 0.85
-  },
-  "anchor": {
-    "type": "clean_autonomy_anchor",
-    "refresh_condition": "raw_readiness_high_and_not_hcs_suspect",
-    "freeze_on_hcs_suspect": true,
-    "fallback": "startup_anchor_or_zero"
-  },
-  "hcs": {
-    "enabled": true,
-    "enable_after_clean_anchor": true,
-    "suspect_condition": "raw_readiness_high_and_stagnation_high",
-    "suspect_patience": 3,
-    "action": "rollback_to_clean_anchor",
-    "max_hcs_rollbacks_per_problem": 2
+    "high_threshold": 0.85,
+    "patience": 3,
+    "block_min_tokens": 32,
+    "block_max_steps": 2,
+    "include_mid_readiness": true
   }
 }
 ```
 
-HCS suspect condition:
+`hcs_suspect` is still logged for `readiness_high and stagnation_high`, but rollback now triggers on confirmed stagnation, including mid-confidence repeated tails.
+
+Autonomy states include:
 
 ```text
-readiness_raw_smooth >= readiness.high_threshold
-and
-stagnation_score >= stagnation.high_threshold
+HIGH_CONF_STAGNATION
+MID_CONF_STAGNATION
+LOW_CONF_STAGNATION_COLLAPSE
 ```
 
-A suspect step is logged immediately and cannot refresh `clean_autonomy_anchor`. HCS confirms after three consecutive suspect SLM steps/blocks. Rollback target is always `clean_autonomy_anchor`, never the stagnation onset.
+Confirmed stagnation rolls back to `clean_autonomy_anchor`, not to the repetition onset.
 
-## 7. HCS Recovery
+## 7. Clean Anchor
 
-Recommended defaults:
+The clean autonomy anchor refreshes only when:
+
+```text
+generator == "slm"
+and readiness_high
+and not stagnation_suspect
+and state == SLM_ACTIVE
+and current step is active
+```
+
+LLM steps, recovery steps, POST_LEASE_OBSERVE steps, and any stagnation-suspect step do not refresh the anchor.
+
+## 8. LLM Lease
+
+LLM can now appear without rollback when SLM has persistent low readiness and no confirmed stagnation:
 
 ```json
 {
-  "hcs_recovery": {
-    "generator": "llm",
+  "low_readiness": {
+    "useful_exploration_grace_steps": 2,
+    "persistent_low_after_grace_action": "llm_lease_no_rollback"
+  },
+  "llm_lease": {
+    "enabled": true,
     "prompt_type": "normal_continuation",
+    "mention_uncertainty": false,
     "mention_stagnation": false,
     "mention_repetition": false,
-    "max_llm_steps": 2,
+    "mention_error": false,
+    "persistent_uncertainty_steps": 2,
+    "confirmed_stagnation_steps": 3,
+    "low_conf_rollback_steps": 2,
     "max_tokens_per_step": 128,
-    "return_to_slm_after_recovery": true
+    "max_events_per_problem": 4,
+    "max_total_tokens_per_problem": 1024,
+    "return_to_slm": true
   }
 }
 ```
 
-After HCS rollback, the LLM sees only the clean prefix and uses the normal continuation prompt path. The prompt must not mention stagnation, repetition, stuckness, loops, strategy changes, or repair instructions.
+The lease prompt remains normal continuation. It must not mention uncertainty, stagnation, repetition, stuckness, strategy changes, or repair.
 
-HCS rollback events include:
+Lease events are logged as:
 
 ```json
 {
-  "event": "hcs_rollback",
-  "reason": "HCS_CONFIRMED_RAW_READINESS",
-  "trigger_step": 135,
-  "clean_anchor_step": 118,
-  "rollback_span": 17,
-  "hcs_rollback_count": 1,
-  "readiness_source": "raw",
-  "calibration_enabled": false,
-  "llm_recovery_prompt_type": "normal_continuation",
+  "event": "llm_lease",
+  "reason": "PERSISTENT_UNCERTAINTY",
+  "rollback_before_lease": false,
+  "lease_steps": 2,
+  "prompt_type": "normal_continuation",
+  "mention_uncertainty": false,
   "mention_stagnation": false,
-  "return_to_slm": true
+  "mention_repetition": false,
+  "return_to_slm": true,
+  "state_after": "POST_LEASE_OBSERVE"
 }
 ```
 
-## 8. Low-Confidence Path
+For confirmed stagnation, the same event has `rollback_before_lease=true`, `reason=CONFIRMED_STAGNATION`, `rollback_anchor=<clean anchor>`, and `removed_steps=[...]`.
 
-Low-confidence collapse remains independent from HCS and also uses raw readiness:
+## 9. Budgets
+
+Problem-level budgets prevent LLM takeover:
 
 ```json
 {
-  "low_confidence": {
-    "useful_exploration_grace_blocks": 2,
-    "collapse_patience_blocks": 3,
-    "action_after_patience": "existing_rollback_recovery"
+  "budget": {
+    "max_llm_lease_events_per_problem": 4,
+    "max_llm_lease_tokens_per_problem": 1024,
+    "max_rollbacks_per_problem": 4,
+    "max_stagnation_rollbacks_per_problem": 2
   }
 }
 ```
 
-If raw readiness is low or raw-readiness degeneration appears during the grace window, the step is logged as `USEFUL_EXPLORATION` and SLM continues. If it persists through the patience window, the existing rollback/recovery path is used. This path does not require stagnation.
+If lease budget is exhausted, the system records `routing_budget_exceeded` and falls back to the configured continue/close/unrecoverable policy instead of repeatedly calling LLM.
 
-## 9. Startup
+## 10. Checks
 
-HCS does not handle startup bad prefixes:
-
-```json
-{
-  "startup_guard": {
-    "hcs_enabled": false,
-    "enable_hcs_after_clean_anchor": true
-  }
-}
-```
-
-Startup continues to use the existing startup rollback / confidence-degeneration logic, but the confidence signal is raw readiness. Jaccard stagnation detection does not interfere with startup.
-
-## 10. Problem 6 Checks
-
-For Problem 6, inspect `steps.jsonl` and `rollback_events.jsonl`:
+For Problem 6 and Problem 0, inspect:
 
 ```text
 calibration_enabled=false
 readiness_source=raw
-readiness_raw_smooth is present
-hcs_suspect appears on high-confidence repeated tail steps
-anchor_refresh_blocked_reason=HCS_SUSPECT during suspect steps
-third consecutive suspect triggers event=hcs_rollback
-reason=HCS_CONFIRMED_RAW_READINESS
-clean_anchor_step is the rollback target
-hcs_rollback_count <= 2
+readiness_value uses readiness_raw_smooth when available
+LLM_LEASE can appear without rollback for persistent low readiness
+STAGNATION_ROLLBACK appears for confirmed stagnation
+MID_CONF_STAGNATION appears for mid-confidence repeated tails
+anchor_refresh_blocked_reason=STAGNATION_SUSPECT
+LLM steps do not refresh clean_autonomy_anchor
+state transitions include LLM_LEASE -> POST_LEASE_OBSERVE
+no mature prefix re-enters STARTUP after lease or recovery
+llm lease counts and tokens stay within budget
 ```
 
-The expected behavior is that the high-confidence repeated tail is deleted back to the clean autonomy anchor, LLM performs one or two ordinary continuation steps, and control returns to SLM without another long high-confidence loop.
-
-## 11. Sweep
-
-The existing sweep script can still materialize variants:
-
-```bash
-python scripts/run_sarr_sweep.py \
-  --base-config configs/sarr_code_aggressive.json \
-  --dataset aime25 \
-  --max-problems 30 \
-  --output-root sarr_results \
-  --resume
-```
-
-The sweep should inherit raw-readiness settings from the base config. Do not add calibration paths to generated variants.
-
-## 12. Summary Metrics
-
-`summary_metrics.json` records:
-
-```text
-rollback_rate
-startup_rollback_rate
-post_stable_rollback_rate
-hcs_rollback_rate
-avg_rollback_span
-avg_recovery_steps
-recovery_ready_rate
-recovery_exhausted_rate
-forced_close_think_rate
-force_slm_after_recovery_fail_rate
-llm_token_ratio
-```
-
-Raw per-problem fields in `summary.csv` include:
-
-```text
-hcs_rollback_count
-has_hcs_rollback
-hcs_suspect_count
-hcs_confirmed_count
-```
+The expected behavior is bounded SLM-first collaboration: the LLM gets short continuation leases, confirmed polluted tails are removed back to the clean anchor, and control returns to SLM after the post-lease observation window.
