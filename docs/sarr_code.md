@@ -131,6 +131,7 @@ Each scored SLM step records `c_raw`, `readiness_raw`, `readiness_raw_smooth`, `
 ## 5. CI-OD Shadow Logging
 
 CI-OD is shadow-only. It is recorded in traces and summaries, but it never routes to the LLM and never changes the active state machine.
+The original consecutive high-run hazard is retained as `ciod_risk_v1` for comparison; the current CI-OD signal is `ciod_risk_v2`.
 
 Per scored SLM step, `extra.confidence_process` records:
 
@@ -147,6 +148,18 @@ high_run_start_step
 masked_memory_at_high_run_start
 ciod_risk
 ciod_shadow_trigger
+ciod_risk_v1
+ciod_shadow_trigger_v1
+masked_memory
+last_masked_step
+steps_since_last_masked
+post_masked_exposure
+post_masked_high_count
+post_masked_mid_high_count
+ciod_risk_v2
+ciod_shadow_trigger_v2
+ciod_grid_risks
+ciod_grid_triggers
 ```
 
 Definitions:
@@ -157,30 +170,52 @@ smooth_low = readiness_value <= 0.35
 masked_uncertainty = raw_low and not smooth_low
 masked_uncertainty_gap = raw_low_count - smooth_low_count
 high_run_length = consecutive readiness_value >= 0.70
+masked_memory = decayed masked_uncertainty memory
+post_masked_exposure = decayed confidence exposure after masked uncertainty
 ```
 
-Risk uses a conditional hazard, not linear weighting:
+The v2 risk uses a post-masked confidence exposure conditional hazard, not linear weighting:
 
 ```text
-risk = 1 - exp(
-  -lambda0
-  * (1 + masked_memory_at_high_run_start)^alpha
-  * max(0, high_run_length - r0)^power
-)
+if masked_memory < min_masked_memory:
+    risk = 0
+else:
+    exposure_excess = max(0, post_masked_exposure - exposure_e0)
+    cumulative_hazard =
+      lambda0
+      * (1 + masked_memory)^alpha
+      * exposure_excess^power
+    risk = 1 - exp(-cumulative_hazard)
 ```
+
+Exposure increments by `1.0` when `readiness_value >= high_threshold`, by `0.5` when `readiness_value >= mid_high_threshold`, and by `0.0` otherwise. `ciod_shadow_trigger_v2 = ciod_risk_v2 >= risk_threshold`.
 
 Defaults:
 
 ```json
 {
   "confidence_process": {
-    "lambda0": 0.002,
+    "lambda0": 0.003,
     "alpha": 1.0,
     "r0": 20,
     "power": 2.0,
     "high_threshold": 0.70,
+    "mid_high_threshold": 0.60,
     "raw_low_threshold": 0.35,
-    "smooth_low_threshold": 0.35
+    "smooth_low_threshold": 0.35,
+    "masked_decay": 0.995,
+    "exposure_decay": 0.98,
+    "min_masked_memory": 3.0,
+    "exposure_e0": 4.0,
+    "risk_threshold": 0.10,
+    "v1_lambda0": 0.002,
+    "ciod_grid": [
+      {"exposure_e0": 3.0, "lambda0": 0.003, "risk_threshold": 0.10},
+      {"exposure_e0": 4.0, "lambda0": 0.003, "risk_threshold": 0.10},
+      {"exposure_e0": 5.0, "lambda0": 0.003, "risk_threshold": 0.10},
+      {"exposure_e0": 5.0, "lambda0": 0.005, "risk_threshold": 0.10},
+      {"exposure_e0": 8.0, "lambda0": 0.005, "risk_threshold": 0.10}
+    ]
   }
 }
 ```
@@ -198,6 +233,18 @@ ciod_shadow_trigger
 max_ciod_risk
 ciod_shadow_trigger_count
 first_ciod_shadow_trigger_step
+ciod_risk_v1
+ciod_shadow_trigger_v1
+max_ciod_risk_v1
+ciod_shadow_trigger_count_v1
+first_ciod_shadow_trigger_step_v1
+max_post_masked_exposure
+ciod_risk_v2
+ciod_shadow_trigger_v2
+max_ciod_risk_v2
+ciod_shadow_trigger_count_v2
+first_ciod_shadow_trigger_step_v2
+ciod_grid_summary
 ```
 
 ## 6. States
@@ -364,7 +411,7 @@ Useful checks in logs:
 calibration_enabled=false
 readiness_source=raw
 confidence_process exists in every step extra
-ciod_risk and ciod_shadow_trigger are shadow fields only
+ciod_risk_v2 and ciod_shadow_trigger_v2 are shadow fields only
 LLM_LEASE can appear without rollback for persistent low readiness
 STAGNATION_ROLLBACK appears for confirmed stagnation
 MID_CONF_STAGNATION appears for mid-confidence repeated tails

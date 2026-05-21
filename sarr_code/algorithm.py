@@ -30,30 +30,158 @@ class ConfidenceProcessTracker:
         self.raw_low_count = 0
         self.smooth_low_count = 0
         self.masked_uncertainty_count = 0
+
+        # Legacy CI-OD v1: consecutive high-readiness run after masked uncertainty.
         self.high_run_length = 0
         self.high_run_start_step: int | None = None
         self.masked_memory_at_high_run_start = 0
         self.max_high_run_length = 0
-        self.max_ciod_risk = 0.0
-        self.ciod_shadow_trigger_count = 0
-        self.first_ciod_shadow_trigger_step: int | None = None
-        self._last_ciod_risk = 0.0
-        self._last_ciod_shadow_trigger = False
+        self.max_ciod_risk_v1 = 0.0
+        self.ciod_shadow_trigger_count_v1 = 0
+        self.first_ciod_shadow_trigger_step_v1: int | None = None
+        self._last_ciod_risk_v1 = 0.0
+        self._last_ciod_shadow_trigger_v1 = False
+
+        # CI-OD v2: post-masked confidence exposure hazard.
+        self.masked_memory = 0.0
+        self.last_masked_step: int | None = None
+        self.steps_since_last_masked: int | None = None
+        self.post_masked_exposure = 0.0
+        self.post_masked_high_count = 0
+        self.post_masked_mid_high_count = 0
+        self.max_post_masked_exposure = 0.0
+        self.max_ciod_risk_v2 = 0.0
+        self.ciod_shadow_trigger_count_v2 = 0
+        self.first_ciod_shadow_trigger_step_v2: int | None = None
+        self._last_ciod_risk_v2 = 0.0
+        self._last_ciod_shadow_trigger_v2 = False
+
+        self._grid_configs = [
+            {
+                "key": self._grid_key(i, grid),
+                "exposure_e0": float(grid["exposure_e0"]),
+                "lambda0": float(grid["lambda0"]),
+                "risk_threshold": float(grid["risk_threshold"]),
+            }
+            for i, grid in enumerate(self.cfg.ciod_grid)
+        ]
+        self._last_ciod_grid_risks = {grid["key"]: 0.0 for grid in self._grid_configs}
+        self._last_ciod_grid_triggers = {grid["key"]: False for grid in self._grid_configs}
+        self._ciod_grid_stats = {
+            grid["key"]: {
+                "exposure_e0": grid["exposure_e0"],
+                "lambda0": grid["lambda0"],
+                "risk_threshold": grid["risk_threshold"],
+                "max_risk": 0.0,
+                "trigger_count": 0,
+                "first_trigger_step": None,
+            }
+            for grid in self._grid_configs
+        }
 
     @property
     def masked_uncertainty_gap(self) -> int:
         return self.raw_low_count - self.smooth_low_count
 
-    def _ciod_risk(self) -> float:
+    @staticmethod
+    def _compact_float(value: float) -> str:
+        return f"{value:g}".replace(".", "p").replace("-", "m")
+
+    def _grid_key(self, index: int, grid: dict[str, float]) -> str:
+        e0 = float(grid["exposure_e0"])
+        lambda0 = float(grid["lambda0"])
+        threshold = float(grid["risk_threshold"])
+        return (
+            f"g{index}_e0_{self._compact_float(e0)}"
+            f"_lambda0_{self._compact_float(lambda0)}"
+            f"_threshold_{self._compact_float(threshold)}"
+        )
+
+    def _ciod_risk_v1(self) -> float:
         dwell = max(0.0, float(self.high_run_length - self.cfg.r0))
         if dwell <= 0.0:
             return 0.0
         hazard = (
-            self.cfg.lambda0
+            self.cfg.v1_lambda0
             * ((1.0 + float(self.masked_memory_at_high_run_start)) ** self.cfg.alpha)
             * (dwell ** self.cfg.power)
         )
         return float(1.0 - math.exp(-hazard))
+
+    def _ciod_risk_v2(self, *, exposure_e0: float, lambda0: float) -> float:
+        if self.masked_memory < self.cfg.min_masked_memory:
+            return 0.0
+        exposure_excess = max(0.0, self.post_masked_exposure - exposure_e0)
+        if exposure_excess <= 0.0:
+            return 0.0
+        cumulative_hazard = (
+            lambda0
+            * ((1.0 + self.masked_memory) ** self.cfg.alpha)
+            * (exposure_excess ** self.cfg.power)
+        )
+        return float(1.0 - math.exp(-cumulative_hazard))
+
+    def _confidence_process_snapshot(
+        self,
+        *,
+        scored: bool,
+        raw_low: bool,
+        smooth_low: bool,
+        masked_uncertainty: bool,
+    ) -> dict[str, Any]:
+        return {
+            "scored": scored,
+            "raw_low": raw_low,
+            "smooth_low": smooth_low,
+            "masked_uncertainty": masked_uncertainty,
+            "raw_low_count": self.raw_low_count,
+            "smooth_low_count": self.smooth_low_count,
+            "masked_uncertainty_count": self.masked_uncertainty_count,
+            "masked_uncertainty_gap": self.masked_uncertainty_gap,
+            "high_run_length": self.high_run_length,
+            "high_run_start_step": self.high_run_start_step,
+            "masked_memory_at_high_run_start": self.masked_memory_at_high_run_start,
+            "ciod_risk": self._last_ciod_risk_v1,
+            "ciod_shadow_trigger": self._last_ciod_shadow_trigger_v1,
+            "ciod_risk_v1": self._last_ciod_risk_v1,
+            "ciod_shadow_trigger_v1": self._last_ciod_shadow_trigger_v1,
+            "masked_memory": self.masked_memory,
+            "last_masked_step": self.last_masked_step,
+            "steps_since_last_masked": self.steps_since_last_masked,
+            "post_masked_exposure": self.post_masked_exposure,
+            "post_masked_high_count": self.post_masked_high_count,
+            "post_masked_mid_high_count": self.post_masked_mid_high_count,
+            "ciod_risk_v2": self._last_ciod_risk_v2,
+            "ciod_shadow_trigger_v2": self._last_ciod_shadow_trigger_v2,
+            "ciod_grid_risks": dict(self._last_ciod_grid_risks),
+            "ciod_grid_triggers": dict(self._last_ciod_grid_triggers),
+        }
+
+    def _update_grid(self, step_id: int) -> None:
+        risks: dict[str, float] = {}
+        triggers: dict[str, bool] = {}
+        for grid in self._grid_configs:
+            key = str(grid["key"])
+            risk = self._ciod_risk_v2(
+                exposure_e0=float(grid["exposure_e0"]),
+                lambda0=float(grid["lambda0"]),
+            )
+            trigger = risk >= float(grid["risk_threshold"])
+            risks[key] = risk
+            triggers[key] = trigger
+
+            stats = self._ciod_grid_stats[key]
+            stats["max_risk"] = max(float(stats["max_risk"]), risk)
+            if trigger:
+                stats["trigger_count"] = int(stats["trigger_count"]) + 1
+                if stats["first_trigger_step"] is None:
+                    stats["first_trigger_step"] = step_id
+
+        self._last_ciod_grid_risks = risks
+        self._last_ciod_grid_triggers = triggers
+
+    def _grid_summary(self) -> dict[str, dict[str, Any]]:
+        return {key: dict(value) for key, value in self._ciod_grid_stats.items()}
 
     def observe(self, record: StepRecord) -> dict[str, Any]:
         scored = (
@@ -89,48 +217,66 @@ class ConfidenceProcessTracker:
                 self.smooth_low_count += 1
             if masked_uncertainty:
                 self.masked_uncertainty_count += 1
+                self.masked_memory = self.cfg.masked_decay * self.masked_memory + 1.0
+                self.last_masked_step = record.step_id
+            else:
+                self.masked_memory = self.cfg.masked_decay * self.masked_memory
+
+            if self.last_masked_step is None:
+                self.steps_since_last_masked = None
+            else:
+                self.steps_since_last_masked = record.step_id - self.last_masked_step
+
+            if self.masked_memory > 0.0:
+                exposure_increment = 0.0
+                if readiness_value >= self.cfg.high_threshold:
+                    exposure_increment = 1.0
+                    self.post_masked_high_count += 1
+                elif readiness_value >= self.cfg.mid_high_threshold:
+                    exposure_increment = 0.5
+                    self.post_masked_mid_high_count += 1
+                self.post_masked_exposure = self.cfg.exposure_decay * self.post_masked_exposure + exposure_increment
+            else:
+                self.post_masked_exposure = 0.0
 
             self.max_high_run_length = max(self.max_high_run_length, self.high_run_length)
-            self._last_ciod_risk = self._ciod_risk()
-            self.max_ciod_risk = max(self.max_ciod_risk, self._last_ciod_risk)
-            self._last_ciod_shadow_trigger = self._last_ciod_risk > 0.0
-            if self._last_ciod_shadow_trigger:
-                self.ciod_shadow_trigger_count += 1
-                if self.first_ciod_shadow_trigger_step is None:
-                    self.first_ciod_shadow_trigger_step = record.step_id
+            self.max_post_masked_exposure = max(self.max_post_masked_exposure, self.post_masked_exposure)
 
-        return {
-            "scored": scored,
-            "raw_low": raw_low,
-            "smooth_low": smooth_low,
-            "masked_uncertainty": masked_uncertainty,
-            "raw_low_count": self.raw_low_count,
-            "smooth_low_count": self.smooth_low_count,
-            "masked_uncertainty_count": self.masked_uncertainty_count,
-            "masked_uncertainty_gap": self.masked_uncertainty_gap,
-            "high_run_length": self.high_run_length,
-            "high_run_start_step": self.high_run_start_step,
-            "masked_memory_at_high_run_start": self.masked_memory_at_high_run_start,
-            "ciod_risk": self._last_ciod_risk,
-            "ciod_shadow_trigger": self._last_ciod_shadow_trigger,
-        }
+            self._last_ciod_risk_v1 = self._ciod_risk_v1()
+            self.max_ciod_risk_v1 = max(self.max_ciod_risk_v1, self._last_ciod_risk_v1)
+            self._last_ciod_shadow_trigger_v1 = self._last_ciod_risk_v1 > 0.0
+            if self._last_ciod_shadow_trigger_v1:
+                self.ciod_shadow_trigger_count_v1 += 1
+                if self.first_ciod_shadow_trigger_step_v1 is None:
+                    self.first_ciod_shadow_trigger_step_v1 = record.step_id
+
+            self._last_ciod_risk_v2 = self._ciod_risk_v2(
+                exposure_e0=self.cfg.exposure_e0,
+                lambda0=self.cfg.lambda0,
+            )
+            self.max_ciod_risk_v2 = max(self.max_ciod_risk_v2, self._last_ciod_risk_v2)
+            self._last_ciod_shadow_trigger_v2 = self._last_ciod_risk_v2 >= self.cfg.risk_threshold
+            if self._last_ciod_shadow_trigger_v2:
+                self.ciod_shadow_trigger_count_v2 += 1
+                if self.first_ciod_shadow_trigger_step_v2 is None:
+                    self.first_ciod_shadow_trigger_step_v2 = record.step_id
+
+            self._update_grid(record.step_id)
+
+        return self._confidence_process_snapshot(
+            scored=scored,
+            raw_low=raw_low,
+            smooth_low=smooth_low,
+            masked_uncertainty=masked_uncertainty,
+        )
 
     def current_snapshot(self) -> dict[str, Any]:
-        return {
-            "scored": False,
-            "raw_low": False,
-            "smooth_low": False,
-            "masked_uncertainty": False,
-            "raw_low_count": self.raw_low_count,
-            "smooth_low_count": self.smooth_low_count,
-            "masked_uncertainty_count": self.masked_uncertainty_count,
-            "masked_uncertainty_gap": self.masked_uncertainty_gap,
-            "high_run_length": self.high_run_length,
-            "high_run_start_step": self.high_run_start_step,
-            "masked_memory_at_high_run_start": self.masked_memory_at_high_run_start,
-            "ciod_risk": self._last_ciod_risk,
-            "ciod_shadow_trigger": self._last_ciod_shadow_trigger,
-        }
+        return self._confidence_process_snapshot(
+            scored=False,
+            raw_low=False,
+            smooth_low=False,
+            masked_uncertainty=False,
+        )
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -139,11 +285,29 @@ class ConfidenceProcessTracker:
             "masked_uncertainty_count": self.masked_uncertainty_count,
             "masked_uncertainty_gap": self.masked_uncertainty_gap,
             "max_high_run_length": self.max_high_run_length,
-            "ciod_risk": self._last_ciod_risk,
-            "ciod_shadow_trigger": self._last_ciod_shadow_trigger,
-            "max_ciod_risk": self.max_ciod_risk,
-            "ciod_shadow_trigger_count": self.ciod_shadow_trigger_count,
-            "first_ciod_shadow_trigger_step": self.first_ciod_shadow_trigger_step,
+            "ciod_risk": self._last_ciod_risk_v1,
+            "ciod_shadow_trigger": self._last_ciod_shadow_trigger_v1,
+            "max_ciod_risk": self.max_ciod_risk_v1,
+            "ciod_shadow_trigger_count": self.ciod_shadow_trigger_count_v1,
+            "first_ciod_shadow_trigger_step": self.first_ciod_shadow_trigger_step_v1,
+            "ciod_risk_v1": self._last_ciod_risk_v1,
+            "ciod_shadow_trigger_v1": self._last_ciod_shadow_trigger_v1,
+            "max_ciod_risk_v1": self.max_ciod_risk_v1,
+            "ciod_shadow_trigger_count_v1": self.ciod_shadow_trigger_count_v1,
+            "first_ciod_shadow_trigger_step_v1": self.first_ciod_shadow_trigger_step_v1,
+            "masked_memory": self.masked_memory,
+            "last_masked_step": self.last_masked_step,
+            "steps_since_last_masked": self.steps_since_last_masked,
+            "post_masked_exposure": self.post_masked_exposure,
+            "post_masked_high_count": self.post_masked_high_count,
+            "post_masked_mid_high_count": self.post_masked_mid_high_count,
+            "max_post_masked_exposure": self.max_post_masked_exposure,
+            "ciod_risk_v2": self._last_ciod_risk_v2,
+            "ciod_shadow_trigger_v2": self._last_ciod_shadow_trigger_v2,
+            "max_ciod_risk_v2": self.max_ciod_risk_v2,
+            "ciod_shadow_trigger_count_v2": self.ciod_shadow_trigger_count_v2,
+            "first_ciod_shadow_trigger_step_v2": self.first_ciod_shadow_trigger_step_v2,
+            "ciod_grid_summary": self._grid_summary(),
         }
 
 

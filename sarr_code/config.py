@@ -72,27 +72,85 @@ class ConfidenceConfig:
 
 @dataclass
 class ConfidenceProcessConfig:
-    lambda0: float = 0.002
+    lambda0: float = 0.003
     alpha: float = 1.0
     r0: int = 20
     power: float = 2.0
     high_threshold: float = 0.70
+    mid_high_threshold: float = 0.60
     raw_low_threshold: float = 0.35
     smooth_low_threshold: float = 0.35
+    masked_decay: float = 0.995
+    exposure_decay: float = 0.98
+    min_masked_memory: float = 3.0
+    exposure_e0: float = 4.0
+    risk_threshold: float = 0.10
+    v1_lambda0: float = 0.002
+    ciod_grid: list[dict[str, float]] = field(
+        default_factory=lambda: [
+            {"exposure_e0": 3.0, "lambda0": 0.003, "risk_threshold": 0.10},
+            {"exposure_e0": 4.0, "lambda0": 0.003, "risk_threshold": 0.10},
+            {"exposure_e0": 5.0, "lambda0": 0.003, "risk_threshold": 0.10},
+            {"exposure_e0": 5.0, "lambda0": 0.005, "risk_threshold": 0.10},
+            {"exposure_e0": 8.0, "lambda0": 0.005, "risk_threshold": 0.10},
+        ]
+    )
 
     def __post_init__(self) -> None:
         if self.lambda0 < 0.0:
             raise ValueError("confidence_process.lambda0 must be >= 0")
+        if self.v1_lambda0 < 0.0:
+            raise ValueError("confidence_process.v1_lambda0 must be >= 0")
         if self.alpha < 0.0:
             raise ValueError("confidence_process.alpha must be >= 0")
         if self.r0 < 0:
             raise ValueError("confidence_process.r0 must be >= 0")
         if self.power < 0.0:
             raise ValueError("confidence_process.power must be >= 0")
-        for name in ["high_threshold", "raw_low_threshold", "smooth_low_threshold"]:
+        for name in [
+            "high_threshold",
+            "mid_high_threshold",
+            "raw_low_threshold",
+            "smooth_low_threshold",
+            "masked_decay",
+            "exposure_decay",
+            "risk_threshold",
+        ]:
             value = getattr(self, name)
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"confidence_process.{name} must be in [0, 1]")
+        if self.min_masked_memory < 0.0:
+            raise ValueError("confidence_process.min_masked_memory must be >= 0")
+        if self.exposure_e0 < 0.0:
+            raise ValueError("confidence_process.exposure_e0 must be >= 0")
+        normalized_grid = []
+        for i, item in enumerate(self.ciod_grid):
+            if not isinstance(item, dict):
+                raise ValueError(f"confidence_process.ciod_grid[{i}] must be an object")
+            exposure_e0 = item.get("exposure_e0", item.get("e0"))
+            risk_threshold = item.get("risk_threshold", item.get("threshold"))
+            lambda0 = item.get("lambda0")
+            if exposure_e0 is None or risk_threshold is None or lambda0 is None:
+                raise ValueError(
+                    f"confidence_process.ciod_grid[{i}] must include exposure_e0/e0, lambda0, and risk_threshold/threshold"
+                )
+            exposure_e0 = float(exposure_e0)
+            lambda0 = float(lambda0)
+            risk_threshold = float(risk_threshold)
+            if exposure_e0 < 0.0:
+                raise ValueError(f"confidence_process.ciod_grid[{i}].exposure_e0 must be >= 0")
+            if lambda0 < 0.0:
+                raise ValueError(f"confidence_process.ciod_grid[{i}].lambda0 must be >= 0")
+            if not 0.0 <= risk_threshold <= 1.0:
+                raise ValueError(f"confidence_process.ciod_grid[{i}].risk_threshold must be in [0, 1]")
+            normalized_grid.append(
+                {
+                    "exposure_e0": exposure_e0,
+                    "lambda0": lambda0,
+                    "risk_threshold": risk_threshold,
+                }
+            )
+        self.ciod_grid = normalized_grid
 
 
 @dataclass

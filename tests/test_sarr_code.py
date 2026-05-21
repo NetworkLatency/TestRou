@@ -452,7 +452,13 @@ class SARRCodeTests(unittest.TestCase):
                 calibration_path=None,
                 delta=0.0,
             ),
-            confidence_process=ConfidenceProcessConfig(r0=2),
+            confidence_process=ConfidenceProcessConfig(
+                r0=2,
+                min_masked_memory=0.5,
+                exposure_e0=1.0,
+                lambda0=0.05,
+                risk_threshold=0.05,
+            ),
             readiness=ReadinessConfig(smooth_window=3, high_threshold=0.70, low_threshold=0.35),
             startup=StartupConfig(B_min=1, B_max=10, tau_start=1),
             routing=RoutingConfig(enabled=False),
@@ -493,20 +499,29 @@ class SARRCodeTests(unittest.TestCase):
         self.assertFalse(masked["smooth_low"])
         self.assertTrue(masked["masked_uncertainty"])
         self.assertEqual(masked["masked_uncertainty_count"], 1)
+        self.assertGreater(masked["masked_memory"], 0.0)
+        self.assertEqual(masked["last_masked_step"], steps[2]["step_id"])
+        self.assertEqual(masked["steps_since_last_masked"], 0)
+        self.assertIn("ciod_grid_risks", masked)
+        self.assertIn("ciod_grid_triggers", masked)
 
-        triggered = [row for row in steps if row["extra"]["confidence_process"]["ciod_shadow_trigger"]]
-        self.assertTrue(triggered)
-        first_trigger = triggered[0]["extra"]["confidence_process"]
-        self.assertEqual(first_trigger["masked_memory_at_high_run_start"], 1)
-        self.assertGreater(first_trigger["ciod_risk"], 0.0)
+        triggered_v2 = [row for row in steps if row["extra"]["confidence_process"]["ciod_shadow_trigger_v2"]]
+        self.assertTrue(triggered_v2)
+        first_trigger = triggered_v2[0]["extra"]["confidence_process"]
+        self.assertGreater(first_trigger["post_masked_exposure"], 1.0)
+        self.assertGreater(first_trigger["ciod_risk_v2"], 0.0)
 
         summary = next(event.data for event in result.state.trace if event.event == "sarr_summary")
         self.assertEqual(summary["raw_low_count"], 1)
         self.assertEqual(summary["masked_uncertainty_count"], 1)
         self.assertEqual(summary["masked_uncertainty_gap"], 1)
         self.assertGreaterEqual(summary["max_high_run_length"], 3)
-        self.assertGreater(summary["max_ciod_risk"], 0.0)
-        self.assertEqual(summary["first_ciod_shadow_trigger_step"], triggered[0]["step_id"])
+        self.assertIn("ciod_risk_v1", summary)
+        self.assertGreater(summary["max_post_masked_exposure"], 1.0)
+        self.assertGreater(summary["max_ciod_risk_v2"], 0.0)
+        self.assertEqual(summary["first_ciod_shadow_trigger_step_v2"], triggered_v2[0]["step_id"])
+        self.assertIn("ciod_grid_summary", summary)
+        self.assertGreaterEqual(len(summary["ciod_grid_summary"]), 5)
 
         problem_metrics = _confidence_process_metrics(steps)
         for key in [
@@ -518,9 +533,14 @@ class SARRCodeTests(unittest.TestCase):
             "max_ciod_risk",
             "ciod_shadow_trigger_count",
             "first_ciod_shadow_trigger_step",
+            "max_post_masked_exposure",
+            "max_ciod_risk_v2",
+            "ciod_shadow_trigger_count_v2",
+            "first_ciod_shadow_trigger_step_v2",
+            "ciod_grid_summary",
         ]:
             self.assertIn(key, problem_metrics)
-        self.assertGreater(problem_metrics["max_ciod_risk"], 0.0)
+        self.assertGreater(problem_metrics["max_ciod_risk_v2"], 0.0)
 
     def test_summary_metrics_include_required_sarr_fields(self):
         rows = [

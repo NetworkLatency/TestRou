@@ -51,13 +51,27 @@
     "capture_slm_token_entropy": false
   },
   "confidence_process": {
-    "lambda0": 0.002,
+    "lambda0": 0.003,
     "alpha": 1.0,
     "r0": 20,
     "power": 2.0,
     "high_threshold": 0.70,
+    "mid_high_threshold": 0.60,
     "raw_low_threshold": 0.35,
-    "smooth_low_threshold": 0.35
+    "smooth_low_threshold": 0.35,
+    "masked_decay": 0.995,
+    "exposure_decay": 0.98,
+    "min_masked_memory": 3.0,
+    "exposure_e0": 4.0,
+    "risk_threshold": 0.10,
+    "v1_lambda0": 0.002,
+    "ciod_grid": [
+      {"exposure_e0": 3.0, "lambda0": 0.003, "risk_threshold": 0.10},
+      {"exposure_e0": 4.0, "lambda0": 0.003, "risk_threshold": 0.10},
+      {"exposure_e0": 5.0, "lambda0": 0.003, "risk_threshold": 0.10},
+      {"exposure_e0": 5.0, "lambda0": 0.005, "risk_threshold": 0.10},
+      {"exposure_e0": 8.0, "lambda0": 0.005, "risk_threshold": 0.10}
+    ]
   },
   "calibration": {
     "enabled": false,

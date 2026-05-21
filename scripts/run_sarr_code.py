@@ -142,10 +142,55 @@ def _confidence_process_metrics(step_rows: list[dict[str, Any]]) -> dict[str, An
             "max_ciod_risk": 0.0,
             "ciod_shadow_trigger_count": 0,
             "first_ciod_shadow_trigger_step": None,
+            "ciod_risk_v1": 0.0,
+            "ciod_shadow_trigger_v1": False,
+            "max_ciod_risk_v1": 0.0,
+            "ciod_shadow_trigger_count_v1": 0,
+            "first_ciod_shadow_trigger_step_v1": None,
+            "max_post_masked_exposure": 0.0,
+            "ciod_risk_v2": 0.0,
+            "ciod_shadow_trigger_v2": False,
+            "max_ciod_risk_v2": 0.0,
+            "ciod_shadow_trigger_count_v2": 0,
+            "first_ciod_shadow_trigger_step_v2": None,
+            "ciod_grid_summary": {},
         }
 
     latest = process_rows[-1][1]
     trigger_steps = [step_id for step_id, process in process_rows if _truthy(process.get("ciod_shadow_trigger"))]
+    trigger_steps_v1 = [
+        step_id
+        for step_id, process in process_rows
+        if _truthy(process.get("ciod_shadow_trigger_v1", process.get("ciod_shadow_trigger")))
+    ]
+    trigger_steps_v2 = [
+        step_id for step_id, process in process_rows if _truthy(process.get("ciod_shadow_trigger_v2"))
+    ]
+    grid_summary: dict[str, dict[str, Any]] = {}
+    for step_id, process in process_rows:
+        risks = process.get("ciod_grid_risks")
+        triggers = process.get("ciod_grid_triggers")
+        if not isinstance(risks, dict):
+            continue
+        if not isinstance(triggers, dict):
+            triggers = {}
+        for key, risk_value in risks.items():
+            key = str(key)
+            stats = grid_summary.setdefault(
+                key,
+                {
+                    "max_risk": 0.0,
+                    "trigger_count": 0,
+                    "first_trigger_step": None,
+                },
+            )
+            risk = _num(risk_value)
+            stats["max_risk"] = max(float(stats["max_risk"]), risk)
+            if _truthy(triggers.get(key)):
+                stats["trigger_count"] = int(stats["trigger_count"]) + 1
+                if stats["first_trigger_step"] is None:
+                    stats["first_trigger_step"] = step_id
+
     return {
         "raw_low_count": int(_num(latest.get("raw_low_count"))),
         "smooth_low_count": int(_num(latest.get("smooth_low_count"))),
@@ -157,6 +202,18 @@ def _confidence_process_metrics(step_rows: list[dict[str, Any]]) -> dict[str, An
         "max_ciod_risk": max(_num(process.get("ciod_risk")) for _, process in process_rows),
         "ciod_shadow_trigger_count": len(trigger_steps),
         "first_ciod_shadow_trigger_step": min(trigger_steps) if trigger_steps else None,
+        "ciod_risk_v1": _num(latest.get("ciod_risk_v1", latest.get("ciod_risk"))),
+        "ciod_shadow_trigger_v1": _truthy(latest.get("ciod_shadow_trigger_v1", latest.get("ciod_shadow_trigger"))),
+        "max_ciod_risk_v1": max(_num(process.get("ciod_risk_v1", process.get("ciod_risk"))) for _, process in process_rows),
+        "ciod_shadow_trigger_count_v1": len(trigger_steps_v1),
+        "first_ciod_shadow_trigger_step_v1": min(trigger_steps_v1) if trigger_steps_v1 else None,
+        "max_post_masked_exposure": max(_num(process.get("post_masked_exposure")) for _, process in process_rows),
+        "ciod_risk_v2": _num(latest.get("ciod_risk_v2")),
+        "ciod_shadow_trigger_v2": _truthy(latest.get("ciod_shadow_trigger_v2")),
+        "max_ciod_risk_v2": max(_num(process.get("ciod_risk_v2")) for _, process in process_rows),
+        "ciod_shadow_trigger_count_v2": len(trigger_steps_v2),
+        "first_ciod_shadow_trigger_step_v2": min(trigger_steps_v2) if trigger_steps_v2 else None,
+        "ciod_grid_summary": grid_summary,
     }
 
 
