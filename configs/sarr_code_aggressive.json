@@ -34,11 +34,11 @@
   },
   "generation": {
     "step_delimiters": ["\n\n"],
-    "max_new_tokens_per_step": 512,
+    "max_new_tokens_per_step": 256,
     "close_tag_lookahead_tokens": 16,
-    "think_token_budget": 12288,
+    "think_token_budget": 8192,
     "answer_token_budget": 4096,
-    "final_answer_generator": "llm",
+    "final_answer_generator": "active",
     "force_close_think_on_budget": true,
     "force_close_think_text": "\nWe are out of reliable reasoning budget. Stop reasoning now. Do not restart the solution after </think>. After </think>, give only the final answer using the strongest conclusion above; if uncertain, make the best concise guess.\n</think>\n\n"
   },
@@ -70,7 +70,7 @@
     "min_new_masked_mass_for_retrigger": 2.0,
     "min_new_exposure_for_retrigger": 4.0,
     "max_ciod_active_leases_per_problem": 1,
-    "enable_ciod_active_routing": false,
+    "enable_ciod_active_routing": true,
     "v1_lambda0": 0.002,
     "ciod_grid": [
       {"exposure_e0": 3.0, "lambda0": 0.003, "risk_threshold": 0.10},
@@ -109,7 +109,7 @@
   },
   "anchor": {
     "type": "clean_autonomy_anchor",
-    "refresh_condition": "slm_step_and_readiness_high_and_not_stagnation_suspect_and_slm_active",
+    "refresh_condition": "slm_step_and_slm_active",
     "freeze_on_hcs_suspect": true,
     "freeze_on_stagnation_suspect": true,
     "llm_steps_do_not_refresh": true,
@@ -118,15 +118,6 @@
   "routing": {
     "enabled": true
   },
-  "low_readiness": {
-    "useful_exploration_grace_steps": 2,
-    "persistent_low_after_grace_action": "llm_lease_no_rollback"
-  },
-  "confirmed_stagnation": {
-    "action": "rollback_to_clean_anchor_then_llm_lease",
-    "include_mid_readiness": true,
-    "max_rollbacks_per_problem": 2
-  },
   "llm_lease": {
     "enabled": true,
     "prompt_type": "normal_continuation",
@@ -134,17 +125,12 @@
     "mention_stagnation": false,
     "mention_repetition": false,
     "mention_error": false,
-    "persistent_uncertainty_steps": 2,
-    "confirmed_stagnation_steps": 3,
-    "low_conf_rollback_steps": 2,
-    "post_recovery_stabilization_steps": 1,
-    "max_tokens_per_step": 128,
-    "max_events_per_problem": 4,
-    "max_total_tokens_per_problem": 1024,
-    "return_to_slm": true
+    "max_tokens_per_step": 256,
+    "max_steps_per_event": 2,
+    "return_to_slm": false
   },
   "post_lease_observe": {
-    "observe_slm_blocks": 2,
+    "observe_slm_blocks": 0,
     "suppress_startup_rollback": true,
     "suppress_immediate_rollback": true
   },
@@ -164,11 +150,6 @@
     "max_llm_steps": 2,
     "max_tokens_per_step": 128,
     "return_to_slm_after_recovery": true
-  },
-  "low_confidence": {
-    "useful_exploration_grace_blocks": 2,
-    "collapse_patience_blocks": 3,
-    "action_after_patience": "existing_rollback_recovery"
   },
   "startup_guard": {
     "hcs_enabled": false,
@@ -191,7 +172,7 @@
     "M_max": 5,
     "recovery_max_policy": "m_plus_1",
     "confidence_gated_recovery": true,
-    "force_slm_after_recovery": true,
+    "force_slm_after_recovery": false,
     "long_span_policy": "fallback_once_then_rollback",
     "max_long_span_fallbacks_per_anchor": 1,
     "long_span_recovery_steps": 1,
@@ -211,10 +192,15 @@
   "budget": {
     "max_total_hcs_llm_tokens_per_problem": 512,
     "max_total_llm_recovery_tokens_per_problem": 1024,
-    "max_llm_lease_events_per_problem": 4,
-    "max_llm_lease_tokens_per_problem": 1024,
     "max_rollbacks_per_problem": 4,
     "max_stagnation_rollbacks_per_problem": 2
+  },
+  "routing_budget": {
+    "max_total_llm_events_per_problem": 8,
+    "max_total_llm_tokens_per_problem": 4096,
+    "max_ciod_events_per_problem": 1,
+    "max_readiness_events_per_problem": 0,
+    "max_stagnation_events_per_problem": 0
   },
   "logging": {
     "save_step_records": true,

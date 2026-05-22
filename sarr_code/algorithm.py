@@ -599,8 +599,6 @@ def _latest_clean_autonomy_anchor(records: list[StepRecord]) -> int | None:
             record.active
             and record.generator == "slm"
             and not record.is_recovery
-            and record.readiness_high
-            and not record.stagnation_suspect
             and not record.removed_by_rollback
         ):
             return record.step_id
@@ -635,16 +633,22 @@ def _lease_budget_exceeded(
     llm_lease_event_count: int,
     llm_lease_token_count: int,
     requested_steps: int,
+    route_source: str,
+    ciod_event_count: int = 0,
 ) -> bool:
     if not cfg.routing.enabled or not cfg.llm_lease.enabled:
         return True
     if requested_steps <= 0:
         return True
-    max_events = min(cfg.llm_lease.max_events_per_problem, cfg.budget.max_llm_lease_events_per_problem)
-    max_tokens = min(cfg.llm_lease.max_total_tokens_per_problem, cfg.budget.max_llm_lease_tokens_per_problem)
-    if llm_lease_event_count >= max_events:
+    if llm_lease_event_count >= cfg.routing_budget.max_total_llm_events_per_problem:
         return True
-    if llm_lease_token_count >= max_tokens:
+    if llm_lease_token_count >= cfg.routing_budget.max_total_llm_tokens_per_problem:
+        return True
+    if route_source == "ciod_event" and ciod_event_count >= cfg.routing_budget.max_ciod_events_per_problem:
+        return True
+    if route_source == "readiness" and cfg.routing_budget.max_readiness_events_per_problem <= 0:
+        return True
+    if route_source == "stagnation" and cfg.routing_budget.max_stagnation_events_per_problem <= 0:
         return True
     return False
 
@@ -655,8 +659,7 @@ def _lease_steps_within_budget(
     llm_lease_token_count: int,
     requested_steps: int,
 ) -> int:
-    max_tokens = min(cfg.llm_lease.max_total_tokens_per_problem, cfg.budget.max_llm_lease_tokens_per_problem)
-    remaining_tokens = max_tokens - llm_lease_token_count
+    remaining_tokens = cfg.routing_budget.max_total_llm_tokens_per_problem - llm_lease_token_count
     if remaining_tokens <= 0:
         return 0
     token_bounded_steps = remaining_tokens // cfg.llm_lease.max_tokens_per_step
@@ -901,11 +904,10 @@ def confidence_gated_recovery(
         )
         record.state_after = "RECOVERY"
         record.extra["recovery_step"] = recovery_idx
-        record.extra["ready_for_slm"] = record.readiness_high
+        record.extra["readiness_high_diagnostic_only"] = record.readiness_high
+        record.extra["ready_for_slm"] = False
         records.append(record)
         attempt_id += 1
-        if record.readiness_high:
-            return local_context, records, "SLM_READY", attempt_id
     return local_context, records, "EXHAUSTED_FORCE_SLM", attempt_id
 
 
@@ -981,8 +983,18 @@ def _append_final_answer(
     cfg: SARRConfig,
     confidence_process: dict[str, Any] | None = None,
 ) -> str | None:
-    engine = llm if cfg.generation.final_answer_generator == "llm" else slm
     account = cfg.generation.final_answer_generator
+    if account == "active":
+        last_generator = next(
+            (
+                str(row.get("generator"))
+                for row in reversed(step_logs)
+                if row.get("generator") in {"slm", "llm"} and not row.get("is_final_answer")
+            ),
+            "slm",
+        )
+        account = last_generator
+    engine = llm if account == "llm" else slm
     prefix = _final_answer_prefix(state.assistant_prefix_text)
     output = engine.generate_text(
         state.problem_text,
@@ -1114,8 +1126,6 @@ def run_sarr_code(
         if isinstance(confidence_snapshot, dict) and confidence_snapshot.get("ciod_event_shadow"):
             if record.action == "LLM_LEASE_BY_CIOD_EVENT":
                 record.extra["ciod_event_reason"] = "LLM_LEASE_BY_CIOD_EVENT"
-            elif record.action == "LLM_LEASE_BY_READINESS_LOW":
-                record.extra["ciod_event_reason"] = "LLM_LEASE_BY_READINESS_LOW"
             else:
                 record.extra["ciod_event_reason"] = "CIOD_EVENT_SHADOW_ONLY"
                 passive_actions = {
@@ -1125,7 +1135,8 @@ def run_sarr_code(
                     "USEFUL_EXPLORATION",
                     "LOW_CONFIDENCE_OBSERVE",
                     "SUSPECT_OBSERVE",
-                    "POST_LEASE_OBSERVE",
+                    "READINESS_LOW_DIAGNOSTIC_ONLY",
+                    "STAGNATION_DIAGNOSTIC_ONLY",
                 }
                 if record.action in passive_actions:
                     record.extra.setdefault("action_without_ciod_event", record.action)
@@ -1305,25 +1316,23 @@ def run_sarr_code(
 
             active_slm_steps = sum(1 for r in active_records if r.active and r.generator == "slm")
             if monitor_state == "STARTUP":
-                if record.readiness_high and startup_monitor_steps >= cfg.startup.B_min:
-                    transition_state(step_id, "SLM_ACTIVE", "STARTUP_SLM_READY")
+                if startup_monitor_steps >= cfg.startup.B_min:
+                    transition_state(step_id, "SLM_ACTIVE", "STARTUP_DIAGNOSTIC_WINDOW_COMPLETE")
                 elif active_slm_steps > int(cfg.startup.max_steps or cfg.startup.B_max):
                     transition_state(step_id, "SLM_ACTIVE", "STARTUP_MAX_STEPS_EXCEEDED")
 
             record.anchor_refresh_allowed = bool(
                 record.generator == "slm"
-                and record.readiness_high
-                and not record.stagnation_suspect
                 and monitor_state == "SLM_ACTIVE"
                 and record.active
             )
             if record.anchor_refresh_allowed:
                 clean_autonomy_anchor = step_id
+                stable_anchor = step_id
+                record.stable_anchor = stable_anchor
                 record.anchor_refresh_blocked_reason = None
                 if cfg.startup.never_reenter_after_clean_anchor and not ever_left_startup:
                     ever_left_startup = True
-            elif record.stagnation_suspect:
-                record.anchor_refresh_blocked_reason = "STAGNATION_SUSPECT"
             elif record.generator != "slm":
                 record.anchor_refresh_blocked_reason = "NOT_SLM_STEP"
             elif monitor_state == "ROLLBACK_RECOVERY" and recovery_context is not None:
@@ -1332,8 +1341,6 @@ def run_sarr_code(
                 record.anchor_refresh_blocked_reason = "STATE_RECOVERED_TO_SLM_ACTIVE"
             elif monitor_state != "SLM_ACTIVE":
                 record.anchor_refresh_blocked_reason = f"STATE_{monitor_state}"
-            elif not record.readiness_high:
-                record.anchor_refresh_blocked_reason = "READINESS_NOT_HIGH"
             else:
                 record.anchor_refresh_blocked_reason = "INACTIVE_STEP"
             record.clean_autonomy_anchor = clean_autonomy_anchor
@@ -1355,57 +1362,11 @@ def run_sarr_code(
                 record.autonomy_state = "NORMAL"
 
             if record.stagnation_confirmed:
-                if monitor_state == "POST_LEASE_OBSERVE" and cfg.post_lease_observe.suppress_immediate_rollback:
-                    record.action = "POST_LEASE_OBSERVE_STAGNATION_DEFERRED"
-                    record.extra["deferred_intervention"] = "CONFIRMED_STAGNATION"
-                elif (
-                    stagnation_rollback_count
-                    >= min(
-                        cfg.confirmed_stagnation.max_rollbacks_per_problem,
-                        cfg.budget.max_stagnation_rollbacks_per_problem,
-                        cfg.rollback.max_stagnation_rollbacks_per_problem,
-                    )
-                ):
-                    transition_state(step_id, "UNRECOVERABLE", "STAGNATION_ROLLBACK_LIMIT")
-                    record.action = "UNRECOVERABLE_STAGNATION"
-                    record.autonomy_state = "UNRECOVERABLE"
-                    record.state_after = monitor_state
-                    record.extra["stop_reason"] = "STAGNATION_ROLLBACK_LIMIT"
-                    record.extra["stagnation_rollback_count"] = stagnation_rollback_count
-                    append_record(record)
-                    stop_reason = "STAGNATION_ROLLBACK_LIMIT"
-                    break
-                elif total_rollback_count >= min(cfg.rollback.max_rollbacks_per_problem, cfg.budget.max_rollbacks_per_problem):
-                    transition_state(step_id, "UNRECOVERABLE", "ROLLBACK_LIMIT")
-                    record.action = "UNRECOVERABLE_ROLLBACK_LIMIT"
-                    record.state_after = monitor_state
-                    record.extra["stop_reason"] = "ROLLBACK_LIMIT"
-                    append_record(record)
-                    stop_reason = "ROLLBACK_LIMIT"
-                    break
-                else:
-                    should_rollback = True
-                    is_stagnation_rollback = True
-                    is_hcs_rollback = bool(record.hcs_suspect)
-                    rollback_type = "STAGNATION_ROLLBACK"
-                    rollback_reason = "CONFIRMED_STAGNATION"
-                    anchor = _rollback_anchor_for_stagnation(active_records, clean_autonomy_anchor, cfg)
-                    lease_reason = "CONFIRMED_STAGNATION"
-                    lease_steps = cfg.llm_lease.confirmed_stagnation_steps
-                    lease_rollback_before = True
-                    record.action = "CONFIRMED_STAGNATION_ROLLBACK"
-                    record.extra["clean_anchor_step"] = clean_autonomy_anchor
-                    record.extra["rollback_anchor"] = anchor
-
-            if not should_rollback and monitor_state == "POST_LEASE_OBSERVE":
-                post_lease_observe_remaining = max(0, post_lease_observe_remaining - 1)
-                record.action = record.action if record.action != "TRUST" else "POST_LEASE_OBSERVE"
-                record.extra["post_lease_observe_remaining"] = post_lease_observe_remaining
-                if post_lease_observe_remaining <= 0:
-                    transition_state(step_id, "SLM_ACTIVE", "POST_LEASE_OBSERVE_FINISHED")
-                record.state_after = monitor_state
-                append_record(record)
-                continue
+                record.extra["stagnation_routing_source"] = "STAGNATION_DIAGNOSTIC_ONLY"
+                record.extra["stagnation_diagnostic_only"] = True
+                record.extra["routing_source"] = "STAGNATION_DIAGNOSTIC_ONLY"
+                if record.action == "TRUST":
+                    record.action = "STAGNATION_DIAGNOSTIC_ONLY"
 
             confidence_snapshot = record.extra.get("confidence_process", {})
             ciod_event_shadow = bool(
@@ -1421,46 +1382,22 @@ def run_sarr_code(
                 record.extra["ciod_event_active_routing_enabled"] = cfg.confidence_process.enable_ciod_active_routing
                 if not cfg.confidence_process.enable_ciod_active_routing:
                     record.extra["ciod_event_routing_decision"] = "CIOD_EVENT_SHADOW_ONLY"
-                elif record.readiness_low:
-                    record.extra["ciod_event_routing_decision"] = "CIOD_EVENT_DEFER_TO_READINESS_LOW"
                 elif not confidence_process.ciod_active_route_available():
                     record.extra["ciod_event_routing_decision"] = "CIOD_EVENT_ACTIVE_LEASE_LIMIT"
                 elif not (cfg.routing.enabled and cfg.llm_lease.enabled):
                     record.extra["ciod_event_routing_decision"] = "CIOD_EVENT_ROUTING_DISABLED"
                 else:
                     lease_reason = "LLM_LEASE_BY_CIOD_EVENT"
-                    lease_steps = cfg.llm_lease.persistent_uncertainty_steps
+                    lease_steps = cfg.llm_lease.max_steps_per_event
                     lease_rollback_before = False
                     lease_source = "ciod_event"
                     record.action = "LLM_LEASE_BY_CIOD_EVENT"
                     record.autonomy_state = "CIOD_EVENT"
                     record.extra["ciod_event_routing_decision"] = "LLM_LEASE_BY_CIOD_EVENT"
 
-            if not should_rollback and lease_reason is None and record.readiness_high and not record.stagnation_suspect:
-                if monitor_state == "STARTUP":
-                    transition_state(step_id, "SLM_ACTIVE", "STARTUP_SLM_READY")
-                stable_anchor = step_id
-                D_start = 0
-                D_post = 0
-                D_suspect = 0
-                low_confidence_run = 0
-                readiness_low_run = 0
-                suspect_anchor = None
-                suspect_start_step = None
-                suspect_steps = 0
-                suspect_max_readiness = None
-                if pending_force_recovery_event_idx is not None:
-                    rollback_events[pending_force_recovery_event_idx].force_slm_after_recovery_failed = False
-                    pending_force_recovery_event_idx = None
-                record.action = "SUSPECT_RECOVERED" if state_before == "SUSPECT" else "REFRESH_STABLE_ANCHOR"
-                record.state_after = monitor_state
-                record.D_start = D_start
-                record.D_post = D_post
-                record.stable_anchor = stable_anchor
-                if state_before == "SUSPECT":
-                    record.extra["suspect_recovered"] = True
-                append_record(record)
-                continue
+            if not should_rollback and lease_reason is None and record.anchor_refresh_allowed:
+                if record.action == "TRUST":
+                    record.action = "REFRESH_STABLE_ANCHOR"
 
             v = 0
             if len(readiness_history) >= 2:
@@ -1474,30 +1411,7 @@ def run_sarr_code(
             if monitor_state == "STARTUP":
                 D_start += v
                 record.D_start = D_start
-                startup_rollback_suppressed = bool(
-                    ever_left_startup and cfg.post_lease_observe.suppress_startup_rollback
-                )
-                if (
-                    not startup_rollback_suppressed
-                    and startup_monitor_steps >= cfg.startup.B_min
-                    and D_start >= cfg.startup.tau_start
-                ):
-                    should_rollback = True
-                    rollback_type = "STARTUP_ROLLBACK"
-                    rollback_reason = "STARTUP_DEGENERATION"
-                if not startup_rollback_suppressed and startup_monitor_steps >= cfg.startup.B_max:
-                    should_rollback = True
-                    rollback_type = "STARTUP_ROLLBACK"
-                    rollback_reason = "STARTUP_NOT_STABLE_WITHIN_BUDGET"
-                if startup_rollback_suppressed:
-                    record.extra["startup_rollback_suppressed"] = True
-                    transition_state(step_id, "SLM_ACTIVE", "STARTUP_ROLLBACK_SUPPRESSED_AFTER_LEASE")
-                if should_rollback:
-                    if pending_force_recovery_event_idx is not None:
-                        rollback_events[pending_force_recovery_event_idx].force_slm_after_recovery_failed = True
-                        pending_force_recovery_event_idx = None
-                    anchor = choose_best_prefix_anchor(active_records, allow_zero=True)
-                    record.action = rollback_reason
+                record.extra["startup_degradation_diagnostic_only"] = bool(v)
             elif monitor_state == "SLM_ACTIVE" and lease_reason is None:
                 D_post += v
                 record.D_post = D_post
@@ -1512,99 +1426,24 @@ def run_sarr_code(
                     readiness_low_run = 0
                 record.extra["low_confidence_run"] = low_confidence_run
                 record.extra["readiness_low_run"] = readiness_low_run
-                record.extra["useful_exploration_grace_steps"] = cfg.low_readiness.useful_exploration_grace_steps
-                record.extra["useful_exploration_grace_blocks"] = cfg.low_confidence.useful_exploration_grace_blocks
-                record.extra["collapse_patience_blocks"] = cfg.low_confidence.collapse_patience_blocks
-                if record.readiness_low and readiness_low_run <= cfg.low_readiness.useful_exploration_grace_steps:
-                    record.action = "USEFUL_EXPLORATION"
-                    record.autonomy_state = "USEFUL_EXPLORATION"
-                elif (
-                    record.readiness_low
-                    and readiness_low_run > cfg.low_readiness.useful_exploration_grace_steps
-                    and not record.stagnation_confirmed
-                    and cfg.routing.enabled
-                    and cfg.llm_lease.enabled
-                    and not _lease_budget_exceeded(
-                        cfg=cfg,
-                        llm_lease_event_count=llm_lease_event_count,
-                        llm_lease_token_count=llm_lease_token_count,
-                        requested_steps=cfg.llm_lease.persistent_uncertainty_steps,
-                    )
-                ):
-                    lease_reason = "LLM_LEASE_BY_READINESS_LOW"
-                    lease_steps = cfg.llm_lease.persistent_uncertainty_steps
-                    lease_rollback_before = False
-                    lease_source = "readiness_low"
-                    record.action = "LLM_LEASE_BY_READINESS_LOW"
-                elif (
-                    low_confidence_signal
-                    and low_confidence_run <= cfg.low_confidence.useful_exploration_grace_blocks
-                ):
-                    record.action = "USEFUL_EXPLORATION"
-                    record.autonomy_state = "USEFUL_EXPLORATION"
-                elif low_confidence_signal and low_confidence_run < cfg.low_confidence.collapse_patience_blocks:
-                    record.action = "LOW_CONFIDENCE_OBSERVE"
-                    record.autonomy_state = "LOW_CONFIDENCE_OBSERVE"
-                elif low_confidence_signal and D_post >= cfg.stable.tau_D:
-                    if cfg.rollback.post_stable_intervention_policy == "suspect_confirmed_rollback":
-                        transition_state(step_id, "SUSPECT", "CONFIDENCE_DEGENERATION_SUSPECT")
-                        suspect_anchor = stable_anchor if stable_anchor is not None else 0
-                        suspect_start_step = step_id
-                        suspect_steps = 0
-                        D_suspect = 0
-                        suspect_max_readiness = readiness
-                        record.action = "ENTER_SUSPECT"
-                        record.extra["suspect_anchor"] = suspect_anchor
-                        record.extra["suspect_start_step"] = suspect_start_step
-                    else:
-                        should_rollback = True
-                        rollback_type = "POST_STABLE_ROLLBACK"
-                        rollback_reason = "POST_STABLE_DEGENERATION"
-                        anchor = stable_anchor if stable_anchor is not None else 0
-                        record.action = "POST_STABLE_ROLLBACK"
-                        lease_reason = "LOW_CONF_ROLLBACK_RECOVERY"
-                        lease_steps = cfg.llm_lease.low_conf_rollback_steps
-                        lease_rollback_before = True
+                if record.readiness_low:
+                    record.extra["readiness_routing_source"] = "READINESS_LOW_DIAGNOSTIC_ONLY"
+                    record.extra["readiness_diagnostic_only"] = True
+                    if record.action in {"TRUST", "REFRESH_STABLE_ANCHOR"}:
+                        record.action = "READINESS_LOW_DIAGNOSTIC_ONLY"
+                    record.extra.setdefault("routing_source", "READINESS_LOW_DIAGNOSTIC_ONLY")
+                if record.stagnation_confirmed:
+                    record.extra["stagnation_routing_source"] = "STAGNATION_DIAGNOSTIC_ONLY"
+                    record.extra["stagnation_diagnostic_only"] = True
+                    record.extra["routing_source"] = "STAGNATION_DIAGNOSTIC_ONLY"
+                    if record.action in {"TRUST", "REFRESH_STABLE_ANCHOR", "READINESS_LOW_DIAGNOSTIC_ONLY"}:
+                        record.action = "STAGNATION_DIAGNOSTIC_ONLY"
+                if low_confidence_signal:
+                    record.extra["low_confidence_diagnostic_only"] = True
             elif monitor_state == "SUSPECT":
-                suspect_steps += 1
-                D_suspect += v
-                suspect_max_readiness = (
-                    readiness
-                    if suspect_max_readiness is None
-                    else max(float(suspect_max_readiness), float(readiness or 0.0))
-                )
-                record.extra["suspect_anchor"] = suspect_anchor
-                record.extra["suspect_start_step"] = suspect_start_step
-                record.extra["suspect_steps"] = suspect_steps
-                record.extra["D_suspect"] = D_suspect
-                confirmed_by_trend = (
-                    suspect_steps >= cfg.rollback.suspect_confirm_steps
-                    and D_suspect >= cfg.rollback.tau_confirm
-                )
-                confirmed_by_timeout = (
-                    suspect_steps >= cfg.rollback.suspect_max_steps
-                    and (
-                        suspect_max_readiness is None
-                        or suspect_max_readiness < cfg.readiness.high_threshold
-                    )
-                )
-                if confirmed_by_trend or confirmed_by_timeout:
-                    should_rollback = True
-                    rollback_type = "POST_STABLE_ROLLBACK"
-                    rollback_reason = (
-                        "POST_STABLE_CONFIRMED_DEGENERATION"
-                        if confirmed_by_trend
-                        else "POST_STABLE_SUSPECT_TIMEOUT"
-                    )
-                    anchor = suspect_anchor if suspect_anchor is not None else 0
-                    record.action = rollback_reason
-                    record.extra["confirmed_by_trend"] = confirmed_by_trend
-                    record.extra["confirmed_by_timeout"] = confirmed_by_timeout
-                    lease_reason = "LOW_CONF_ROLLBACK_RECOVERY"
-                    lease_steps = cfg.llm_lease.low_conf_rollback_steps
-                    lease_rollback_before = True
-                else:
-                    record.action = "SUSPECT_OBSERVE"
+                record.extra["suspect_diagnostic_only"] = True
+                if record.action == "TRUST":
+                    record.action = "SUSPECT_DIAGNOSTIC_ONLY"
 
             record.state_after = monitor_state
             append_record(record)
@@ -1615,6 +1454,7 @@ def run_sarr_code(
             current_step_id = len(active_records)
             if lease_reason is not None and not should_rollback:
                 record.extra["lease_source"] = lease_source
+                record.extra["routing_source"] = lease_reason
                 lease_steps = _lease_steps_within_budget(
                     cfg=cfg,
                     llm_lease_token_count=llm_lease_token_count,
@@ -1625,11 +1465,14 @@ def run_sarr_code(
                     llm_lease_event_count=llm_lease_event_count,
                     llm_lease_token_count=llm_lease_token_count,
                     requested_steps=lease_steps,
+                    route_source=lease_source or "",
+                    ciod_event_count=confidence_process.ciod_active_lease_count,
                 ):
                     if lease_source == "ciod_event":
                         record.extra["ciod_event_routing_decision"] = "CIOD_EVENT_ROUTING_BUDGET_EXCEEDED"
                     record.action = "ROUTING_BUDGET_EXCEEDED_CONTINUE_SLM"
                     record.extra["routing_budget_exceeded"] = True
+                    record.extra["routing_source"] = "ROUTING_BUDGET_EXCEEDED"
                     recovery_context = None
                     transition_state(current_step_id, "SLM_ACTIVE", "ROUTING_BUDGET_EXCEEDED_CONTINUE_SLM")
                     record.state_after = monitor_state
@@ -1682,7 +1525,7 @@ def run_sarr_code(
                     recovery_max_steps=lease_steps,
                     recovery_actual_steps=len(lease_records),
                     recovery_c_norm=[],
-                    force_next_step_slm=cfg.llm_lease.return_to_slm,
+                    force_next_step_slm=False,
                     event="llm_lease",
                     rollback_before_lease=False,
                     rollback_anchor=None,
@@ -1693,14 +1536,14 @@ def run_sarr_code(
                     mention_stagnation=cfg.llm_lease.mention_stagnation,
                     mention_repetition=cfg.llm_lease.mention_repetition,
                     mention_error=cfg.llm_lease.mention_error,
-                    return_to_slm=cfg.llm_lease.return_to_slm,
-                    state_after="POST_LEASE_OBSERVE",
+                    return_to_slm=False,
+                    state_after="SLM_ACTIVE",
                 )
                 rollback_events.append(event)
                 state.trace.append(TraceEvent(current_step_id, "llm_lease", asdict(event)))
-                transition_state(state.step_count, "POST_LEASE_OBSERVE", "LEASE_FINISHED")
-                post_lease_observe_remaining = cfg.post_lease_observe.observe_slm_blocks
-                force_next_step_slm = cfg.llm_lease.return_to_slm
+                transition_state(state.step_count, "SLM_ACTIVE", "LEASE_FINISHED")
+                post_lease_observe_remaining = 0
+                force_next_step_slm = False
                 ever_left_startup = True
                 hcs_suspect_run = 0
                 stagnation_suspect_run = 0
@@ -1724,9 +1567,12 @@ def run_sarr_code(
                 llm_lease_event_count=llm_lease_event_count,
                 llm_lease_token_count=llm_lease_token_count,
                 requested_steps=lease_steps,
+                route_source=lease_source or "",
+                ciod_event_count=confidence_process.ciod_active_lease_count,
             ):
                 record.action = "ROUTING_BUDGET_EXCEEDED_CONTINUE_SLM"
                 record.extra["routing_budget_exceeded"] = True
+                record.extra["routing_source"] = "ROUTING_BUDGET_EXCEEDED"
                 recovery_context = None
                 transition_state(current_step_id, "SLM_ACTIVE", "ROUTING_BUDGET_EXCEEDED_CONTINUE_SLM")
                 D_suspect = 0
@@ -1893,7 +1739,7 @@ def run_sarr_code(
                 )
 
             new_active_records = kept + rec_records
-            recovery_state_after = "POST_LEASE_OBSERVE" if lease_reason is not None else "SLM_ACTIVE"
+            recovery_state_after = "SLM_ACTIVE"
             if rec_records and (lease_reason is not None or rec_stop_reason in RECOVERY_COMPLETE_TO_SLM):
                 rec_records[-1].state_after = recovery_state_after
                 rec_records[-1].extra["recovery_terminal_state_after"] = recovery_state_after
@@ -1993,9 +1839,7 @@ def run_sarr_code(
 
             transition_state(state.step_count, recovery_state_after, "LEASE_FINISHED" if lease_reason is not None else rec_stop_reason)
             recovery_context = None
-            post_lease_observe_remaining = (
-                cfg.post_lease_observe.observe_slm_blocks if recovery_state_after == "POST_LEASE_OBSERVE" else 0
-            )
+            post_lease_observe_remaining = 0
             ever_left_startup = True
             D_start = 0
             D_post = 0

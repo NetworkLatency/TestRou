@@ -33,7 +33,7 @@ class GenerationConfig:
     close_tag_lookahead_tokens: int = 16
     think_token_budget: int = 8192
     answer_token_budget: int = 2048
-    final_answer_generator: str = "llm"
+    final_answer_generator: str = "active"
     force_close_think_on_budget: bool = True
     force_close_think_text: str = (
         "\nWe are out of reliable reasoning budget. Stop reasoning now. "
@@ -50,8 +50,8 @@ class GenerationConfig:
             raise ValueError("generation.think_token_budget must be >= 1")
         if self.answer_token_budget < 1:
             raise ValueError("generation.answer_token_budget must be >= 1")
-        if self.final_answer_generator not in {"slm", "llm"}:
-            raise ValueError("generation.final_answer_generator must be 'slm' or 'llm'")
+        if self.final_answer_generator not in {"slm", "llm", "active"}:
+            raise ValueError("generation.final_answer_generator must be 'slm', 'llm', or 'active'")
 
 
 @dataclass
@@ -251,7 +251,7 @@ class StagnationConfig:
 @dataclass
 class AnchorConfig:
     type: str = "clean_autonomy_anchor"
-    refresh_condition: str = "slm_step_and_readiness_high_and_not_stagnation_suspect_and_slm_active"
+    refresh_condition: str = "slm_step_and_slm_active"
     freeze_on_hcs_suspect: bool = True
     freeze_on_stagnation_suspect: bool = True
     llm_steps_do_not_refresh: bool = True
@@ -260,14 +260,8 @@ class AnchorConfig:
     def __post_init__(self) -> None:
         if self.type != "clean_autonomy_anchor":
             raise ValueError("anchor.type must be 'clean_autonomy_anchor'")
-        if self.refresh_condition not in {
-            "raw_readiness_high_and_not_hcs_suspect",
-            "slm_step_and_readiness_high_and_not_stagnation_suspect_and_slm_active",
-        }:
-            raise ValueError(
-                "anchor.refresh_condition must be "
-                "'slm_step_and_readiness_high_and_not_stagnation_suspect_and_slm_active'"
-            )
+        if self.refresh_condition != "slm_step_and_slm_active":
+            raise ValueError("anchor.refresh_condition must be 'slm_step_and_slm_active'")
         if self.fallback not in {"startup_anchor_or_zero", "zero"}:
             raise ValueError("anchor.fallback must be 'startup_anchor_or_zero' or 'zero'")
 
@@ -314,14 +308,9 @@ class LLMLeaseConfig:
     mention_stagnation: bool = False
     mention_repetition: bool = False
     mention_error: bool = False
-    persistent_uncertainty_steps: int = 2
-    confirmed_stagnation_steps: int = 3
-    low_conf_rollback_steps: int = 2
-    post_recovery_stabilization_steps: int = 1
-    max_tokens_per_step: int = 128
-    max_events_per_problem: int = 4
-    max_total_tokens_per_problem: int = 1024
-    return_to_slm: bool = True
+    max_tokens_per_step: int = 256
+    max_steps_per_event: int = 2
+    return_to_slm: bool = False
 
     def __post_init__(self) -> None:
         if self.prompt_type != "normal_continuation":
@@ -329,23 +318,20 @@ class LLMLeaseConfig:
         if self.mention_uncertainty or self.mention_stagnation or self.mention_repetition or self.mention_error:
             raise ValueError("LLM lease prompts must not mention uncertainty, stagnation, repetition, or errors")
         for name in [
-            "persistent_uncertainty_steps",
-            "confirmed_stagnation_steps",
-            "low_conf_rollback_steps",
-            "post_recovery_stabilization_steps",
             "max_tokens_per_step",
-            "max_events_per_problem",
-            "max_total_tokens_per_problem",
+            "max_steps_per_event",
         ]:
             if getattr(self, name) < 0:
                 raise ValueError(f"llm_lease.{name} must be >= 0")
         if self.max_tokens_per_step < 1:
             raise ValueError("llm_lease.max_tokens_per_step must be >= 1")
+        if self.max_steps_per_event < 1:
+            raise ValueError("llm_lease.max_steps_per_event must be >= 1")
 
 
 @dataclass
 class PostLeaseObserveConfig:
-    observe_slm_blocks: int = 2
+    observe_slm_blocks: int = 0
     suppress_startup_rollback: bool = True
     suppress_immediate_rollback: bool = True
 
@@ -426,8 +412,6 @@ class StartupGuardConfig:
 class BudgetConfig:
     max_total_hcs_llm_tokens_per_problem: int = 512
     max_total_llm_recovery_tokens_per_problem: int = 1024
-    max_llm_lease_events_per_problem: int = 4
-    max_llm_lease_tokens_per_problem: int = 1024
     max_rollbacks_per_problem: int = 4
     max_stagnation_rollbacks_per_problem: int = 2
 
@@ -436,14 +420,30 @@ class BudgetConfig:
             raise ValueError("budget.max_total_hcs_llm_tokens_per_problem must be >= 0")
         if self.max_total_llm_recovery_tokens_per_problem < 0:
             raise ValueError("budget.max_total_llm_recovery_tokens_per_problem must be >= 0")
-        if self.max_llm_lease_events_per_problem < 0:
-            raise ValueError("budget.max_llm_lease_events_per_problem must be >= 0")
-        if self.max_llm_lease_tokens_per_problem < 0:
-            raise ValueError("budget.max_llm_lease_tokens_per_problem must be >= 0")
         if self.max_rollbacks_per_problem < 0:
             raise ValueError("budget.max_rollbacks_per_problem must be >= 0")
         if self.max_stagnation_rollbacks_per_problem < 0:
             raise ValueError("budget.max_stagnation_rollbacks_per_problem must be >= 0")
+
+
+@dataclass
+class RoutingBudgetConfig:
+    max_total_llm_events_per_problem: int = 8
+    max_total_llm_tokens_per_problem: int = 4096
+    max_ciod_events_per_problem: int = 1
+    max_readiness_events_per_problem: int = 0
+    max_stagnation_events_per_problem: int = 0
+
+    def __post_init__(self) -> None:
+        for name in [
+            "max_total_llm_events_per_problem",
+            "max_total_llm_tokens_per_problem",
+            "max_ciod_events_per_problem",
+            "max_readiness_events_per_problem",
+            "max_stagnation_events_per_problem",
+        ]:
+            if getattr(self, name) < 0:
+                raise ValueError(f"routing_budget.{name} must be >= 0")
 
 
 @dataclass
@@ -485,7 +485,7 @@ class RollbackConfig:
     M_max: int = 5
     recovery_max_policy: str = "m_plus_1"
     confidence_gated_recovery: bool = True
-    force_slm_after_recovery: bool = True
+    force_slm_after_recovery: bool = False
     long_span_policy: str = "fallback_once_then_rollback"
     max_long_span_fallbacks_per_anchor: int = 1
     long_span_recovery_steps: int = 1
@@ -593,6 +593,7 @@ class SARRConfig:
     stable: StableConfig = field(default_factory=StableConfig)
     rollback: RollbackConfig = field(default_factory=RollbackConfig)
     budget: BudgetConfig = field(default_factory=BudgetConfig)
+    routing_budget: RoutingBudgetConfig = field(default_factory=RoutingBudgetConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
@@ -634,6 +635,7 @@ class SARRConfig:
             ("stable", StableConfig),
             ("rollback", RollbackConfig),
             ("budget", BudgetConfig),
+            ("routing_budget", RoutingBudgetConfig),
             ("logging", LoggingConfig),
             ("runtime", RuntimeConfig),
         ]:

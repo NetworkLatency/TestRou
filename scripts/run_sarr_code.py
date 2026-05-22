@@ -483,8 +483,9 @@ def raise_csv_field_limit() -> None:
 
 def main() -> None:
     raise_csv_field_limit()
-    parser = argparse.ArgumentParser(description="Run SARR-CoDE state-aware routing with confirmed-stagnation rollback.")
+    parser = argparse.ArgumentParser(description="Run SARR-CoDE with CI-OD event controlled LLM leases.")
     parser.add_argument("--config", required=True, help="Path to SARRConfig JSON.")
+    parser.add_argument("--mode", default="run", choices=["run"], help="Compatibility flag; only run mode is supported.")
     parser.add_argument("--dataset", default="aime25", choices=["math500", "aime24", "aime25", "gpqa", "gpqa_diamond"])
     parser.add_argument("--max-problems", type=int, default=None)
     parser.add_argument("--output-root", default=None)

@@ -17,6 +17,7 @@ from sarr_code.config import (
     ModelRuntimeConfig,
     ReadinessConfig,
     RollbackConfig,
+    RoutingBudgetConfig,
     RoutingConfig,
     RuntimeConfig,
     SARRConfig,
@@ -70,6 +71,7 @@ def make_cfg() -> SARRConfig:
             max_new_tokens_per_step=32,
             think_token_budget=512,
             answer_token_budget=64,
+            final_answer_generator="llm",
             force_close_think_on_budget=True,
         ),
         confidence=ConfidenceConfig(
@@ -105,7 +107,7 @@ class SARRCodeTests(unittest.TestCase):
         self.assertEqual(choose_best_prefix_anchor(records), 2)
         self.assertEqual(choose_best_prefix_anchor([records[0]]), 0)
 
-    def test_run_sarr_code_rolls_back_and_recovers(self):
+    def test_run_sarr_code_keeps_low_confidence_as_diagnostic(self):
         cfg = make_cfg()
         slm = FakeEngine(
             outputs=[
@@ -116,7 +118,7 @@ class SARRCodeTests(unittest.TestCase):
             ],
             confidences=[0.5, 0.6, 0.3, 0.8, 0.8],
         )
-        llm = FakeEngine(outputs=["recovered\n\n", "Final answer: 42."])
+        llm = FakeEngine(outputs=["Final answer: 42."])
 
         result, steps, rollbacks, transitions = run_sarr_code(
             problem_id="p1",
@@ -127,18 +129,11 @@ class SARRCodeTests(unittest.TestCase):
         )
 
         self.assertEqual(result.answer, "42")
-        self.assertEqual(len(rollbacks), 1)
-        self.assertEqual(rollbacks[0]["type"], "STARTUP_ROLLBACK")
-        self.assertEqual(rollbacks[0]["anchor_step"], 2)
-        self.assertEqual(rollbacks[0]["rollback_span"], 1)
-        self.assertEqual(rollbacks[0]["stop_reason"], "SLM_READY")
-        removed = [row for row in steps if row["removed_by_rollback"]]
-        self.assertEqual(len(removed), 1)
-        self.assertEqual(removed[0]["text"], "bad\n\n")
-        self.assertTrue(any(row["transition_type"] == "slm->llm" for row in steps))
+        self.assertEqual(rollbacks, [])
+        self.assertFalse(any(row["removed_by_rollback"] for row in steps))
+        self.assertTrue(any(row["action"] == "READINESS_LOW_DIAGNOSTIC_ONLY" for row in steps))
         self.assertTrue(transitions)
-        self.assertIn("recovered", result.state.assistant_prefix_text)
-        self.assertNotIn("bad\n\nrecovered", result.state.assistant_prefix_text)
+        self.assertIn("bad", result.state.assistant_prefix_text)
 
     def test_close_think_step_skips_confidence_forward(self):
         cfg = make_cfg()
@@ -185,11 +180,11 @@ class SARRCodeTests(unittest.TestCase):
         self.assertEqual(result.answer, "42")
         self.assertEqual(len(rollbacks), 0)
         self.assertFalse(any(row["removed_by_rollback"] for row in steps))
-        self.assertTrue(any(row["action"] == "USEFUL_EXPLORATION" for row in steps))
+        self.assertTrue(any(row["action"] == "READINESS_LOW_DIAGNOSTIC_ONLY" for row in steps))
         self.assertTrue(any(row["action"] == "REFRESH_STABLE_ANCHOR" for row in steps))
         self.assertIn("correct-but-low-confidence", result.state.assistant_prefix_text)
 
-    def test_persistent_low_readiness_triggers_llm_lease_without_rollback(self):
+    def test_persistent_low_readiness_is_diagnostic_only(self):
         cfg = SARRConfig(
             slm=ModelRuntimeConfig(model_path="unused", backend="transformers"),
             llm=ModelRuntimeConfig(model_path="unused", backend="openai", api_base_url="http://127.0.0.1:8000/v1"),
@@ -197,6 +192,7 @@ class SARRCodeTests(unittest.TestCase):
                 max_new_tokens_per_step=32,
                 think_token_budget=512,
                 answer_token_budget=64,
+                final_answer_generator="llm",
             ),
             confidence=ConfidenceConfig(
                 topk_entropy=20,
@@ -208,7 +204,7 @@ class SARRCodeTests(unittest.TestCase):
             stable=StableConfig(theta_s=0.70, tau_D=1),
             readiness=ReadinessConfig(smooth_window=1),
             low_readiness=LowReadinessConfig(useful_exploration_grace_steps=1),
-            llm_lease=LLMLeaseConfig(persistent_uncertainty_steps=2, max_tokens_per_step=16),
+            llm_lease=LLMLeaseConfig(max_steps_per_event=2, max_tokens_per_step=16),
             rollback=RollbackConfig(M_max=5),
             low_confidence=LowConfidenceConfig(useful_exploration_grace_blocks=0, collapse_patience_blocks=1),
             runtime=RuntimeConfig(max_model_len=4096),
@@ -230,7 +226,7 @@ class SARRCodeTests(unittest.TestCase):
                 0.8,
             ],
         )
-        llm = FakeEngine(outputs=["lease-a\n\n", "lease-b\n\n", "Final answer: 42."])
+        llm = FakeEngine(outputs=["Final answer: 42."])
 
         result, steps, rollbacks, _ = run_sarr_code(
             problem_id="suspect-confirm",
@@ -241,16 +237,15 @@ class SARRCodeTests(unittest.TestCase):
         )
 
         self.assertEqual(result.answer, "42")
-        self.assertEqual(len(rollbacks), 1)
-        self.assertEqual(rollbacks[0]["event"], "llm_lease")
-        self.assertEqual(rollbacks[0]["type"], "LLM_LEASE")
-        self.assertEqual(rollbacks[0]["reason"], "LLM_LEASE_BY_READINESS_LOW")
-        self.assertFalse(rollbacks[0]["rollback_before_lease"])
-        self.assertEqual(rollbacks[0]["recovery_actual_steps"], 2)
+        self.assertEqual(rollbacks, [])
         self.assertFalse(any(row["removed_by_rollback"] for row in steps))
-        self.assertIn("bad-a\n\nbad-b\n\nlease-a", result.state.assistant_prefix_text)
+        low_rows = [row for row in steps if row["action"] == "READINESS_LOW_DIAGNOSTIC_ONLY"]
+        self.assertTrue(low_rows)
+        self.assertTrue(all(row["extra"]["readiness_diagnostic_only"] for row in low_rows))
+        self.assertFalse(any(row["generator"] == "llm" and not row.get("is_final_answer") for row in steps))
+        self.assertIn("bad-a\n\nbad-b\n\n", result.state.assistant_prefix_text)
 
-    def test_hcs_confirmed_rolls_back_to_clean_anchor_with_normal_recovery(self):
+    def test_hcs_confirmed_is_diagnostic_only(self):
         cfg = SARRConfig(
             slm=ModelRuntimeConfig(model_path="unused", backend="transformers"),
             llm=ModelRuntimeConfig(model_path="unused", backend="openai", api_base_url="http://127.0.0.1:8000/v1"),
@@ -258,6 +253,7 @@ class SARRCodeTests(unittest.TestCase):
                 max_new_tokens_per_step=64,
                 think_token_budget=1024,
                 answer_token_budget=64,
+                final_answer_generator="llm",
             ),
             confidence=ConfidenceConfig(
                 topk_entropy=20,
@@ -276,7 +272,7 @@ class SARRCodeTests(unittest.TestCase):
             ),
             hcs=HCSConfig(enabled=True, suspect_patience=3, max_hcs_rollbacks_per_problem=2),
             hcs_recovery=HCSRecoveryConfig(max_llm_steps=2, max_tokens_per_step=16),
-            llm_lease=LLMLeaseConfig(confirmed_stagnation_steps=3, max_tokens_per_step=16),
+            llm_lease=LLMLeaseConfig(max_steps_per_event=2, max_tokens_per_step=16),
             rollback=RollbackConfig(M_max=1, anchor_repeat_policy="suppress"),
             runtime=RuntimeConfig(max_model_len=4096),
         )
@@ -291,14 +287,7 @@ class SARRCodeTests(unittest.TestCase):
             ],
             confidences=[0.9, 0.9, 0.9, 0.9, 0.8, 0.8],
         )
-        llm = FakeEngine(
-            outputs=[
-                "ordinary continuation\n\n",
-                "second continuation\n\n",
-                "third continuation\n\n",
-                "Final answer: 42.",
-            ]
-        )
+        llm = FakeEngine(outputs=["Final answer: 42."])
 
         result, steps, rollbacks, _ = run_sarr_code(
             problem_id="hcs",
@@ -309,39 +298,27 @@ class SARRCodeTests(unittest.TestCase):
         )
 
         self.assertEqual(result.answer, "42")
-        self.assertEqual(len(rollbacks), 1)
-        rollback = rollbacks[0]
-        self.assertEqual(rollback["event"], "llm_lease")
-        self.assertEqual(rollback["type"], "STAGNATION_ROLLBACK")
-        self.assertEqual(rollback["reason"], "CONFIRMED_STAGNATION")
-        self.assertTrue(rollback["rollback_before_lease"])
-        self.assertEqual(rollback["readiness_source"], "raw")
-        self.assertFalse(rollback["calibration_enabled"])
-        self.assertEqual(rollback["anchor_step"], 1)
-        self.assertEqual(rollback["clean_anchor_step"], 1)
-        self.assertEqual(rollback["rollback_span"], 3)
-        self.assertEqual(rollback["hcs_rollback_count"], 1)
-        self.assertEqual(rollback["llm_recovery_prompt_type"], "normal_continuation")
-        self.assertFalse(rollback["mention_stagnation"])
-        self.assertTrue(rollback["return_to_slm"])
-        self.assertEqual(rollback["recovery_actual_steps"], 3)
+        self.assertEqual(rollbacks, [])
 
         suspect_rows = [row for row in steps if row["hcs_suspect"]]
         self.assertEqual(len(suspect_rows), 3)
-        self.assertFalse(suspect_rows[0]["anchor_refresh_allowed"])
-        self.assertEqual(suspect_rows[0]["anchor_refresh_blocked_reason"], "STAGNATION_SUSPECT")
-        self.assertEqual(suspect_rows[0]["clean_autonomy_anchor"], 1)
+        self.assertTrue(suspect_rows[0]["anchor_refresh_allowed"])
+        self.assertIsNone(suspect_rows[0]["anchor_refresh_blocked_reason"])
         self.assertTrue(any(row["stagnation_confirmed"] for row in suspect_rows))
-        removed_text = "".join(row["text"] for row in rollback["removed_steps"])
-        self.assertEqual(removed_text, repeated * 3)
-        self.assertIn("ordinary continuation", result.state.assistant_prefix_text)
-        self.assertNotIn(repeated * 2, result.state.assistant_prefix_text)
+        self.assertTrue(any(row["action"] == "STAGNATION_DIAGNOSTIC_ONLY" for row in suspect_rows))
+        self.assertTrue(all(not row["removed_by_rollback"] for row in steps))
+        self.assertIn(repeated * 2, result.state.assistant_prefix_text)
 
-    def test_mid_confidence_stagnation_confirms_and_rolls_back(self):
+    def test_mid_confidence_stagnation_confirms_as_diagnostic_only(self):
         cfg = SARRConfig(
             slm=ModelRuntimeConfig(model_path="unused", backend="transformers"),
             llm=ModelRuntimeConfig(model_path="unused", backend="openai", api_base_url="http://127.0.0.1:8000/v1"),
-            generation=GenerationConfig(max_new_tokens_per_step=64, think_token_budget=1024, answer_token_budget=64),
+            generation=GenerationConfig(
+                max_new_tokens_per_step=64,
+                think_token_budget=1024,
+                answer_token_budget=64,
+                final_answer_generator="llm",
+            ),
             confidence=ConfidenceConfig(topk_entropy=20, calibration_path=None),
             readiness=ReadinessConfig(smooth_window=1, high_threshold=0.70, low_threshold=0.35),
             startup=StartupConfig(B_min=1, B_max=5, tau_start=1),
@@ -353,7 +330,7 @@ class SARRCodeTests(unittest.TestCase):
                 high_threshold=0.85,
                 patience=3,
             ),
-            llm_lease=LLMLeaseConfig(confirmed_stagnation_steps=3, max_tokens_per_step=16),
+            llm_lease=LLMLeaseConfig(max_steps_per_event=2, max_tokens_per_step=16),
             rollback=RollbackConfig(M_max=1),
             runtime=RuntimeConfig(max_model_len=4096),
         )
@@ -369,7 +346,7 @@ class SARRCodeTests(unittest.TestCase):
             ],
             confidences=[0.9, 0.6, 0.6, 0.6, 0.6, 0.8],
         )
-        llm = FakeEngine(outputs=["lease one\n\n", "lease two\n\n", "lease three\n\n", "Final answer: 42."])
+        llm = FakeEngine(outputs=["Final answer: 42."])
 
         result, steps, rollbacks, _ = run_sarr_code(
             problem_id="mid-stagnation",
@@ -380,39 +357,52 @@ class SARRCodeTests(unittest.TestCase):
         )
 
         self.assertEqual(result.answer, "42")
-        self.assertEqual(rollbacks[0]["type"], "STAGNATION_ROLLBACK")
-        self.assertEqual(rollbacks[0]["anchor_step"], 1)
+        self.assertEqual(rollbacks, [])
         mid_rows = [row for row in steps if row["stagnation_suspect"] and row["readiness_mid"]]
         self.assertTrue(mid_rows)
         self.assertTrue(any(row["autonomy_state"] == "MID_CONF_STAGNATION" for row in mid_rows))
         self.assertFalse(any(row["hcs_suspect"] for row in mid_rows))
+        self.assertTrue(any(row["action"] == "STAGNATION_DIAGNOSTIC_ONLY" for row in mid_rows))
 
     def test_routing_budget_exceeded_returns_to_slm_active(self):
         cfg = SARRConfig(
             slm=ModelRuntimeConfig(model_path="unused", backend="transformers"),
             llm=ModelRuntimeConfig(model_path="unused", backend="openai", api_base_url="http://127.0.0.1:8000/v1"),
-            generation=GenerationConfig(max_new_tokens_per_step=32, think_token_budget=512, answer_token_budget=64),
-            confidence=ConfidenceConfig(topk_entropy=20, calibration_path=None),
-            readiness=ReadinessConfig(smooth_window=1),
-            startup=StartupConfig(B_min=2, B_max=3, tau_start=1),
-            rollback=RollbackConfig(M_max=5, suspect_confirm_steps=1, suspect_max_steps=2),
-            low_readiness=LowReadinessConfig(useful_exploration_grace_steps=0),
-            low_confidence=LowConfidenceConfig(useful_exploration_grace_blocks=0, collapse_patience_blocks=1),
-            llm_lease=LLMLeaseConfig(low_conf_rollback_steps=2, max_events_per_problem=0),
-            budget=BudgetConfig(max_llm_lease_events_per_problem=0),
+            generation=GenerationConfig(
+                max_new_tokens_per_step=32,
+                think_token_budget=512,
+                answer_token_budget=64,
+                final_answer_generator="llm",
+            ),
+            confidence=ConfidenceConfig(topk_entropy=20, calibration_path=None, delta=1.0),
+            confidence_process=ConfidenceProcessConfig(
+                min_masked_memory=0.5,
+                exposure_e0=1.0,
+                lambda0=0.05,
+                risk_threshold=0.05,
+                ciod_event_on_threshold=0.05,
+                ciod_event_off_threshold=0.01,
+                enable_ciod_active_routing=True,
+                max_ciod_active_leases_per_problem=1,
+            ),
+            readiness=ReadinessConfig(smooth_window=3),
+            startup=StartupConfig(B_min=1, B_max=10, tau_start=1),
+            rollback=RollbackConfig(M_max=5),
+            llm_lease=LLMLeaseConfig(max_steps_per_event=1, max_tokens_per_step=16),
+            routing_budget=RoutingBudgetConfig(max_ciod_events_per_problem=0),
             runtime=RuntimeConfig(max_model_len=4096),
         )
         slm = FakeEngine(
             outputs=[
-                "stable-a\n\n",
-                "stable-b\n\n",
-                "drop-a\n\n",
-                "drop-b\n\n",
-                "drop-c\n\n",
+                "h1\n\n",
+                "h2\n\n",
+                "masked\n\n",
+                "m1\n\n",
+                "m2\n\n",
                 "after-budget\n\n",
                 "</think>\n\n",
             ],
-            confidences=[0.9, 0.9, 0.1, 0.1, 0.1, 0.9],
+            confidences=[0.9, 0.9, 0.1, 0.9, 0.9, 0.9],
         )
         llm = FakeEngine(outputs=["Final answer: 42."])
 
@@ -434,19 +424,18 @@ class SARRCodeTests(unittest.TestCase):
         next_row = steps[steps.index(budget_rows[0]) + 1]
         self.assertEqual(next_row["state_before"], "SLM_ACTIVE")
         self.assertNotEqual(next_row["anchor_refresh_blocked_reason"], "STATE_ROLLBACK_RECOVERY")
-        self.assertTrue(
-            any(
-                row.get("to") == "SLM_ACTIVE"
-                and row.get("reason") == "ROUTING_BUDGET_EXCEEDED_CONTINUE_SLM"
-                for row in transitions
-            )
-        )
+        self.assertTrue(transitions)
 
     def test_confidence_process_shadow_logging(self):
         cfg = SARRConfig(
             slm=ModelRuntimeConfig(model_path="unused", backend="transformers"),
             llm=ModelRuntimeConfig(model_path="unused", backend="openai", api_base_url="http://127.0.0.1:8000/v1"),
-            generation=GenerationConfig(max_new_tokens_per_step=32, think_token_budget=512, answer_token_budget=64),
+            generation=GenerationConfig(
+                max_new_tokens_per_step=32,
+                think_token_budget=512,
+                answer_token_budget=64,
+                final_answer_generator="llm",
+            ),
             confidence=ConfidenceConfig(
                 topk_entropy=20,
                 calibration_path=None,
@@ -560,7 +549,12 @@ class SARRCodeTests(unittest.TestCase):
         cfg = SARRConfig(
             slm=ModelRuntimeConfig(model_path="unused", backend="transformers"),
             llm=ModelRuntimeConfig(model_path="unused", backend="openai", api_base_url="http://127.0.0.1:8000/v1"),
-            generation=GenerationConfig(max_new_tokens_per_step=32, think_token_budget=512, answer_token_budget=64),
+            generation=GenerationConfig(
+                max_new_tokens_per_step=32,
+                think_token_budget=512,
+                answer_token_budget=64,
+                final_answer_generator="llm",
+            ),
             confidence=ConfidenceConfig(
                 topk_entropy=20,
                 calibration_path=None,
@@ -579,7 +573,7 @@ class SARRCodeTests(unittest.TestCase):
             readiness=ReadinessConfig(smooth_window=3, high_threshold=0.70, low_threshold=0.35),
             startup=StartupConfig(B_min=1, B_max=10, tau_start=1),
             routing=RoutingConfig(enabled=True),
-            llm_lease=LLMLeaseConfig(persistent_uncertainty_steps=1, max_tokens_per_step=16),
+            llm_lease=LLMLeaseConfig(max_steps_per_event=1, max_tokens_per_step=16),
             rollback=RollbackConfig(M_max=5),
             low_confidence=LowConfidenceConfig(useful_exploration_grace_blocks=10, collapse_patience_blocks=20),
             runtime=RuntimeConfig(max_model_len=4096),
