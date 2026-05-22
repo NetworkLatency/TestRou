@@ -5,25 +5,14 @@ import unittest
 from sarr_code.algorithm import choose_best_prefix_anchor, run_sarr_code
 from sarr_code.calibration import PercentileNormalizer, code_style_degeneration_event, smooth_confidence
 from sarr_code.config import (
-    BudgetConfig,
+    CIODConfig,
     ConfidenceConfig,
-    ConfidenceProcessConfig,
+    ControllerConfig,
     GenerationConfig,
-    HCSConfig,
-    HCSRecoveryConfig,
-    LLMLeaseConfig,
-    LowConfidenceConfig,
-    LowReadinessConfig,
+    LoggingConfig,
     ModelRuntimeConfig,
-    ReadinessConfig,
-    RollbackConfig,
-    RoutingBudgetConfig,
-    RoutingConfig,
     RuntimeConfig,
     SARRConfig,
-    StableConfig,
-    StagnationConfig,
-    StartupConfig,
 )
 from sarr_code.records import StepOutput, StepRecord
 from scripts.run_sarr_code import _confidence_process_metrics, _extra_sarr_metrics
@@ -63,7 +52,8 @@ class FakeEngine:
         return True
 
 
-def make_cfg() -> SARRConfig:
+def make_cfg(**ciod_kwargs) -> SARRConfig:
+    """Minimal config for unit tests. CIODConfig with on_threshold=99 disables CI-OD routing."""
     return SARRConfig(
         slm=ModelRuntimeConfig(model_path="unused", backend="transformers"),
         llm=ModelRuntimeConfig(model_path="unused", backend="openai", api_base_url="http://127.0.0.1:8000/v1"),
@@ -74,22 +64,14 @@ def make_cfg() -> SARRConfig:
             final_answer_generator="llm",
             force_close_think_on_budget=True,
         ),
-        confidence=ConfidenceConfig(
-            topk_entropy=20,
-            calibration_path=None,
-            smooth_window=2,
-            delta=0.55,
-        ),
-        readiness=ReadinessConfig(smooth_window=1),
-        startup=StartupConfig(B_min=2, B_max=3, tau_start=1),
-        stable=StableConfig(theta_s=0.70, tau_D=1),
-        rollback=RollbackConfig(M_max=5),
-        low_confidence=LowConfidenceConfig(useful_exploration_grace_blocks=0, collapse_patience_blocks=1),
+        confidence=ConfidenceConfig(top_k=20, smooth_window=2),
+        ciod=CIODConfig(on_threshold=0.99, **ciod_kwargs),  # disable CIOD by default
         runtime=RuntimeConfig(max_model_len=4096),
     )
 
 
 class SARRCodeTests(unittest.TestCase):
+
     def test_percentile_normalizer_and_degradation(self):
         normalizer = PercentileNormalizer([0.1, 0.2, 0.4, 0.8])
         self.assertEqual(normalizer.transform(0.2), 0.5)
@@ -98,516 +80,251 @@ class SARRCodeTests(unittest.TestCase):
         self.assertEqual(code_style_degeneration_event(0.7, 0.5, delta=0.55), 1)
         self.assertEqual(code_style_degeneration_event(0.5, 0.7, delta=0.55), 0)
 
-    def test_choose_best_prefix_anchor_allows_zero(self):
+    def test_choose_best_prefix_anchor_uses_c_smooth(self):
         records = [
-            StepRecord("p", 1, "slm", "a", [], readiness_raw_smooth=None),
-            StepRecord("p", 2, "slm", "b", [], readiness_raw_smooth=0.4),
-            StepRecord("p", 3, "slm", "c", [], readiness_raw_smooth=0.3),
+            StepRecord("p", 1, "slm", "a", [], c_smooth=None),
+            StepRecord("p", 2, "slm", "b", [], c_smooth=0.4),
+            StepRecord("p", 3, "slm", "c", [], c_smooth=0.3),
         ]
         self.assertEqual(choose_best_prefix_anchor(records), 2)
         self.assertEqual(choose_best_prefix_anchor([records[0]]), 0)
 
-    def test_run_sarr_code_keeps_low_confidence_as_diagnostic(self):
+    def test_low_confidence_step_stays_in_trace(self):
+        """Low c_raw steps produce no routing action; all text is kept in trace."""
         cfg = make_cfg()
         slm = FakeEngine(
-            outputs=[
-                "first\n\n",
-                "second\n\n",
-                "bad\n\n",
-                "</think>\n\n",
-            ],
-            confidences=[0.5, 0.6, 0.3, 0.8, 0.8],
+            outputs=["first\n\n", "second\n\n", "bad\n\n", "</think>\n\n"],
+            confidences=[0.5, 0.6, 0.3, 0.8],
         )
         llm = FakeEngine(outputs=["Final answer: 42."])
 
-        result, steps, rollbacks, transitions = run_sarr_code(
-            problem_id="p1",
-            problem_text="Problem: 6*7?",
-            slm=slm,
-            llm=llm,
-            cfg=cfg,
+        result, steps, driver_switches, _ = run_sarr_code(
+            problem_id="p1", problem_text="6*7?", slm=slm, llm=llm, cfg=cfg,
         )
 
         self.assertEqual(result.answer, "42")
-        self.assertEqual(rollbacks, [])
+        self.assertEqual(driver_switches, [])
         self.assertFalse(any(row["removed_by_rollback"] for row in steps))
-        self.assertTrue(any(row["action"] == "READINESS_LOW_DIAGNOSTIC_ONLY" for row in steps))
-        self.assertTrue(transitions)
         self.assertIn("bad", result.state.assistant_prefix_text)
+        # c_smooth is logged for SLM steps
+        slm_steps = [s for s in steps if s["generator"] == "slm" and s["c_raw"] is not None]
+        self.assertTrue(all(s["c_smooth"] is not None for s in slm_steps))
 
-    def test_close_think_step_skips_confidence_forward(self):
+    def test_close_think_step_skips_confidence(self):
         cfg = make_cfg()
         slm = FakeEngine(outputs=["Done.\n</think>\n\n"], confidences=[])
         llm = FakeEngine(outputs=["Final answer: 42."])
 
-        result, steps, rollbacks, _ = run_sarr_code(
-            problem_id="close",
-            problem_text="Problem: 6*7?",
-            slm=slm,
-            llm=llm,
-            cfg=cfg,
+        result, steps, _, _ = run_sarr_code(
+            problem_id="close", problem_text="6*7?", slm=slm, llm=llm, cfg=cfg,
         )
 
         self.assertEqual(result.answer, "42")
-        self.assertEqual(len(rollbacks), 0)
         self.assertEqual(slm.confidence_calls, 0)
         self.assertEqual(steps[0]["action"], "FINISHED")
         self.assertTrue(steps[0]["extra"]["confidence_skipped"])
-        self.assertEqual(steps[0]["extra"]["confidence_skipped_reason"], "finished")
 
-    def test_post_stable_suspect_recovers_without_rollback(self):
+    def test_no_llm_routing_without_ciod_trigger(self):
+        """All SLM steps complete without LLM when CI-OD risk stays below threshold."""
+        cfg = make_cfg()  # on_threshold=0.99 → never triggers
+        slm = FakeEngine(
+            outputs=["step1\n\n", "step2\n\n", "step3\n\n", "</think>\n\n"],
+            confidences=[0.9, 0.1, 0.9],  # spike but risk won't build to 0.99
+        )
+        llm = FakeEngine(outputs=["Final answer: 42."])
+
+        result, steps, driver_switches, _ = run_sarr_code(
+            problem_id="no-routing", problem_text="test", slm=slm, llm=llm, cfg=cfg,
+        )
+
+        self.assertEqual(result.answer, "42")
+        self.assertEqual(driver_switches, [])
+        self.assertFalse(any(
+            row["generator"] == "llm" and not row.get("is_final_answer") for row in steps
+        ))
+        for text in ["step1", "step2", "step3"]:
+            self.assertIn(text, result.state.assistant_prefix_text)
+
+    def test_anchor_refreshed_on_slm_active_steps(self):
+        """clean_autonomy_anchor advances on each SLM step in SLM_ACTIVE."""
         cfg = make_cfg()
         slm = FakeEngine(
-            outputs=[
-                "stable-a\n\n",
-                "stable-b\n\n",
-                "correct-but-low-confidence\n\n",
-                "confirmation-step\n\n",
-                "</think>\n\n",
-            ],
-            confidences=[0.9, 0.9, 0.1, 0.9, 0.9],
+            outputs=["s1\n\n", "s2\n\n", "s3\n\n", "</think>\n\n"],
+            confidences=[0.8, 0.8, 0.8],
         )
         llm = FakeEngine(outputs=["Final answer: 42."])
 
-        result, steps, rollbacks, _ = run_sarr_code(
-            problem_id="suspect-recover",
-            problem_text="Problem: test",
-            slm=slm,
-            llm=llm,
-            cfg=cfg,
+        _, steps, _, _ = run_sarr_code(
+            problem_id="anchor", problem_text="test", slm=slm, llm=llm, cfg=cfg,
         )
 
-        self.assertEqual(result.answer, "42")
-        self.assertEqual(len(rollbacks), 0)
-        self.assertFalse(any(row["removed_by_rollback"] for row in steps))
-        self.assertTrue(any(row["action"] == "READINESS_LOW_DIAGNOSTIC_ONLY" for row in steps))
-        self.assertTrue(any(row["action"] == "REFRESH_STABLE_ANCHOR" for row in steps))
-        self.assertIn("correct-but-low-confidence", result.state.assistant_prefix_text)
+        slm_steps = [s for s in steps if s["generator"] == "slm" and s["c_raw"] is not None]
+        anchors = [s["extra"]["clean_autonomy_anchor"] for s in slm_steps]
+        # Each step advances the anchor to its own step_id
+        for i, (step, anchor) in enumerate(zip(slm_steps, anchors)):
+            self.assertEqual(anchor, step["step_id"])
 
-    def test_persistent_low_readiness_is_diagnostic_only(self):
-        cfg = SARRConfig(
-            slm=ModelRuntimeConfig(model_path="unused", backend="transformers"),
-            llm=ModelRuntimeConfig(model_path="unused", backend="openai", api_base_url="http://127.0.0.1:8000/v1"),
-            generation=GenerationConfig(
-                max_new_tokens_per_step=32,
-                think_token_budget=512,
-                answer_token_budget=64,
-                final_answer_generator="llm",
-            ),
-            confidence=ConfidenceConfig(
-                topk_entropy=20,
-                calibration_path=None,
-                smooth_window=2,
-                delta=0.55,
-            ),
-            startup=StartupConfig(B_min=2, B_max=3, tau_start=1),
-            stable=StableConfig(theta_s=0.70, tau_D=1),
-            readiness=ReadinessConfig(smooth_window=1),
-            low_readiness=LowReadinessConfig(useful_exploration_grace_steps=1),
-            llm_lease=LLMLeaseConfig(max_steps_per_event=2, max_tokens_per_step=16),
-            rollback=RollbackConfig(M_max=5),
-            low_confidence=LowConfidenceConfig(useful_exploration_grace_blocks=0, collapse_patience_blocks=1),
-            runtime=RuntimeConfig(max_model_len=4096),
-        )
+    def test_c_smooth_is_moving_average(self):
+        """c_smooth equals rolling mean of last smooth_window c_raw values."""
+        cfg = make_cfg()
+        # smooth_window=2: c_smooth[i] = mean(c_raw[i-1], c_raw[i])
         slm = FakeEngine(
-            outputs=[
-                "stable-a\n\n",
-                "stable-b\n\n",
-                "bad-a\n\n",
-                "bad-b\n\n",
-                "after-lease-observe\n\n",
-                "</think>\n\n",
-            ],
-            confidences=[
-                0.9,
-                0.9,
-                0.1,
-                0.0,
-                0.8,
-            ],
+            outputs=["s1\n\n", "s2\n\n", "s3\n\n", "</think>\n\n"],
+            confidences=[0.8, 0.4, 0.6],
         )
         llm = FakeEngine(outputs=["Final answer: 42."])
 
-        result, steps, rollbacks, _ = run_sarr_code(
-            problem_id="suspect-confirm",
-            problem_text="Problem: test",
-            slm=slm,
-            llm=llm,
-            cfg=cfg,
+        _, steps, _, _ = run_sarr_code(
+            problem_id="smooth", problem_text="test", slm=slm, llm=llm, cfg=cfg,
         )
 
-        self.assertEqual(result.answer, "42")
-        self.assertEqual(rollbacks, [])
-        self.assertFalse(any(row["removed_by_rollback"] for row in steps))
-        low_rows = [row for row in steps if row["action"] == "READINESS_LOW_DIAGNOSTIC_ONLY"]
-        self.assertTrue(low_rows)
-        self.assertTrue(all(row["extra"]["readiness_diagnostic_only"] for row in low_rows))
-        self.assertFalse(any(row["generator"] == "llm" and not row.get("is_final_answer") for row in steps))
-        self.assertIn("bad-a\n\nbad-b\n\n", result.state.assistant_prefix_text)
+        slm_steps = [s for s in steps if s["generator"] == "slm" and s["c_raw"] is not None]
+        # step 1: only 1 value → smooth = 0.8
+        self.assertAlmostEqual(slm_steps[0]["c_smooth"], 0.8, places=5)
+        # step 2: mean(0.8, 0.4) = 0.6
+        self.assertAlmostEqual(slm_steps[1]["c_smooth"], 0.6, places=5)
+        # step 3: mean(0.4, 0.6) = 0.5
+        self.assertAlmostEqual(slm_steps[2]["c_smooth"], 0.5, places=5)
 
-    def test_hcs_confirmed_is_diagnostic_only(self):
+    def test_ciod_driver_switching(self):
+        """CI-OD risk triggers SWITCH_TO_LLM_BY_CIOD; probe passes → SWITCH_TO_SLM_BY_REENTRY_RISK.
+
+        Parameters chosen so CIOD triggers at step 4 (h3) and re-entry probe passes
+        after exactly 2 LLM steps (probe_c=0.5, exposure_decay=0.70 drains exposure
+        below exposure_e0=0.5 within 2 steps).
+        """
         cfg = SARRConfig(
             slm=ModelRuntimeConfig(model_path="unused", backend="transformers"),
             llm=ModelRuntimeConfig(model_path="unused", backend="openai", api_base_url="http://127.0.0.1:8000/v1"),
             generation=GenerationConfig(
-                max_new_tokens_per_step=64,
-                think_token_budget=1024,
-                answer_token_budget=64,
-                final_answer_generator="llm",
+                max_new_tokens_per_step=32, think_token_budget=512,
+                answer_token_budget=64, final_answer_generator="llm",
             ),
-            confidence=ConfidenceConfig(
-                topk_entropy=20,
-                calibration_path=None,
-                smooth_window=1,
-                delta=0.55,
-            ),
-            startup=StartupConfig(B_min=1, B_max=5, tau_start=1),
-            stable=StableConfig(theta_s=0.70, tau_D=1),
-            stagnation=StagnationConfig(
-                enabled=True,
-                block_min_tokens=8,
-                block_max_steps=1,
-                repeat_window=10,
-                high_threshold=0.85,
-            ),
-            hcs=HCSConfig(enabled=True, suspect_patience=3, max_hcs_rollbacks_per_problem=2),
-            hcs_recovery=HCSRecoveryConfig(max_llm_steps=2, max_tokens_per_step=16),
-            llm_lease=LLMLeaseConfig(max_steps_per_event=2, max_tokens_per_step=16),
-            rollback=RollbackConfig(M_max=1, anchor_repeat_policy="suppress"),
-            runtime=RuntimeConfig(max_model_len=4096),
-        )
-        repeated = "we repeat the same confident local calculation and anchor phrase again\n\n"
-        slm = FakeEngine(
-            outputs=[
-                repeated,
-                repeated,
-                repeated,
-                repeated,
-                "</think>\n\n",
-            ],
-            confidences=[0.9, 0.9, 0.9, 0.9, 0.8, 0.8],
-        )
-        llm = FakeEngine(outputs=["Final answer: 42."])
-
-        result, steps, rollbacks, _ = run_sarr_code(
-            problem_id="hcs",
-            problem_text="Problem: test",
-            slm=slm,
-            llm=llm,
-            cfg=cfg,
-        )
-
-        self.assertEqual(result.answer, "42")
-        self.assertEqual(rollbacks, [])
-
-        suspect_rows = [row for row in steps if row["hcs_suspect"]]
-        self.assertEqual(len(suspect_rows), 3)
-        self.assertTrue(suspect_rows[0]["anchor_refresh_allowed"])
-        self.assertIsNone(suspect_rows[0]["anchor_refresh_blocked_reason"])
-        self.assertTrue(any(row["stagnation_confirmed"] for row in suspect_rows))
-        self.assertTrue(any(row["action"] == "STAGNATION_DIAGNOSTIC_ONLY" for row in suspect_rows))
-        self.assertTrue(all(not row["removed_by_rollback"] for row in steps))
-        self.assertIn(repeated * 2, result.state.assistant_prefix_text)
-
-    def test_mid_confidence_stagnation_confirms_as_diagnostic_only(self):
-        cfg = SARRConfig(
-            slm=ModelRuntimeConfig(model_path="unused", backend="transformers"),
-            llm=ModelRuntimeConfig(model_path="unused", backend="openai", api_base_url="http://127.0.0.1:8000/v1"),
-            generation=GenerationConfig(
-                max_new_tokens_per_step=64,
-                think_token_budget=1024,
-                answer_token_budget=64,
-                final_answer_generator="llm",
-            ),
-            confidence=ConfidenceConfig(topk_entropy=20, calibration_path=None),
-            readiness=ReadinessConfig(smooth_window=1, high_threshold=0.70, low_threshold=0.35),
-            startup=StartupConfig(B_min=1, B_max=5, tau_start=1),
-            stagnation=StagnationConfig(
-                enabled=True,
-                block_min_tokens=8,
-                block_max_steps=1,
-                repeat_window=10,
-                high_threshold=0.85,
-                patience=3,
-            ),
-            llm_lease=LLMLeaseConfig(max_steps_per_event=2, max_tokens_per_step=16),
-            rollback=RollbackConfig(M_max=1),
-            runtime=RuntimeConfig(max_model_len=4096),
-        )
-        repeated = "repeat the same mid confidence derivation fragment again\n\n"
-        slm = FakeEngine(
-            outputs=[
-                "clean confident anchor step with enough unique tokens\n\n",
-                repeated,
-                repeated,
-                repeated,
-                repeated,
-                "</think>\n\n",
-            ],
-            confidences=[0.9, 0.6, 0.6, 0.6, 0.6, 0.8],
-        )
-        llm = FakeEngine(outputs=["Final answer: 42."])
-
-        result, steps, rollbacks, _ = run_sarr_code(
-            problem_id="mid-stagnation",
-            problem_text="Problem: test",
-            slm=slm,
-            llm=llm,
-            cfg=cfg,
-        )
-
-        self.assertEqual(result.answer, "42")
-        self.assertEqual(rollbacks, [])
-        mid_rows = [row for row in steps if row["stagnation_suspect"] and row["readiness_mid"]]
-        self.assertTrue(mid_rows)
-        self.assertTrue(any(row["autonomy_state"] == "MID_CONF_STAGNATION" for row in mid_rows))
-        self.assertFalse(any(row["hcs_suspect"] for row in mid_rows))
-        self.assertTrue(any(row["action"] == "STAGNATION_DIAGNOSTIC_ONLY" for row in mid_rows))
-
-    def test_routing_budget_exceeded_returns_to_slm_active(self):
-        cfg = SARRConfig(
-            slm=ModelRuntimeConfig(model_path="unused", backend="transformers"),
-            llm=ModelRuntimeConfig(model_path="unused", backend="openai", api_base_url="http://127.0.0.1:8000/v1"),
-            generation=GenerationConfig(
-                max_new_tokens_per_step=32,
-                think_token_budget=512,
-                answer_token_budget=64,
-                final_answer_generator="llm",
-            ),
-            confidence=ConfidenceConfig(topk_entropy=20, calibration_path=None, delta=1.0),
-            confidence_process=ConfidenceProcessConfig(
+            confidence=ConfidenceConfig(top_k=20, smooth_window=2),
+            ciod=CIODConfig(
+                masked_low_threshold=0.35,
+                exposure_threshold=0.60,
+                masked_decay=0.95,
+                exposure_decay=0.70,  # fast drain so probe passes in 2 steps
                 min_masked_memory=0.5,
-                exposure_e0=1.0,
-                lambda0=0.05,
-                risk_threshold=0.05,
-                ciod_event_on_threshold=0.05,
-                ciod_event_off_threshold=0.01,
-                enable_ciod_active_routing=True,
-                max_ciod_active_leases_per_problem=1,
+                exposure_e0=0.5,
+                hazard_scale=1.0,
+                on_threshold=0.10,
+                off_threshold=0.01,
             ),
-            readiness=ReadinessConfig(smooth_window=3),
-            startup=StartupConfig(B_min=1, B_max=10, tau_start=1),
-            rollback=RollbackConfig(M_max=5),
-            llm_lease=LLMLeaseConfig(max_steps_per_event=1, max_tokens_per_step=16),
-            routing_budget=RoutingBudgetConfig(max_ciod_events_per_problem=0),
             runtime=RuntimeConfig(max_model_len=4096),
         )
+        # SLM outputs: h1, masked, h2, h3(trigger), h4(new segment), </think>
+        # SLM confidences: gen×4, probe×2, gen×1
         slm = FakeEngine(
-            outputs=[
-                "h1\n\n",
-                "h2\n\n",
-                "masked\n\n",
-                "m1\n\n",
-                "m2\n\n",
-                "after-budget\n\n",
-                "</think>\n\n",
-            ],
-            confidences=[0.9, 0.9, 0.1, 0.9, 0.9, 0.9],
+            outputs=["h1\n\n", "masked\n\n", "h2\n\n", "h3\n\n", "h4\n\n", "</think>\n\n"],
+            confidences=[0.9, 0.1, 0.9, 0.9, 0.5, 0.5, 0.9],
         )
-        llm = FakeEngine(outputs=["Final answer: 42."])
+        llm = FakeEngine(outputs=["l1\n\n", "l2\n\n", "Final answer: 42."])
 
-        result, steps, rollbacks, transitions = run_sarr_code(
-            problem_id="budget-exceeded",
-            problem_text="Problem: test",
-            slm=slm,
-            llm=llm,
-            cfg=cfg,
+        result, steps, driver_switches, _ = run_sarr_code(
+            problem_id="ciod-switch", problem_text="test", slm=slm, llm=llm, cfg=cfg,
         )
 
         self.assertEqual(result.answer, "42")
-        self.assertEqual(rollbacks, [])
-        budget_rows = [row for row in steps if row["action"] == "ROUTING_BUDGET_EXCEEDED_CONTINUE_SLM"]
-        self.assertEqual(len(budget_rows), 1)
-        self.assertEqual(budget_rows[0]["state_after"], "SLM_ACTIVE")
-        self.assertTrue(budget_rows[0]["extra"]["routing_budget_exceeded"])
-        self.assertFalse(budget_rows[0]["invalid_rollback_recovery_state"])
-        next_row = steps[steps.index(budget_rows[0]) + 1]
-        self.assertEqual(next_row["state_before"], "SLM_ACTIVE")
-        self.assertNotEqual(next_row["anchor_refresh_blocked_reason"], "STATE_ROLLBACK_RECOVERY")
-        self.assertTrue(transitions)
 
-    def test_confidence_process_shadow_logging(self):
+        # One CIOD trigger on SLM side
+        ciod_triggers = [s for s in steps if s["action"] == "SWITCH_TO_LLM_BY_CIOD"]
+        self.assertEqual(len(ciod_triggers), 1)
+        self.assertEqual(ciod_triggers[0]["generator"], "slm")
+
+        # Two LLM steps: first keeps, second switches back
+        llm_steps = [s for s in steps if s["generator"] == "llm" and not s.get("is_final_answer")]
+        self.assertEqual(len(llm_steps), 2)
+        self.assertEqual(llm_steps[0]["action"], "KEEP_LLM_BY_REENTRY_RISK")
+        self.assertEqual(llm_steps[1]["action"], "SWITCH_TO_SLM_BY_REENTRY_RISK")
+
+        # slm_reentry_risk logged on LLM steps
+        self.assertIsNotNone(llm_steps[0]["extra"]["slm_reentry_risk"])
+        self.assertGreater(llm_steps[0]["extra"]["slm_reentry_risk"], cfg.ciod.off_threshold)
+        self.assertLessEqual(llm_steps[1]["extra"]["slm_reentry_risk"], cfg.ciod.off_threshold)
+
+        # Two driver switch events (SLM→LLM, LLM→SLM)
+        self.assertEqual(len(driver_switches), 2)
+        self.assertEqual(driver_switches[0]["from"], "SLM_ACTIVE")
+        self.assertEqual(driver_switches[0]["to"], "LLM_ACTIVE")
+        self.assertEqual(driver_switches[1]["from"], "LLM_ACTIVE")
+        self.assertEqual(driver_switches[1]["to"], "SLM_ACTIVE")
+
+        # SLM steps after return are in new segment (segment_id=2)
+        post_return_slm = [
+            s for s in steps
+            if s["generator"] == "slm"
+            and s["extra"].get("segment_id", 1) == 2
+        ]
+        self.assertTrue(post_return_slm)
+
+    def test_ciod_segment_tracker_risk_computation(self):
+        """Segment CI-OD risk in extra matches expected formula values."""
         cfg = SARRConfig(
             slm=ModelRuntimeConfig(model_path="unused", backend="transformers"),
             llm=ModelRuntimeConfig(model_path="unused", backend="openai", api_base_url="http://127.0.0.1:8000/v1"),
             generation=GenerationConfig(
-                max_new_tokens_per_step=32,
-                think_token_budget=512,
-                answer_token_budget=64,
-                final_answer_generator="llm",
+                max_new_tokens_per_step=32, think_token_budget=512,
+                answer_token_budget=64, final_answer_generator="llm",
             ),
-            confidence=ConfidenceConfig(
-                topk_entropy=20,
-                calibration_path=None,
-                delta=0.0,
-            ),
-            confidence_process=ConfidenceProcessConfig(
-                r0=2,
+            confidence=ConfidenceConfig(top_k=20, smooth_window=2),
+            ciod=CIODConfig(
+                on_threshold=0.99,   # disable routing so we can inspect all steps
                 min_masked_memory=0.5,
-                exposure_e0=1.0,
-                lambda0=0.05,
-                risk_threshold=0.05,
+                exposure_e0=0.5,
+                hazard_scale=1.0,
             ),
-            readiness=ReadinessConfig(smooth_window=3, high_threshold=0.70, low_threshold=0.35),
-            startup=StartupConfig(B_min=1, B_max=10, tau_start=1),
-            routing=RoutingConfig(enabled=False),
-            rollback=RollbackConfig(M_max=5),
-            low_confidence=LowConfidenceConfig(useful_exploration_grace_blocks=0, collapse_patience_blocks=1),
             runtime=RuntimeConfig(max_model_len=4096),
         )
         slm = FakeEngine(
-            outputs=[
-                "h1\n\n",
-                "h2\n\n",
-                "masked\n\n",
-                "m1\n\n",
-                "m2\n\n",
-                "h3\n\n",
-                "h4\n\n",
-                "h5\n\n",
-                "</think>\n\n",
-            ],
-            confidences=[0.9, 0.9, 0.1, 0.9, 0.9, 0.9, 0.9, 0.9],
+            outputs=["h1\n\n", "masked\n\n", "h2\n\n", "h3\n\n", "</think>\n\n"],
+            confidences=[0.9, 0.1, 0.9, 0.9],
+        )
+        llm = FakeEngine(outputs=["Final answer: 42."])
+
+        _, steps, driver_switches, _ = run_sarr_code(
+            problem_id="risk-check", problem_text="test", slm=slm, llm=llm, cfg=cfg,
+        )
+
+        self.assertEqual(driver_switches, [])
+
+        slm_steps = [s for s in steps if s["generator"] == "slm" and s["c_raw"] is not None]
+
+        # Step 1 (h1): no masked → masked_memory=0 → risk=0
+        self.assertAlmostEqual(slm_steps[0]["extra"]["masked_memory"], 0.0, places=5)
+        self.assertAlmostEqual(slm_steps[0]["extra"]["ciod_risk"], 0.0, places=5)
+
+        # Step 2 (masked): raw_low=True, smooth_low=False (smooth=(0.9+0.1)/2=0.5>0.35)
+        # → masked_uncertainty=True → masked_memory = 0.98*0 + 1 = 1.0 (with default decay=0.98)
+        # Wait: test uses default CIODConfig except on_threshold.
+        # masked_decay=0.98 (default). masked_memory after step 2 = 0.98*0 + 1 = 1.0
+        mm_step2 = slm_steps[1]["extra"]["masked_memory"]
+        self.assertGreater(mm_step2, 0.9)   # should be close to 1.0
+        self.assertLessEqual(mm_step2, 1.0)
+
+        # Step 4 (h3): c_smooth = mean(0.9, 0.9) = 0.9 >= exposure_threshold=0.60
+        # → exposure accumulates → ciod_risk should be > 0 (assuming mm >= min_masked_memory=0.5)
+        risk_step4 = slm_steps[3]["extra"]["ciod_risk"]
+        self.assertGreater(risk_step4, 0.0)
+
+    def test_budget_exhausted_forces_close_think(self):
+        """When think_token_budget is hit, force_close_think_text is appended."""
+        cfg = make_cfg()
+        # Use small budget to force exhaustion
+        cfg.generation.think_token_budget = 20
+        slm = FakeEngine(
+            outputs=["longer step text here\n\n", "more text here\n\n"],
+            confidences=[0.8, 0.8],
         )
         llm = FakeEngine(outputs=["Final answer: 42."])
 
         result, steps, _, _ = run_sarr_code(
-            problem_id="confidence-process",
-            problem_text="Problem: test",
-            slm=slm,
-            llm=llm,
-            cfg=cfg,
+            problem_id="budget", problem_text="test", slm=slm, llm=llm, cfg=cfg,
         )
 
-        self.assertEqual(result.answer, "42")
-        for row in steps:
-            self.assertIn("confidence_process", row["extra"])
-
-        masked = steps[2]["extra"]["confidence_process"]
-        self.assertTrue(masked["raw_low"])
-        self.assertFalse(masked["smooth_low"])
-        self.assertTrue(masked["masked_uncertainty"])
-        self.assertEqual(masked["masked_uncertainty_count"], 1)
-        self.assertGreater(masked["masked_memory"], 0.0)
-        self.assertEqual(masked["last_masked_step"], steps[2]["step_id"])
-        self.assertEqual(masked["steps_since_last_masked"], 0)
-        self.assertIn("ciod_grid_risks", masked)
-        self.assertIn("ciod_grid_triggers", masked)
-
-        triggered_v2 = [row for row in steps if row["extra"]["confidence_process"]["ciod_shadow_trigger_v2"]]
-        self.assertTrue(triggered_v2)
-        first_trigger = triggered_v2[0]["extra"]["confidence_process"]
-        self.assertGreater(first_trigger["post_masked_exposure"], 1.0)
-        self.assertGreater(first_trigger["ciod_risk_v2"], 0.0)
-        ciod_events = [row for row in steps if row["extra"]["confidence_process"]["ciod_event_shadow"]]
-        self.assertTrue(ciod_events)
-        self.assertLess(len(ciod_events), len(triggered_v2))
-        self.assertEqual(ciod_events[0]["action"], "CIOD_EVENT_SHADOW_ONLY")
-
-        summary = next(event.data for event in result.state.trace if event.event == "sarr_summary")
-        self.assertEqual(summary["raw_low_count"], 1)
-        self.assertEqual(summary["masked_uncertainty_count"], 1)
-        self.assertEqual(summary["masked_uncertainty_gap"], 1)
-        self.assertGreaterEqual(summary["max_high_run_length"], 3)
-        self.assertIn("ciod_risk_v1", summary)
-        self.assertGreater(summary["max_post_masked_exposure"], 1.0)
-        self.assertGreater(summary["max_ciod_risk_v2"], 0.0)
-        self.assertEqual(summary["first_ciod_shadow_trigger_step_v2"], triggered_v2[0]["step_id"])
-        self.assertIn("ciod_grid_summary", summary)
-        self.assertGreaterEqual(len(summary["ciod_grid_summary"]), 5)
-        self.assertEqual(summary["first_ciod_event_step"], ciod_events[0]["step_id"])
-        self.assertEqual(summary["ciod_event_count"], len(ciod_events))
-        self.assertEqual(summary["ciod_active_lease_count"], 0)
-
-        problem_metrics = _confidence_process_metrics(steps)
-        for key in [
-            "raw_low_count",
-            "smooth_low_count",
-            "masked_uncertainty_count",
-            "masked_uncertainty_gap",
-            "max_high_run_length",
-            "max_ciod_risk",
-            "ciod_shadow_trigger_count",
-            "first_ciod_shadow_trigger_step",
-            "max_post_masked_exposure",
-            "max_ciod_risk_v2",
-            "ciod_shadow_trigger_count_v2",
-            "first_ciod_shadow_trigger_step_v2",
-            "ciod_grid_summary",
-            "ciod_event_count",
-            "first_ciod_event_step",
-            "last_ciod_event_step",
-            "ciod_event_before_first_readiness_low",
-            "ciod_event_steps",
-            "ciod_active_lease_count",
-        ]:
-            self.assertIn(key, problem_metrics)
-        self.assertGreater(problem_metrics["max_ciod_risk_v2"], 0.0)
-        self.assertEqual(problem_metrics["ciod_event_count"], len(ciod_events))
-
-    def test_ciod_event_can_trigger_single_active_lease_when_enabled(self):
-        cfg = SARRConfig(
-            slm=ModelRuntimeConfig(model_path="unused", backend="transformers"),
-            llm=ModelRuntimeConfig(model_path="unused", backend="openai", api_base_url="http://127.0.0.1:8000/v1"),
-            generation=GenerationConfig(
-                max_new_tokens_per_step=32,
-                think_token_budget=512,
-                answer_token_budget=64,
-                final_answer_generator="llm",
-            ),
-            confidence=ConfidenceConfig(
-                topk_entropy=20,
-                calibration_path=None,
-                delta=1.0,
-            ),
-            confidence_process=ConfidenceProcessConfig(
-                min_masked_memory=0.5,
-                exposure_e0=1.0,
-                lambda0=0.05,
-                risk_threshold=0.05,
-                ciod_event_on_threshold=0.05,
-                ciod_event_off_threshold=0.01,
-                enable_ciod_active_routing=True,
-                max_ciod_active_leases_per_problem=1,
-            ),
-            readiness=ReadinessConfig(smooth_window=3, high_threshold=0.70, low_threshold=0.35),
-            startup=StartupConfig(B_min=1, B_max=10, tau_start=1),
-            routing=RoutingConfig(enabled=True),
-            llm_lease=LLMLeaseConfig(max_steps_per_event=1, max_tokens_per_step=16),
-            rollback=RollbackConfig(M_max=5),
-            low_confidence=LowConfidenceConfig(useful_exploration_grace_blocks=10, collapse_patience_blocks=20),
-            runtime=RuntimeConfig(max_model_len=4096),
-        )
-        slm = FakeEngine(
-            outputs=[
-                "h1\n\n",
-                "h2\n\n",
-                "masked\n\n",
-                "m1\n\n",
-                "m2\n\n",
-                "h3\n\n",
-                "</think>\n\n",
-            ],
-            confidences=[0.9, 0.9, 0.1, 0.9, 0.9, 0.9],
-        )
-        llm = FakeEngine(outputs=["ciod lease\n\n", "Final answer: 42."])
-
-        result, steps, rollbacks, _ = run_sarr_code(
-            problem_id="ciod-active",
-            problem_text="Problem: test",
-            slm=slm,
-            llm=llm,
-            cfg=cfg,
-        )
-
-        self.assertEqual(result.answer, "42")
-        ciod_routes = [row for row in steps if row["action"] == "LLM_LEASE_BY_CIOD_EVENT"]
-        self.assertEqual(len(ciod_routes), 1)
-        self.assertEqual(len([r for r in rollbacks if r["reason"] == "LLM_LEASE_BY_CIOD_EVENT"]), 1)
-        self.assertEqual(rollbacks[0]["type"], "LLM_LEASE")
-        self.assertFalse(rollbacks[0]["rollback_before_lease"])
-        summary = next(event.data for event in result.state.trace if event.event == "sarr_summary")
-        self.assertEqual(summary["ciod_active_lease_count"], 1)
+        self.assertIn("</think>", result.state.assistant_prefix_text)
+        self.assertIn("think_token_budget", result.state.stop_reason)
 
     def test_summary_metrics_include_required_sarr_fields(self):
         rows = [

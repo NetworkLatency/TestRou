@@ -28,11 +28,10 @@ class ModelRuntimeConfig:
 
 @dataclass
 class GenerationConfig:
-    step_delimiters: list[str] = field(default_factory=lambda: ["\n\n"])
     max_new_tokens_per_step: int = 256
-    close_tag_lookahead_tokens: int = 16
     think_token_budget: int = 8192
     answer_token_budget: int = 2048
+    step_delimiters: list[str] = field(default_factory=lambda: ["\n\n"])
     final_answer_generator: str = "active"
     force_close_think_on_budget: bool = True
     force_close_think_text: str = (
@@ -40,518 +39,103 @@ class GenerationConfig:
         "Do not restart the solution after </think>. After </think>, give only the final answer "
         "using the strongest conclusion above; if uncertain, make the best concise guess.\n</think>\n\n"
     )
+    close_tag_lookahead_tokens: int = 16
 
     def __post_init__(self) -> None:
         if self.max_new_tokens_per_step < 1:
             raise ValueError("generation.max_new_tokens_per_step must be >= 1")
-        if self.close_tag_lookahead_tokens < 0:
-            raise ValueError("generation.close_tag_lookahead_tokens must be >= 0")
         if self.think_token_budget < 1:
             raise ValueError("generation.think_token_budget must be >= 1")
         if self.answer_token_budget < 1:
             raise ValueError("generation.answer_token_budget must be >= 1")
+        if self.close_tag_lookahead_tokens < 0:
+            raise ValueError("generation.close_tag_lookahead_tokens must be >= 0")
         if self.final_answer_generator not in {"slm", "llm", "active"}:
             raise ValueError("generation.final_answer_generator must be 'slm', 'llm', or 'active'")
 
 
 @dataclass
-class ConfidenceConfig:
-    topk_entropy: int = 20
-    percentile_normalization: bool = False
-    calibration_path: str | None = None
-    smooth_window: int = 2
-    delta: float = 0.55
-    capture_slm_token_entropy: bool = False
+class ControllerConfig:
+    mode: str = "ciod_driver_switching"
+    initial_driver: str = "slm"
 
     def __post_init__(self) -> None:
-        if self.topk_entropy < 2:
-            raise ValueError("confidence.topk_entropy must be >= 2")
+        if self.mode != "ciod_driver_switching":
+            raise ValueError("controller.mode must be 'ciod_driver_switching'")
+        if self.initial_driver != "slm":
+            raise ValueError("controller.initial_driver must be 'slm'")
+
+
+@dataclass
+class ConfidenceConfig:
+    """Confidence observation config. score_type is metadata; top_k and smooth_window are active."""
+
+    score_type: str = "normalized_topk_entropy"
+    top_k: int = 20
+    smooth_window: int = 3
+
+    def __post_init__(self) -> None:
+        if self.score_type != "normalized_topk_entropy":
+            raise ValueError("confidence.score_type must be 'normalized_topk_entropy'")
+        if self.top_k < 2:
+            raise ValueError("confidence.top_k must be >= 2")
         if self.smooth_window < 1:
             raise ValueError("confidence.smooth_window must be >= 1")
 
 
 @dataclass
-class ConfidenceProcessConfig:
-    lambda0: float = 0.003
-    alpha: float = 1.0
-    r0: int = 20
-    power: float = 2.0
-    high_threshold: float = 0.70
-    mid_high_threshold: float = 0.60
-    raw_low_threshold: float = 0.35
-    smooth_low_threshold: float = 0.35
-    masked_decay: float = 0.995
+class CIODConfig:
+    """CI-OD (Confidence-based Intervention on Degeneration) driver switching config.
+
+    Risk formula (v2):
+        hazard = hazard_scale * (1 + masked_memory) * max(0, post_masked_exposure - exposure_e0)^2
+        ciod_risk = 1 - exp(-hazard)
+
+    State equations per SLM step:
+        masked_uncertainty = (c_raw <= masked_low_threshold) AND (c_smooth > masked_low_threshold)
+        masked_memory_t = masked_decay * masked_memory_{t-1} + 1[masked_uncertainty]
+        exp_inc = 1 if (masked_memory > 0 AND c_smooth >= exposure_threshold) else 0
+        post_masked_exposure_t = exposure_decay * post_masked_exposure_{t-1} + exp_inc
+    """
+
+    masked_low_threshold: float = 0.35
+    exposure_threshold: float = 0.60
+    masked_decay: float = 0.98
     exposure_decay: float = 0.98
     min_masked_memory: float = 3.0
-    exposure_e0: float = 4.0
-    risk_threshold: float = 0.10
-    ciod_event_on_threshold: float = 0.10
-    ciod_event_off_threshold: float = 0.03
-    ciod_event_cooldown_steps: int = 32
-    min_new_masked_mass_for_retrigger: float = 2.0
-    min_new_exposure_for_retrigger: float = 4.0
-    max_ciod_active_leases_per_problem: int = 1
-    enable_ciod_active_routing: bool = False
-    v1_lambda0: float = 0.002
-    ciod_grid: list[dict[str, float]] = field(
-        default_factory=lambda: [
-            {"exposure_e0": 3.0, "lambda0": 0.003, "risk_threshold": 0.10},
-            {"exposure_e0": 4.0, "lambda0": 0.003, "risk_threshold": 0.10},
-            {"exposure_e0": 5.0, "lambda0": 0.003, "risk_threshold": 0.10},
-            {"exposure_e0": 5.0, "lambda0": 0.005, "risk_threshold": 0.10},
-            {"exposure_e0": 8.0, "lambda0": 0.005, "risk_threshold": 0.10},
-        ]
-    )
+    exposure_e0: float = 8.0
+    hazard_scale: float = 0.005
+    on_threshold: float = 0.10
+    off_threshold: float = 0.03
 
     def __post_init__(self) -> None:
-        if self.lambda0 < 0.0:
-            raise ValueError("confidence_process.lambda0 must be >= 0")
-        if self.v1_lambda0 < 0.0:
-            raise ValueError("confidence_process.v1_lambda0 must be >= 0")
-        if self.alpha < 0.0:
-            raise ValueError("confidence_process.alpha must be >= 0")
-        if self.r0 < 0:
-            raise ValueError("confidence_process.r0 must be >= 0")
-        if self.power < 0.0:
-            raise ValueError("confidence_process.power must be >= 0")
         for name in [
-            "high_threshold",
-            "mid_high_threshold",
-            "raw_low_threshold",
-            "smooth_low_threshold",
+            "masked_low_threshold",
+            "exposure_threshold",
             "masked_decay",
             "exposure_decay",
-            "risk_threshold",
-            "ciod_event_on_threshold",
-            "ciod_event_off_threshold",
+            "on_threshold",
+            "off_threshold",
         ]:
-            value = getattr(self, name)
-            if not 0.0 <= value <= 1.0:
-                raise ValueError(f"confidence_process.{name} must be in [0, 1]")
+            v = getattr(self, name)
+            if not 0.0 <= v <= 1.0:
+                raise ValueError(f"ciod.{name} must be in [0, 1]")
         if self.min_masked_memory < 0.0:
-            raise ValueError("confidence_process.min_masked_memory must be >= 0")
+            raise ValueError("ciod.min_masked_memory must be >= 0")
         if self.exposure_e0 < 0.0:
-            raise ValueError("confidence_process.exposure_e0 must be >= 0")
-        if self.ciod_event_off_threshold > self.ciod_event_on_threshold:
-            raise ValueError("confidence_process.ciod_event_off_threshold must be <= ciod_event_on_threshold")
-        if self.ciod_event_cooldown_steps < 0:
-            raise ValueError("confidence_process.ciod_event_cooldown_steps must be >= 0")
-        if self.min_new_masked_mass_for_retrigger < 0.0:
-            raise ValueError("confidence_process.min_new_masked_mass_for_retrigger must be >= 0")
-        if self.min_new_exposure_for_retrigger < 0.0:
-            raise ValueError("confidence_process.min_new_exposure_for_retrigger must be >= 0")
-        if self.max_ciod_active_leases_per_problem < 0:
-            raise ValueError("confidence_process.max_ciod_active_leases_per_problem must be >= 0")
-        normalized_grid = []
-        for i, item in enumerate(self.ciod_grid):
-            if not isinstance(item, dict):
-                raise ValueError(f"confidence_process.ciod_grid[{i}] must be an object")
-            exposure_e0 = item.get("exposure_e0", item.get("e0"))
-            risk_threshold = item.get("risk_threshold", item.get("threshold"))
-            lambda0 = item.get("lambda0")
-            if exposure_e0 is None or risk_threshold is None or lambda0 is None:
-                raise ValueError(
-                    f"confidence_process.ciod_grid[{i}] must include exposure_e0/e0, lambda0, and risk_threshold/threshold"
-                )
-            exposure_e0 = float(exposure_e0)
-            lambda0 = float(lambda0)
-            risk_threshold = float(risk_threshold)
-            if exposure_e0 < 0.0:
-                raise ValueError(f"confidence_process.ciod_grid[{i}].exposure_e0 must be >= 0")
-            if lambda0 < 0.0:
-                raise ValueError(f"confidence_process.ciod_grid[{i}].lambda0 must be >= 0")
-            if not 0.0 <= risk_threshold <= 1.0:
-                raise ValueError(f"confidence_process.ciod_grid[{i}].risk_threshold must be in [0, 1]")
-            normalized_grid.append(
-                {
-                    "exposure_e0": exposure_e0,
-                    "lambda0": lambda0,
-                    "risk_threshold": risk_threshold,
-                }
-            )
-        self.ciod_grid = normalized_grid
-
-
-@dataclass
-class CalibrationConfig:
-    enabled: bool = False
-    build_cdf: bool = False
-    load_cdf: bool = False
-    use_percentile: bool = False
-
-    def __post_init__(self) -> None:
-        if self.enabled or self.build_cdf or self.load_cdf or self.use_percentile:
-            raise ValueError("This experiment disables calibration; calibration.* must all be false")
-
-
-@dataclass
-class ReadinessConfig:
-    signal: str = "continuation_confidence"
-    normalization: str = "raw"
-    use_calibration: bool = False
-    value_field: str = "readiness_smooth_or_raw"
-    high_threshold: float = 0.70
-    low_threshold: float = 0.35
-    smooth_window: int = 3
-
-    def __post_init__(self) -> None:
-        if self.signal != "continuation_confidence":
-            raise ValueError("readiness.signal must be 'continuation_confidence'")
-        if self.normalization != "raw":
-            raise ValueError("This experiment disables calibration; readiness.normalization must be 'raw'")
-        if self.use_calibration:
-            raise ValueError("This experiment disables calibration; readiness.use_calibration must be false")
-        if self.value_field not in {"readiness_smooth_or_raw", "c_raw"}:
-            raise ValueError(
-                "This experiment disables calibration; readiness.value_field must be "
-                "'readiness_smooth_or_raw' or 'c_raw'"
-            )
-        if not 0.0 <= self.high_threshold <= 1.0:
-            raise ValueError("readiness.high_threshold must be in [0, 1]")
-        if not 0.0 <= self.low_threshold <= 1.0:
-            raise ValueError("readiness.low_threshold must be in [0, 1]")
-        if self.low_threshold > self.high_threshold:
-            raise ValueError("readiness.low_threshold must be <= readiness.high_threshold")
-        if self.smooth_window < 1:
-            raise ValueError("readiness.smooth_window must be >= 1")
-
-
-@dataclass
-class StagnationConfig:
-    enabled: bool = True
-    unit: str = "step_or_small_block"
-    block_min_tokens: int = 32
-    block_max_steps: int = 2
-    metric: str = "word_3gram_jaccard"
-    repeat_window: int = 10
-    ngram_n: int = 3
-    high_threshold: float = 0.85
-    patience: int = 3
-    include_mid_readiness: bool = True
-
-    def __post_init__(self) -> None:
-        if self.unit != "step_or_small_block":
-            raise ValueError("stagnation.unit must be 'step_or_small_block'")
-        if self.block_min_tokens < 1:
-            raise ValueError("stagnation.block_min_tokens must be >= 1")
-        if self.block_max_steps < 1:
-            raise ValueError("stagnation.block_max_steps must be >= 1")
-        if self.metric != "word_3gram_jaccard":
-            raise ValueError("stagnation.metric must be 'word_3gram_jaccard'")
-        if self.repeat_window < 1:
-            raise ValueError("stagnation.repeat_window must be >= 1")
-        if self.ngram_n < 1:
-            raise ValueError("stagnation.ngram_n must be >= 1")
-        if not 0.0 <= self.high_threshold <= 1.0:
-            raise ValueError("stagnation.high_threshold must be in [0, 1]")
-        if self.patience < 1:
-            raise ValueError("stagnation.patience must be >= 1")
-
-
-@dataclass
-class AnchorConfig:
-    type: str = "clean_autonomy_anchor"
-    refresh_condition: str = "slm_step_and_slm_active"
-    freeze_on_hcs_suspect: bool = True
-    freeze_on_stagnation_suspect: bool = True
-    llm_steps_do_not_refresh: bool = True
-    fallback: str = "startup_anchor_or_zero"
-
-    def __post_init__(self) -> None:
-        if self.type != "clean_autonomy_anchor":
-            raise ValueError("anchor.type must be 'clean_autonomy_anchor'")
-        if self.refresh_condition != "slm_step_and_slm_active":
-            raise ValueError("anchor.refresh_condition must be 'slm_step_and_slm_active'")
-        if self.fallback not in {"startup_anchor_or_zero", "zero"}:
-            raise ValueError("anchor.fallback must be 'startup_anchor_or_zero' or 'zero'")
-
-
-@dataclass
-class RoutingConfig:
-    enabled: bool = True
-
-
-@dataclass
-class LowReadinessConfig:
-    useful_exploration_grace_steps: int = 2
-    persistent_low_after_grace_action: str = "llm_lease_no_rollback"
-
-    def __post_init__(self) -> None:
-        if self.useful_exploration_grace_steps < 0:
-            raise ValueError("low_readiness.useful_exploration_grace_steps must be >= 0")
-        if self.persistent_low_after_grace_action != "llm_lease_no_rollback":
-            raise ValueError(
-                "low_readiness.persistent_low_after_grace_action must be 'llm_lease_no_rollback'"
-            )
-
-
-@dataclass
-class ConfirmedStagnationConfig:
-    action: str = "rollback_to_clean_anchor_then_llm_lease"
-    include_mid_readiness: bool = True
-    max_rollbacks_per_problem: int = 2
-
-    def __post_init__(self) -> None:
-        if self.action != "rollback_to_clean_anchor_then_llm_lease":
-            raise ValueError(
-                "confirmed_stagnation.action must be 'rollback_to_clean_anchor_then_llm_lease'"
-            )
-        if self.max_rollbacks_per_problem < 0:
-            raise ValueError("confirmed_stagnation.max_rollbacks_per_problem must be >= 0")
-
-
-@dataclass
-class LLMLeaseConfig:
-    enabled: bool = True
-    prompt_type: str = "normal_continuation"
-    mention_uncertainty: bool = False
-    mention_stagnation: bool = False
-    mention_repetition: bool = False
-    mention_error: bool = False
-    max_tokens_per_step: int = 256
-    max_steps_per_event: int = 2
-    return_to_slm: bool = False
-
-    def __post_init__(self) -> None:
-        if self.prompt_type != "normal_continuation":
-            raise ValueError("llm_lease.prompt_type must be 'normal_continuation'")
-        if self.mention_uncertainty or self.mention_stagnation or self.mention_repetition or self.mention_error:
-            raise ValueError("LLM lease prompts must not mention uncertainty, stagnation, repetition, or errors")
-        for name in [
-            "max_tokens_per_step",
-            "max_steps_per_event",
-        ]:
-            if getattr(self, name) < 0:
-                raise ValueError(f"llm_lease.{name} must be >= 0")
-        if self.max_tokens_per_step < 1:
-            raise ValueError("llm_lease.max_tokens_per_step must be >= 1")
-        if self.max_steps_per_event < 1:
-            raise ValueError("llm_lease.max_steps_per_event must be >= 1")
-
-
-@dataclass
-class PostLeaseObserveConfig:
-    observe_slm_blocks: int = 0
-    suppress_startup_rollback: bool = True
-    suppress_immediate_rollback: bool = True
-
-    def __post_init__(self) -> None:
-        if self.observe_slm_blocks < 0:
-            raise ValueError("post_lease_observe.observe_slm_blocks must be >= 0")
-
-
-@dataclass
-class HCSConfig:
-    enabled: bool = True
-    enable_after_clean_anchor: bool = True
-    suspect_condition: str = "raw_readiness_high_and_stagnation_high"
-    suspect_patience: int = 3
-    action: str = "rollback_to_clean_anchor"
-    max_hcs_rollbacks_per_problem: int = 2
-
-    def __post_init__(self) -> None:
-        if self.suspect_condition != "raw_readiness_high_and_stagnation_high":
-            raise ValueError("hcs.suspect_condition must be 'raw_readiness_high_and_stagnation_high'")
-        if self.suspect_patience < 1:
-            raise ValueError("hcs.suspect_patience must be >= 1")
-        if self.action != "rollback_to_clean_anchor":
-            raise ValueError("hcs.action must be 'rollback_to_clean_anchor'")
-        if self.max_hcs_rollbacks_per_problem < 0:
-            raise ValueError("hcs.max_hcs_rollbacks_per_problem must be >= 0")
-
-
-@dataclass
-class HCSRecoveryConfig:
-    generator: str = "llm"
-    prompt_type: str = "normal_continuation"
-    mention_stagnation: bool = False
-    mention_repetition: bool = False
-    max_llm_steps: int = 2
-    max_tokens_per_step: int = 128
-    return_to_slm_after_recovery: bool = True
-
-    def __post_init__(self) -> None:
-        if self.generator != "llm":
-            raise ValueError("hcs_recovery.generator must be 'llm'")
-        if self.prompt_type != "normal_continuation":
-            raise ValueError("hcs_recovery.prompt_type must be 'normal_continuation'")
-        if self.mention_stagnation:
-            raise ValueError("hcs_recovery.mention_stagnation must remain false")
-        if self.mention_repetition:
-            raise ValueError("hcs_recovery.mention_repetition must remain false")
-        if self.max_llm_steps < 1:
-            raise ValueError("hcs_recovery.max_llm_steps must be >= 1")
-        if self.max_tokens_per_step < 1:
-            raise ValueError("hcs_recovery.max_tokens_per_step must be >= 1")
-
-
-@dataclass
-class LowConfidenceConfig:
-    useful_exploration_grace_blocks: int = 2
-    collapse_patience_blocks: int = 3
-    action_after_patience: str = "existing_rollback_recovery"
-
-    def __post_init__(self) -> None:
-        if self.useful_exploration_grace_blocks < 0:
-            raise ValueError("low_confidence.useful_exploration_grace_blocks must be >= 0")
-        if self.collapse_patience_blocks < 1:
-            raise ValueError("low_confidence.collapse_patience_blocks must be >= 1")
-        if self.collapse_patience_blocks <= self.useful_exploration_grace_blocks:
-            raise ValueError("low_confidence.collapse_patience_blocks must be > useful_exploration_grace_blocks")
-        if self.action_after_patience != "existing_rollback_recovery":
-            raise ValueError("low_confidence.action_after_patience must be 'existing_rollback_recovery'")
-
-
-@dataclass
-class StartupGuardConfig:
-    hcs_enabled: bool = False
-    enable_hcs_after_clean_anchor: bool = True
-
-
-@dataclass
-class BudgetConfig:
-    max_total_hcs_llm_tokens_per_problem: int = 512
-    max_total_llm_recovery_tokens_per_problem: int = 1024
-    max_rollbacks_per_problem: int = 4
-    max_stagnation_rollbacks_per_problem: int = 2
-
-    def __post_init__(self) -> None:
-        if self.max_total_hcs_llm_tokens_per_problem < 0:
-            raise ValueError("budget.max_total_hcs_llm_tokens_per_problem must be >= 0")
-        if self.max_total_llm_recovery_tokens_per_problem < 0:
-            raise ValueError("budget.max_total_llm_recovery_tokens_per_problem must be >= 0")
-        if self.max_rollbacks_per_problem < 0:
-            raise ValueError("budget.max_rollbacks_per_problem must be >= 0")
-        if self.max_stagnation_rollbacks_per_problem < 0:
-            raise ValueError("budget.max_stagnation_rollbacks_per_problem must be >= 0")
-
-
-@dataclass
-class RoutingBudgetConfig:
-    max_total_llm_events_per_problem: int = 8
-    max_total_llm_tokens_per_problem: int = 4096
-    max_ciod_events_per_problem: int = 1
-    max_readiness_events_per_problem: int = 0
-    max_stagnation_events_per_problem: int = 0
-
-    def __post_init__(self) -> None:
-        for name in [
-            "max_total_llm_events_per_problem",
-            "max_total_llm_tokens_per_problem",
-            "max_ciod_events_per_problem",
-            "max_readiness_events_per_problem",
-            "max_stagnation_events_per_problem",
-        ]:
-            if getattr(self, name) < 0:
-                raise ValueError(f"routing_budget.{name} must be >= 0")
-
-
-@dataclass
-class StartupConfig:
-    B_min: int = 2
-    B_max: int = 5
-    tau_start: int = 1
-    max_steps: int | None = None
-    never_reenter_after_recovery: bool = True
-    never_reenter_after_llm_lease: bool = True
-    never_reenter_after_clean_anchor: bool = True
-
-    def __post_init__(self) -> None:
-        if self.max_steps is not None:
-            self.B_max = self.max_steps
-        if self.B_min < 1:
-            raise ValueError("startup.B_min must be >= 1")
-        if self.B_max < self.B_min:
-            raise ValueError("startup.B_max must be >= startup.B_min")
-        if self.tau_start < 1:
-            raise ValueError("startup.tau_start must be >= 1")
-        self.max_steps = self.B_max
-
-
-@dataclass
-class StableConfig:
-    theta_s: float = 0.70
-    tau_D: int = 1
-
-    def __post_init__(self) -> None:
-        if not 0.0 <= self.theta_s <= 1.0:
-            raise ValueError("stable.theta_s must be in [0, 1]")
-        if self.tau_D < 1:
-            raise ValueError("stable.tau_D must be >= 1")
-
-
-@dataclass
-class RollbackConfig:
-    M_max: int = 5
-    recovery_max_policy: str = "m_plus_1"
-    confidence_gated_recovery: bool = True
-    force_slm_after_recovery: bool = False
-    long_span_policy: str = "fallback_once_then_rollback"
-    max_long_span_fallbacks_per_anchor: int = 1
-    long_span_recovery_steps: int = 1
-    post_stable_intervention_policy: str = "suspect_confirmed_rollback"
-    suspect_confirm_steps: int = 1
-    suspect_max_steps: int = 2
-    tau_confirm: int = 1
-    anchor_repeat_policy: str = "suppress"
-    anchor_repeat_backoff_after: int = 1
-    anchor_repeat_backoff_steps: int = 1
-    max_root_rollbacks: int = 2
-    root_rollback_action: str = "force_close_think"
-    max_rollbacks_per_problem: int = 4
-    max_stagnation_rollbacks_per_problem: int = 2
-    fallback_if_no_clean_anchor: str = "startup_anchor_or_zero"
-
-    def __post_init__(self) -> None:
-        if self.M_max < 1:
-            raise ValueError("rollback.M_max must be >= 1")
-        if self.recovery_max_policy != "m_plus_1":
-            raise ValueError("Only rollback.recovery_max_policy='m_plus_1' is implemented.")
-        if self.long_span_policy not in {"fallback_no_delete", "rollback_to_anchor", "fallback_once_then_rollback"}:
-            raise ValueError(
-                "rollback.long_span_policy must be one of "
-                "'fallback_no_delete', 'rollback_to_anchor', or 'fallback_once_then_rollback'."
-            )
-        if self.max_long_span_fallbacks_per_anchor < 0:
-            raise ValueError("rollback.max_long_span_fallbacks_per_anchor must be >= 0")
-        if self.long_span_recovery_steps < 1:
-            raise ValueError("rollback.long_span_recovery_steps must be >= 1")
-        if self.post_stable_intervention_policy not in {
-            "suspect_confirmed_rollback",
-            "rollback_to_anchor",
-        }:
-            raise ValueError(
-                "rollback.post_stable_intervention_policy must be "
-                "'suspect_confirmed_rollback' or 'rollback_to_anchor'"
-            )
-        if self.suspect_confirm_steps < 1:
-            raise ValueError("rollback.suspect_confirm_steps must be >= 1")
-        if self.suspect_max_steps < self.suspect_confirm_steps:
-            raise ValueError("rollback.suspect_max_steps must be >= suspect_confirm_steps")
-        if self.tau_confirm < 1:
-            raise ValueError("rollback.tau_confirm must be >= 1")
-        if self.anchor_repeat_policy not in {"suppress", "backoff", "allow"}:
-            raise ValueError("rollback.anchor_repeat_policy must be 'suppress', 'backoff', or 'allow'")
-        if self.anchor_repeat_backoff_after < 1:
-            raise ValueError("rollback.anchor_repeat_backoff_after must be >= 1")
-        if self.anchor_repeat_backoff_steps < 0:
-            raise ValueError("rollback.anchor_repeat_backoff_steps must be >= 0")
-        if self.max_root_rollbacks < 0:
-            raise ValueError("rollback.max_root_rollbacks must be >= 0")
-        if self.root_rollback_action not in {"force_close_think", "allow"}:
-            raise ValueError("rollback.root_rollback_action must be 'force_close_think' or 'allow'")
-        if self.max_rollbacks_per_problem < 0:
-            raise ValueError("rollback.max_rollbacks_per_problem must be >= 0")
-        if self.max_stagnation_rollbacks_per_problem < 0:
-            raise ValueError("rollback.max_stagnation_rollbacks_per_problem must be >= 0")
-        if self.fallback_if_no_clean_anchor not in {"startup_anchor_or_zero", "zero"}:
-            raise ValueError("rollback.fallback_if_no_clean_anchor must be 'startup_anchor_or_zero' or 'zero'")
+            raise ValueError("ciod.exposure_e0 must be >= 0")
+        if self.hazard_scale < 0.0:
+            raise ValueError("ciod.hazard_scale must be >= 0")
+        if self.off_threshold > self.on_threshold:
+            raise ValueError("ciod.off_threshold must be <= ciod.on_threshold")
+        if self.exposure_threshold < self.masked_low_threshold:
+            raise ValueError("ciod.exposure_threshold must be >= ciod.masked_low_threshold")
 
 
 @dataclass
 class LoggingConfig:
     save_step_records: bool = True
-    save_rollback_events: bool = True
+    save_driver_switch_events: bool = True
     save_transition_stats: bool = True
 
 
@@ -567,33 +151,16 @@ class RuntimeConfig:
 
 @dataclass
 class SARRConfig:
-    method: str = "sarr_code_v3_state_aware_routing_rollback"
+    method: str = "sarr_code_v4_ciod_driver"
     metadata: dict[str, Any] = field(default_factory=dict)
     slm: ModelRuntimeConfig = field(default_factory=lambda: ModelRuntimeConfig(model_path=""))
     llm: ModelRuntimeConfig = field(default_factory=lambda: ModelRuntimeConfig(model_path="", backend="openai"))
     output_dir: str = "sarr_results"
     dataset_paths: dict[str, str] = field(default_factory=dict)
     generation: GenerationConfig = field(default_factory=GenerationConfig)
+    controller: ControllerConfig = field(default_factory=ControllerConfig)
     confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
-    confidence_process: ConfidenceProcessConfig = field(default_factory=ConfidenceProcessConfig)
-    calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
-    readiness: ReadinessConfig = field(default_factory=ReadinessConfig)
-    stagnation: StagnationConfig = field(default_factory=StagnationConfig)
-    anchor: AnchorConfig = field(default_factory=AnchorConfig)
-    routing: RoutingConfig = field(default_factory=RoutingConfig)
-    low_readiness: LowReadinessConfig = field(default_factory=LowReadinessConfig)
-    confirmed_stagnation: ConfirmedStagnationConfig = field(default_factory=ConfirmedStagnationConfig)
-    llm_lease: LLMLeaseConfig = field(default_factory=LLMLeaseConfig)
-    post_lease_observe: PostLeaseObserveConfig = field(default_factory=PostLeaseObserveConfig)
-    hcs: HCSConfig = field(default_factory=HCSConfig)
-    hcs_recovery: HCSRecoveryConfig = field(default_factory=HCSRecoveryConfig)
-    low_confidence: LowConfidenceConfig = field(default_factory=LowConfidenceConfig)
-    startup_guard: StartupGuardConfig = field(default_factory=StartupGuardConfig)
-    startup: StartupConfig = field(default_factory=StartupConfig)
-    stable: StableConfig = field(default_factory=StableConfig)
-    rollback: RollbackConfig = field(default_factory=RollbackConfig)
-    budget: BudgetConfig = field(default_factory=BudgetConfig)
-    routing_budget: RoutingBudgetConfig = field(default_factory=RoutingBudgetConfig)
+    ciod: CIODConfig = field(default_factory=CIODConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
@@ -616,38 +183,17 @@ class SARRConfig:
             kwargs["llm"] = ModelRuntimeConfig(**kwargs["llm"])
         for key, cls_ in [
             ("generation", GenerationConfig),
+            ("controller", ControllerConfig),
             ("confidence", ConfidenceConfig),
-            ("confidence_process", ConfidenceProcessConfig),
-            ("calibration", CalibrationConfig),
-            ("readiness", ReadinessConfig),
-            ("stagnation", StagnationConfig),
-            ("anchor", AnchorConfig),
-            ("routing", RoutingConfig),
-            ("low_readiness", LowReadinessConfig),
-            ("confirmed_stagnation", ConfirmedStagnationConfig),
-            ("llm_lease", LLMLeaseConfig),
-            ("post_lease_observe", PostLeaseObserveConfig),
-            ("hcs", HCSConfig),
-            ("hcs_recovery", HCSRecoveryConfig),
-            ("low_confidence", LowConfidenceConfig),
-            ("startup_guard", StartupGuardConfig),
-            ("startup", StartupConfig),
-            ("stable", StableConfig),
-            ("rollback", RollbackConfig),
-            ("budget", BudgetConfig),
-            ("routing_budget", RoutingBudgetConfig),
+            ("ciod", CIODConfig),
             ("logging", LoggingConfig),
             ("runtime", RuntimeConfig),
         ]:
             if isinstance(kwargs.get(key), dict):
                 kwargs[key] = cls_(**kwargs[key])
         cfg = cls(**kwargs)
-        if cfg.confidence.percentile_normalization:
-            raise ValueError("This experiment disables calibration; confidence.percentile_normalization must be false")
-        if cfg.confidence.calibration_path:
-            raise ValueError("This experiment disables calibration; confidence.calibration_path must be null")
         if cfg.slm.backend != "transformers":
-            raise ValueError("SARR-CoDE requires slm.backend='transformers' for local logits diagnostics.")
+            raise ValueError("SARR-CoDE requires slm.backend='transformers' for local logits.")
         if cfg.llm.backend == "transformers":
             raise ValueError("Use llm.backend='openai' or 'vllm'. SLM is the local transformers model.")
         return cfg
