@@ -44,7 +44,6 @@ SUMMARY_KEYS = [
     "avg_handoff_probe_count",
     "handoff_success_rate",
     "handoff_failure_rate",
-    "answer_stability_rate",
     "degenerative_loop_rate",
     "prefix_contamination_rate",
     "rollback_rate",

@@ -77,7 +77,6 @@ class ConfidenceConfig:
 @dataclass
 class RiskConfig:
     enable_local_difficulty_routing: bool = False
-    enable_answer_stability: bool = True
     stable_reference_min_steps: int = 3
     recent_window: int = 4
     prefix_recent_steps: int = 3
@@ -87,8 +86,6 @@ class RiskConfig:
     low_new_information_threshold: float = 0.72
     prefix_bad_ratio: float = 0.66
     handoff_max_risk_rank: int = 1
-    answer_stability_min_mentions: int = 2
-    answer_stability_recent_window: int = 4
 
     def __post_init__(self) -> None:
         if self.stable_reference_min_steps < 1:
@@ -109,10 +106,6 @@ class RiskConfig:
                 raise ValueError(f"risk.{name} must be in [0, 1]")
         if self.handoff_max_risk_rank < 0:
             raise ValueError("risk.handoff_max_risk_rank must be >= 0")
-        if self.answer_stability_min_mentions < 2:
-            raise ValueError("risk.answer_stability_min_mentions must be >= 2")
-        if self.answer_stability_recent_window < 1:
-            raise ValueError("risk.answer_stability_recent_window must be >= 1")
 
 
 @dataclass

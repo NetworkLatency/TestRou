@@ -220,29 +220,6 @@ class DetectionResult:
 
 
 @dataclass
-class CandidateHistory:
-    value: str
-    first_seen_step: int
-    mention_count: int = 0
-    last_seen_step: int = 0
-    step_ids: list[int] = field(default_factory=list)
-    surrounding_verification_text: list[str] = field(default_factory=list)
-
-    @property
-    def distinct_step_count(self) -> int:
-        return len(set(self.step_ids))
-
-    def snapshot(self) -> dict[str, Any]:
-        return {
-            "candidate": self.value,
-            "first_seen_step": self.first_seen_step,
-            "mention_count": self.mention_count,
-            "last_seen_step": self.last_seen_step,
-            "distinct_step_count": self.distinct_step_count,
-        }
-
-
-@dataclass
 class SealedInterval:
     anchor_step_id: int
     removed_start_step_id: int
@@ -655,129 +632,6 @@ class StableStepMemory:
         return max(anchors) if anchors else None
 
 
-class AnswerStabilityDetector:
-    def __init__(self, cfg: RiskConfig) -> None:
-        self.cfg = cfg
-        self.histories: dict[str, CandidateHistory] = {}
-        self.stable_candidate: str | None = None
-        self.trigger_count = 0
-        self.last_reason: str = ""
-
-    def known_candidates(self) -> list[str]:
-        return list(self.histories)
-
-    def update(self, record: StepRecord, signals: StepSignals, trajectory: TrajectoryState) -> DetectionResult:
-        current_candidate = signals.candidate_answer_value
-        candidates_to_update: list[str] = []
-        if current_candidate:
-            candidates_to_update.append(current_candidate)
-        for candidate in self.histories:
-            if _contains_candidate(record.text, candidate):
-                candidates_to_update.append(candidate)
-
-        for candidate in dict.fromkeys(candidates_to_update):
-            mentions = max(1, _candidate_mention_count(record.text, candidate))
-            history = self.histories.get(candidate)
-            if history is None:
-                history = CandidateHistory(
-                    value=candidate,
-                    first_seen_step=record.step_id,
-                    last_seen_step=record.step_id,
-                )
-                self.histories[candidate] = history
-            history.mention_count += mentions
-            history.last_seen_step = record.step_id
-            if not history.step_ids or history.step_ids[-1] != record.step_id:
-                history.step_ids.append(record.step_id)
-            if signals.repeated_verification_pattern_count or signals.reflection_pattern_count:
-                history.surrounding_verification_text.append(record.text[:240])
-
-        if not self.cfg.enable_answer_stability:
-            return DetectionResult()
-
-        result = self._detect(trajectory)
-        if result.triggered:
-            self.stable_candidate = result.candidate_answer
-            self.trigger_count += 1
-            self.last_reason = result.reason
-        return result
-
-    def _detect(self, trajectory: TrajectoryState) -> DetectionResult:
-        if not self.histories:
-            return DetectionResult()
-        recent = trajectory.get_recent_steps(self.cfg.answer_stability_recent_window)
-        if not recent:
-            return DetectionResult()
-        recent_start = recent[0].step_id
-        recent_mentions = {
-            history.value: sum(1 for record in recent if _contains_candidate(record.text, history.value))
-            for history in self.histories.values()
-        }
-        active_candidates = []
-        for history in self.histories.values():
-            if history.mention_count < self.cfg.answer_stability_min_mentions:
-                continue
-            if history.distinct_step_count < 2:
-                continue
-            if recent_mentions.get(history.value, 0) < 2:
-                continue
-            active_candidates.append(history)
-        if not active_candidates:
-            return DetectionResult()
-        active_candidates.sort(key=lambda h: (recent_mentions.get(h.value, 0), h.last_seen_step, h.mention_count), reverse=True)
-        best = active_candidates[0]
-        conflicts = [
-            history
-            for history in self.histories.values()
-            if history.value != best.value
-            and history.last_seen_step >= recent_start
-            and recent_mentions.get(history.value, 0) >= 2
-        ]
-        if conflicts:
-            return DetectionResult()
-
-        candidate_recent_mentions = recent_mentions.get(best.value, 0)
-        recent_signals = [record.observed_signals for record in recent if isinstance(record.observed_signals, dict)]
-        verification_steps = sum(
-            1
-            for sig in recent_signals
-            if int(sig.get("repeated_verification_pattern_count") or 0) > 0
-            or int(sig.get("reflection_pattern_count") or 0) > 0
-        )
-        low_info_steps = sum(
-            1
-            for sig in recent_signals
-            if float(sig.get("low_new_information_score") or 0.0) >= self.cfg.low_new_information_threshold * 0.75
-        )
-        substantive_progress_steps = sum(
-            1
-            for sig in recent_signals
-            if (
-                bool(sig.get("has_new_equation"))
-                or bool(sig.get("has_new_case_split"))
-                or bool(sig.get("has_new_constraint"))
-            )
-            and float(sig.get("low_new_information_score") or 0.0) < self.cfg.low_new_information_threshold * 0.75
-        )
-        repeats = sum(1 for sig in recent_signals if bool(sig.get("repeats_existing_candidate_answer")))
-
-        enough_self_check = verification_steps >= 1 or low_info_steps >= 2 or repeats >= 1
-        if candidate_recent_mentions >= 2 and enough_self_check and substantive_progress_steps <= 1:
-            return DetectionResult(
-                triggered=True,
-                reason="candidate_answer_stable_but_thinking_continues",
-                onset_step_id=best.first_seen_step,
-                candidate_answer=best.value,
-            )
-        return DetectionResult()
-
-    def snapshot(self) -> dict[str, Any]:
-        return {
-            "stable_candidate": self.stable_candidate,
-            "candidates": [history.snapshot() for history in self.histories.values()],
-        }
-
-
 class RiskDetector:
     def __init__(self, cfg: RiskConfig) -> None:
         self.cfg = cfg
@@ -849,53 +703,11 @@ class RiskDetector:
                 )
         return DetectionResult()
 
-    def degenerative_loop(
-        self,
-        trajectory: TrajectoryState,
-        answer_detector: AnswerStabilityDetector,
-    ) -> DetectionResult:
+    def degenerative_loop(self, trajectory: TrajectoryState) -> DetectionResult:
         recent = trajectory.get_recent_steps(self.cfg.recent_window)
         if len(recent) < 2:
             return DetectionResult()
         recent_signals = [_signals_from_record(record) for record in recent]
-        stable_candidate = answer_detector.stable_candidate
-        if stable_candidate:
-            mentions = sum(1 for record in recent if _contains_candidate(record.text, stable_candidate))
-            verification = sum(sig.repeated_verification_pattern_count + sig.reflection_pattern_count for sig in recent_signals)
-            low_info = sum(1 for sig in recent_signals if sig.low_new_information_score >= self.cfg.low_new_information_threshold * 0.75)
-            if mentions >= 2 and (verification >= 2 or low_info >= 2):
-                return DetectionResult(
-                    triggered=True,
-                    reason="stable_candidate_repeated_in_verification_loop",
-                    onset_step_id=recent[0].step_id,
-                    loop_type="answer_verification_loop",
-                    candidate_answer=stable_candidate,
-                )
-
-        recent_candidates = [
-            sig.candidate_answer_value
-            for sig in recent_signals
-            if sig.candidate_answer_value
-        ]
-        if recent_candidates:
-            candidate, count = Counter(recent_candidates).most_common(1)[0]
-            mentions = sum(1 for record in recent if _contains_candidate(record.text, candidate))
-            verification = sum(sig.repeated_verification_pattern_count + sig.reflection_pattern_count for sig in recent_signals)
-            low_info = sum(1 for sig in recent_signals if sig.low_new_information_score >= self.cfg.low_new_information_threshold * 0.75)
-            substantive_progress = sum(
-                1
-                for sig in recent_signals
-                if (sig.has_new_equation or sig.has_new_case_split or sig.has_new_constraint)
-                and sig.low_new_information_score < self.cfg.low_new_information_threshold * 0.75
-            )
-            if count >= 2 and mentions >= 2 and (verification >= 2 or low_info >= 2) and substantive_progress <= 1:
-                return DetectionResult(
-                    triggered=True,
-                    reason="repeated_candidate_answer_verification_loop",
-                    onset_step_id=recent[0].step_id,
-                    loop_type="answer_verification_loop",
-                    candidate_answer=candidate,
-                )
 
         skeletons = [normalize_step_skeleton(record.text) for record in recent if len(record.text.strip()) >= 20]
         if len(skeletons) >= 2 and (skeletons[-1] == skeletons[-2] or (len(skeletons) >= 3 and skeletons[-1] == skeletons[-3])):
@@ -999,7 +811,6 @@ class OwnershipController:
         self.local_difficulty_count = 0
         self.prefix_contamination_count = 0
         self.degenerative_loop_count = 0
-        self.answer_stability_count = 0
         self.rollback_count = 0
         self.repeated_rollback_blocked_count = 0
         self.confidence_forward_count = 0
@@ -1085,7 +896,6 @@ class OwnershipController:
             "local_difficulty_count": self.local_difficulty_count,
             "prefix_contamination_count": self.prefix_contamination_count,
             "degenerative_loop_count": self.degenerative_loop_count,
-            "answer_stability_count": self.answer_stability_count,
             "rollback_count": self.rollback_count,
             "sealed_interval_count": len(trajectory.sealed_intervals),
             "repeated_rollback_blocked_count": self.repeated_rollback_blocked_count,

@@ -19,7 +19,6 @@ from .controller import (
     SLM_ACTIVE,
     SOURCE_LLM,
     SOURCE_SLM,
-    AnswerStabilityDetector,
     HandoffReadiness,
     ObservableSignals,
     OwnershipController,
@@ -355,7 +354,6 @@ def run_sarr_code(
     signals_engine = ObservableSignals(cfg.risk)
     stable_memory = StableStepMemory(cfg.risk)
     risk_detector = RiskDetector(cfg.risk)
-    answer_detector = AnswerStabilityDetector(cfg.risk)
     handoff_readiness = HandoffReadiness(cfg.risk)
     sealed_lock = SealedIntervalLock()
     controller = OwnershipController(problem_id, cfg.risk, cfg.controller.initial_driver)
@@ -382,7 +380,7 @@ def run_sarr_code(
                     source=SOURCE_SLM,
                     output_extra=output.extra,
                     trajectory=trajectory,
-                    known_candidates=answer_detector.known_candidates(),
+                    known_candidates=[],
                 )
                 record = _record_step(
                     trajectory=trajectory,
@@ -400,7 +398,6 @@ def run_sarr_code(
                 _sync_prefix(state, trajectory)
 
                 thinking_stop = _strict_thinking_stop_reason(output, output.text)
-                answer_stability = answer_detector.update(record, signals, trajectory)
 
                 if thinking_stop is not None:
                     record.action = "FINISHED" if thinking_stop == "finished" else f"STOP_{thinking_stop.upper()}"
@@ -409,19 +406,7 @@ def run_sarr_code(
                     controller.switch(CLOSE_OR_FINALIZE, step_id=record.step_id, reason=stop_reason)
                     break
 
-                if cfg.risk.enable_answer_stability and answer_stability.triggered:
-                    controller.answer_stability_count += 1
-                    controller.note_event(
-                        "answer_stability_detected",
-                        step_id=record.step_id,
-                        reason=answer_stability.reason,
-                        data=answer_stability.to_dict(),
-                    )
-                    stop_reason = "answer_stability"
-                    controller.switch(CLOSE_OR_FINALIZE, step_id=record.step_id, reason=stop_reason)
-                    break
-
-                loop = risk_detector.degenerative_loop(trajectory, answer_detector)
+                loop = risk_detector.degenerative_loop(trajectory)
                 if loop.triggered:
                     controller.degenerative_loop_count += 1
                     controller.note_event(
@@ -430,15 +415,10 @@ def run_sarr_code(
                         reason=loop.reason,
                         data=loop.to_dict(),
                     )
-                    if loop.candidate_answer or answer_detector.stable_candidate:
-                        answer_detector.stable_candidate = loop.candidate_answer or answer_detector.stable_candidate
-                        stop_reason = "degenerative_loop_with_stable_answer"
-                        controller.switch(CLOSE_OR_FINALIZE, step_id=record.step_id, reason=stop_reason)
-                        break
                     controller.switch(
                         LLM_FORWARD_OWNERSHIP,
                         step_id=record.step_id,
-                        reason="degenerative_loop_without_stable_answer",
+                        reason="degenerative_loop",
                         data=loop.to_dict(),
                     )
                     continue
@@ -549,7 +529,7 @@ def run_sarr_code(
                     source=SOURCE_LLM,
                     output_extra=output.extra,
                     trajectory=trajectory,
-                    known_candidates=answer_detector.known_candidates(),
+                    known_candidates=[],
                 )
                 record = _record_step(
                     trajectory=trajectory,
@@ -567,24 +547,11 @@ def run_sarr_code(
                 _sync_prefix(state, trajectory)
 
                 thinking_stop = _strict_thinking_stop_reason(output, output.text)
-                answer_stability = answer_detector.update(record, signals, trajectory)
-                if cfg.risk.enable_answer_stability and answer_stability.triggered:
-                    controller.answer_stability_count += 1
-                    controller.note_event(
-                        "answer_stability_detected",
-                        step_id=record.step_id,
-                        reason=answer_stability.reason,
-                        data=answer_stability.to_dict(),
-                    )
 
                 if thinking_stop is not None:
                     record.action = "FINISHED" if thinking_stop == "finished" else f"STOP_{thinking_stop.upper()}"
                     _replace_step_log(step_logs, record)
                     stop_reason = thinking_stop
-                    controller.switch(CLOSE_OR_FINALIZE, step_id=record.step_id, reason=stop_reason)
-                    break
-                if cfg.risk.enable_answer_stability and answer_stability.triggered:
-                    stop_reason = "answer_stability"
                     controller.switch(CLOSE_OR_FINALIZE, step_id=record.step_id, reason=stop_reason)
                     break
 
@@ -606,7 +573,7 @@ def run_sarr_code(
                     source=SOURCE_SLM,
                     output_extra=output.extra,
                     trajectory=trajectory,
-                    known_candidates=answer_detector.known_candidates(),
+                    known_candidates=[],
                 )
                 readiness = handoff_readiness.evaluate(
                     probe_text=output.text,
@@ -631,15 +598,9 @@ def run_sarr_code(
                     )
                     attempt_id += 1
                     _sync_prefix(state, trajectory)
-                    answer_stability = answer_detector.update(record, signals, trajectory)
                     thinking_stop = _strict_thinking_stop_reason(output, output.text)
                     if thinking_stop is not None:
                         stop_reason = thinking_stop
-                        controller.switch(CLOSE_OR_FINALIZE, step_id=record.step_id, reason=stop_reason)
-                        break
-                    if cfg.risk.enable_answer_stability and answer_stability.triggered:
-                        controller.answer_stability_count += 1
-                        stop_reason = "answer_stability"
                         controller.switch(CLOSE_OR_FINALIZE, step_id=record.step_id, reason=stop_reason)
                         break
                     stable_memory.add_if_stable(record, signals)
@@ -687,8 +648,6 @@ def run_sarr_code(
         should_close = (
             stop_reason in {
                 "think_token_budget",
-                "answer_stability",
-                "degenerative_loop_with_stable_answer",
                 "done",
                 "empty_step",
             }
@@ -712,7 +671,7 @@ def run_sarr_code(
                 cfg=cfg,
                 trajectory=trajectory,
                 controller=controller,
-                fallback_answer=answer_detector.stable_candidate,
+                fallback_answer=None,
             )
         except ContextBudgetExceeded as exc:
             state.stop_reason = "context_budget_final_answer"
@@ -735,7 +694,6 @@ def run_sarr_code(
         slm_prefill_count=state.slm_generate_calls,
         llm_prefill_count=state.llm_full_calls,
     )
-    summary["answer_stability"] = answer_detector.snapshot()
     state.trace.append(TraceEvent(state.step_count, "sarr_summary", summary))
     state.trace.append(TraceEvent(state.step_count, "step_logs", {"steps": step_logs}))
     state.trace.append(TraceEvent(state.step_count, "controller_events", {"events": controller.events}))

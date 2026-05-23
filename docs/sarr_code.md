@@ -123,7 +123,6 @@ handoff_failure_count
 local_difficulty_count
 prefix_contamination_count
 degenerative_loop_count
-answer_stability_count
 rollback_count
 sealed_interval_count
 repeated_rollback_blocked_count

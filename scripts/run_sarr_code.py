@@ -155,7 +155,6 @@ def _problem_sarr_metrics(result, step_rows: list[dict[str, Any]], controller_ro
         "local_difficulty_count": int(_num(summary.get("local_difficulty_count"))),
         "prefix_contamination_count": int(_num(summary.get("prefix_contamination_count"))),
         "degenerative_loop_count": int(_num(summary.get("degenerative_loop_count"))),
-        "answer_stability_count": int(_num(summary.get("answer_stability_count"))),
         "rollback_count": int(_num(summary.get("rollback_count"))),
         "has_rollback": int(_num(summary.get("rollback_count"))) > 0,
         "sealed_interval_count": int(_num(summary.get("sealed_interval_count"))),
@@ -196,11 +195,6 @@ def _extra_sarr_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "handoff_failure_rate": (
             total("handoff_failure_count") / total("handoff_probe_count")
             if total("handoff_probe_count")
-            else 0.0
-        ),
-        "answer_stability_rate": (
-            sum(1 for row in rows if int(_num(row.get("answer_stability_count"))) > 0) / n
-            if n
             else 0.0
         ),
         "degenerative_loop_rate": (
