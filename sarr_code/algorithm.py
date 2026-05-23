@@ -60,6 +60,14 @@ def _stop_strings_for_slm(cfg: SARRConfig) -> list[str]:
     return [stop for stop in cfg.generation.step_delimiters if stop]
 
 
+def _stop_strings_for_llm(cfg: SARRConfig) -> list[str]:
+    stops: list[str] = []
+    for stop in [*cfg.generation.step_delimiters, CLOSE_THINK_TAG]:
+        if stop and stop not in stops:
+            stops.append(stop)
+    return stops
+
+
 def _ensure_step_terminator(step_text: str, finish_reason: str, delimiters: list[str]) -> str:
     if finish_reason == "eos" or CLOSE_THINK_TAG in step_text or not delimiters:
         return step_text
@@ -77,6 +85,24 @@ def _strict_thinking_stop_reason(generation: StepOutput, step_text: str) -> str 
     if generation.finish_reason == "eos":
         return "eos"
     return None
+
+
+def _text_step_count(text: str, delimiters: list[str]) -> int:
+    if not str(text or "").strip():
+        return 0
+    primary = next((delimiter for delimiter in delimiters if delimiter), "\n\n")
+    count = str(text).count(primary)
+    if count > 0:
+        return count
+    return 1
+
+
+def _output_step_count(output: StepOutput, cfg: SARRConfig) -> int:
+    return _text_step_count(output.text, cfg.generation.step_delimiters)
+
+
+def _removed_text_step_count(records: list[StepRecord], cfg: SARRConfig) -> int:
+    return max(1, sum(_text_step_count(record.text, cfg.generation.step_delimiters) for record in records))
 
 
 def _final_answer_prefix(thinking_text: str) -> str:
@@ -216,9 +242,9 @@ def _generate_llm_step(
         state.problem_text,
         state.assistant_prefix_text,
         max_new_tokens=max_new_tokens,
-        stop_delimiters=[CLOSE_THINK_TAG],
+        stop_delimiters=_stop_strings_for_llm(cfg),
     )
-    output.text = _ensure_step_terminator(output.text, output.finish_reason, [])
+    output.text = _ensure_step_terminator(output.text, output.finish_reason, cfg.generation.step_delimiters)
     _account_generation_cost(
         state,
         "llm",
@@ -254,6 +280,7 @@ def _record_step(
     output: StepOutput,
     source: str,
     controller: OwnershipController,
+    cfg: SARRConfig,
     signals: StepSignals,
     action: str,
     attempt_id: int,
@@ -261,6 +288,8 @@ def _record_step(
     transition_events: list[dict[str, Any]],
     extra: dict[str, Any] | None = None,
 ) -> StepRecord:
+    payload = dict(extra or {})
+    payload.setdefault("text_step_count", _output_step_count(output, cfg))
     record = trajectory.append_active_step(
         output=output,
         source=source,
@@ -268,7 +297,7 @@ def _record_step(
         observed_signals=signals,
         action=action,
         attempt_id=attempt_id,
-        extra=extra,
+        extra=payload,
     )
     trans = _apply_transition_metadata(trajectory.records)
     if trans is not None:
@@ -291,6 +320,7 @@ def _append_probe_discard(
     trajectory: TrajectoryState,
     output: StepOutput,
     controller: OwnershipController,
+    cfg: SARRConfig,
     signals: StepSignals,
     attempt_id: int,
     reason: str,
@@ -304,6 +334,7 @@ def _append_probe_discard(
         action="HANDOFF_PROBE_DISCARDED",
         attempt_id=attempt_id,
         reason=reason,
+        extra={"text_step_count": _output_step_count(output, cfg)},
     )
     step_logs.append(_serialize_step(record))
     return record
@@ -358,6 +389,7 @@ def run_sarr_code(
                     output=output,
                     source=SOURCE_SLM,
                     controller=controller,
+                    cfg=cfg,
                     signals=signals,
                     action="SLM_CONTINUE",
                     attempt_id=attempt_id,
@@ -377,7 +409,7 @@ def run_sarr_code(
                     controller.switch(CLOSE_OR_FINALIZE, step_id=record.step_id, reason=stop_reason)
                     break
 
-                if answer_stability.triggered:
+                if cfg.risk.enable_answer_stability and answer_stability.triggered:
                     controller.answer_stability_count += 1
                     controller.note_event(
                         "answer_stability_detected",
@@ -435,6 +467,7 @@ def run_sarr_code(
                     if anchor is not None:
                         removed = trajectory.rollback_to_step(anchor)
                         if removed:
+                            repair_horizon = _removed_text_step_count(removed, cfg)
                             controller.rollback_count += 1
                             stable_memory.remove_after(anchor)
                             removed_start = min(item.step_id for item in removed)
@@ -444,14 +477,14 @@ def run_sarr_code(
                                 removed_start_step_id=removed_start,
                                 removed_end_step_id=removed_end,
                                 reason=contamination.reason,
-                                repair_horizon=len(removed),
+                                repair_horizon=repair_horizon,
                                 removed_steps=removed,
                             )
                             sealed_lock.add(interval)
                             for removed_record in removed:
                                 _replace_step_log(step_logs, removed_record)
                             _sync_prefix(state, trajectory)
-                            controller.start_repair(repair_horizon=len(removed))
+                            controller.start_repair(repair_horizon=repair_horizon)
                             controller.note_event(
                                 "prefix_contamination_rollback",
                                 step_id=record.step_id,
@@ -461,7 +494,8 @@ def run_sarr_code(
                                     "anchor_step_id": anchor,
                                     "removed_start_step_id": removed_start,
                                     "removed_end_step_id": removed_end,
-                                    "repair_horizon": len(removed),
+                                    "repair_horizon": repair_horizon,
+                                    "removed_record_count": len(removed),
                                 },
                             )
                             controller.switch(
@@ -486,22 +520,23 @@ def run_sarr_code(
                     )
                     continue
 
-                local = risk_detector.local_difficulty(record, signals, stable_memory)
-                if local.triggered:
-                    controller.local_difficulty_count += 1
-                    controller.note_event(
-                        "local_difficulty_detected",
-                        step_id=record.step_id,
-                        reason=local.reason,
-                        data=local.to_dict(),
-                    )
-                    controller.switch(
-                        LLM_FORWARD_OWNERSHIP,
-                        step_id=record.step_id,
-                        reason="local_difficulty",
-                        data=local.to_dict(),
-                    )
-                    continue
+                if cfg.risk.enable_local_difficulty_routing:
+                    local = risk_detector.local_difficulty(record, signals, stable_memory)
+                    if local.triggered:
+                        controller.local_difficulty_count += 1
+                        controller.note_event(
+                            "local_difficulty_detected",
+                            step_id=record.step_id,
+                            reason=local.reason,
+                            data=local.to_dict(),
+                        )
+                        controller.switch(
+                            LLM_FORWARD_OWNERSHIP,
+                            step_id=record.step_id,
+                            reason="local_difficulty",
+                            data=local.to_dict(),
+                        )
+                        continue
 
                 stable_memory.add_if_stable(record, signals)
                 continue
@@ -521,6 +556,7 @@ def run_sarr_code(
                     output=output,
                     source=SOURCE_LLM,
                     controller=controller,
+                    cfg=cfg,
                     signals=signals,
                     action="LLM_FORWARD_CONTINUE" if ownership_state == LLM_FORWARD_OWNERSHIP else "LLM_REPAIR_CONTINUE",
                     attempt_id=attempt_id,
@@ -532,7 +568,7 @@ def run_sarr_code(
 
                 thinking_stop = _strict_thinking_stop_reason(output, output.text)
                 answer_stability = answer_detector.update(record, signals, trajectory)
-                if answer_stability.triggered:
+                if cfg.risk.enable_answer_stability and answer_stability.triggered:
                     controller.answer_stability_count += 1
                     controller.note_event(
                         "answer_stability_detected",
@@ -547,13 +583,13 @@ def run_sarr_code(
                     stop_reason = thinking_stop
                     controller.switch(CLOSE_OR_FINALIZE, step_id=record.step_id, reason=stop_reason)
                     break
-                if answer_stability.triggered:
+                if cfg.risk.enable_answer_stability and answer_stability.triggered:
                     stop_reason = "answer_stability"
                     controller.switch(CLOSE_OR_FINALIZE, step_id=record.step_id, reason=stop_reason)
                     break
 
                 if ownership_state == LLM_REPAIR_OWNERSHIP:
-                    controller.note_repair_step()
+                    controller.note_repair_step(_output_step_count(output, cfg))
                     if not controller.repair_horizon_satisfied():
                         continue
 
@@ -585,6 +621,7 @@ def run_sarr_code(
                         output=output,
                         source=SOURCE_SLM,
                         controller=controller,
+                        cfg=cfg,
                         signals=signals,
                         action="HANDOFF_PROBE_ACCEPTED",
                         attempt_id=attempt_id,
@@ -600,7 +637,7 @@ def run_sarr_code(
                         stop_reason = thinking_stop
                         controller.switch(CLOSE_OR_FINALIZE, step_id=record.step_id, reason=stop_reason)
                         break
-                    if answer_stability.triggered:
+                    if cfg.risk.enable_answer_stability and answer_stability.triggered:
                         controller.answer_stability_count += 1
                         stop_reason = "answer_stability"
                         controller.switch(CLOSE_OR_FINALIZE, step_id=record.step_id, reason=stop_reason)
@@ -614,6 +651,7 @@ def run_sarr_code(
                     trajectory=trajectory,
                     output=output,
                     controller=controller,
+                    cfg=cfg,
                     signals=signals,
                     attempt_id=attempt_id,
                     reason=readiness.reason,

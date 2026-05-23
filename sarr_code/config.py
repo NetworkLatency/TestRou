@@ -76,6 +76,8 @@ class ConfidenceConfig:
 
 @dataclass
 class RiskConfig:
+    enable_local_difficulty_routing: bool = False
+    enable_answer_stability: bool = True
     stable_reference_min_steps: int = 3
     recent_window: int = 4
     prefix_recent_steps: int = 3

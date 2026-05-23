@@ -94,7 +94,20 @@ def _normalize_candidate(value: str | None) -> str | None:
     candidate = candidate.strip(" ,;:.")
     if not candidate:
         return None
+    if not _is_strong_candidate(candidate):
+        return None
     return candidate[:100]
+
+
+def _is_strong_candidate(candidate: str) -> bool:
+    value = str(candidate or "").strip()
+    if not value:
+        return False
+    if re.fullmatch(r"[A-Za-z]", value):
+        return False
+    if re.fullmatch(r"(?:the|a|an|it|this|that|yes|no)", value, flags=re.I):
+        return False
+    return bool(re.search(r"\d|\\(?:frac|sqrt)|[=+\-*/^%]", value))
 
 
 def extract_candidate_answer(text: str) -> str | None:
@@ -117,7 +130,7 @@ def _short_candidate(raw: str) -> str | None:
     if boxed is not None:
         return _normalize_candidate(boxed)
     math_match = re.search(
-        r"(\\frac\s*\{[^{}\r\n]{1,80}\}\s*\{[^{}\r\n]{1,80}\}|[-+]?\d+(?:\.\d+)?(?:\s*/\s*[-+]?\d+(?:\.\d+)?)?%?|\b[ABCD]\b)",
+        r"(\\frac\s*\{[^{}\r\n]{1,80}\}\s*\{[^{}\r\n]{1,80}\}|[-+]?\d+(?:\.\d+)?(?:\s*/\s*[-+]?\d+(?:\.\d+)?)?%?)",
         text,
         flags=re.I,
     )
@@ -135,7 +148,17 @@ def _candidate_mention_count(text: str, candidate: str | None) -> int:
     raw = str(text or "")
     if not raw:
         return 0
-    return raw.lower().count(candidate.lower())
+    escaped_parts = [re.escape(part) for part in str(candidate).split()]
+    if not escaped_parts:
+        return 0
+    pattern = r"\s+".join(escaped_parts)
+    pattern = pattern.replace(r"\/", r"\s*/\s*")
+    pattern = pattern.replace(r"\+", r"\s*\+\s*")
+    pattern = pattern.replace(r"\-", r"\s*-\s*")
+    try:
+        return len(re.findall(rf"(?<![A-Za-z0-9]){pattern}(?![A-Za-z0-9])", raw, flags=re.I))
+    except re.error:
+        return raw.lower().count(candidate.lower())
 
 
 def _contains_candidate(text: str, candidate: str | None) -> bool:
@@ -664,9 +687,13 @@ class AnswerStabilityDetector:
                 self.histories[candidate] = history
             history.mention_count += mentions
             history.last_seen_step = record.step_id
-            history.step_ids.append(record.step_id)
+            if not history.step_ids or history.step_ids[-1] != record.step_id:
+                history.step_ids.append(record.step_id)
             if signals.repeated_verification_pattern_count or signals.reflection_pattern_count:
                 history.surrounding_verification_text.append(record.text[:240])
+
+        if not self.cfg.enable_answer_stability:
+            return DetectionResult()
 
         result = self._detect(trajectory)
         if result.triggered:
@@ -682,25 +709,34 @@ class AnswerStabilityDetector:
         if not recent:
             return DetectionResult()
         recent_start = recent[0].step_id
-        active_candidates = [
-            history
+        recent_mentions = {
+            history.value: sum(1 for record in recent if _contains_candidate(record.text, history.value))
             for history in self.histories.values()
-            if history.mention_count >= self.cfg.answer_stability_min_mentions
-            and history.distinct_step_count >= 2
-        ]
+        }
+        active_candidates = []
+        for history in self.histories.values():
+            if history.mention_count < self.cfg.answer_stability_min_mentions:
+                continue
+            if history.distinct_step_count < 2:
+                continue
+            if recent_mentions.get(history.value, 0) < 2:
+                continue
+            active_candidates.append(history)
         if not active_candidates:
             return DetectionResult()
-        active_candidates.sort(key=lambda h: (h.mention_count, h.last_seen_step), reverse=True)
+        active_candidates.sort(key=lambda h: (recent_mentions.get(h.value, 0), h.last_seen_step, h.mention_count), reverse=True)
         best = active_candidates[0]
         conflicts = [
             history
             for history in self.histories.values()
-            if history.value != best.value and history.last_seen_step >= recent_start
+            if history.value != best.value
+            and history.last_seen_step >= recent_start
+            and recent_mentions.get(history.value, 0) >= 2
         ]
         if conflicts:
             return DetectionResult()
 
-        candidate_recent_mentions = sum(1 for record in recent if _contains_candidate(record.text, best.value))
+        candidate_recent_mentions = recent_mentions.get(best.value, 0)
         recent_signals = [record.observed_signals for record in recent if isinstance(record.observed_signals, dict)]
         verification_steps = sum(
             1
@@ -713,17 +749,26 @@ class AnswerStabilityDetector:
             for sig in recent_signals
             if float(sig.get("low_new_information_score") or 0.0) >= self.cfg.low_new_information_threshold * 0.75
         )
-        progress_steps = sum(1 for sig in recent_signals if bool(sig.get("has_progress")))
+        substantive_progress_steps = sum(
+            1
+            for sig in recent_signals
+            if (
+                bool(sig.get("has_new_equation"))
+                or bool(sig.get("has_new_case_split"))
+                or bool(sig.get("has_new_constraint"))
+            )
+            and float(sig.get("low_new_information_score") or 0.0) < self.cfg.low_new_information_threshold * 0.75
+        )
         repeats = sum(1 for sig in recent_signals if bool(sig.get("repeats_existing_candidate_answer")))
 
-        if candidate_recent_mentions >= 2 and (verification_steps >= 2 or low_info_steps >= 2 or repeats >= 1):
-            if progress_steps <= max(1, len(recent) // 2):
-                return DetectionResult(
-                    triggered=True,
-                    reason="candidate_answer_stable_but_thinking_continues",
-                    onset_step_id=best.first_seen_step,
-                    candidate_answer=best.value,
-                )
+        enough_self_check = verification_steps >= 1 or low_info_steps >= 2 or repeats >= 1
+        if candidate_recent_mentions >= 2 and enough_self_check and substantive_progress_steps <= 1:
+            return DetectionResult(
+                triggered=True,
+                reason="candidate_answer_stable_but_thinking_continues",
+                onset_step_id=best.first_seen_step,
+                candidate_answer=best.value,
+            )
         return DetectionResult()
 
     def snapshot(self) -> dict[str, Any]:
@@ -825,6 +870,31 @@ class RiskDetector:
                     onset_step_id=recent[0].step_id,
                     loop_type="answer_verification_loop",
                     candidate_answer=stable_candidate,
+                )
+
+        recent_candidates = [
+            sig.candidate_answer_value
+            for sig in recent_signals
+            if sig.candidate_answer_value
+        ]
+        if recent_candidates:
+            candidate, count = Counter(recent_candidates).most_common(1)[0]
+            mentions = sum(1 for record in recent if _contains_candidate(record.text, candidate))
+            verification = sum(sig.repeated_verification_pattern_count + sig.reflection_pattern_count for sig in recent_signals)
+            low_info = sum(1 for sig in recent_signals if sig.low_new_information_score >= self.cfg.low_new_information_threshold * 0.75)
+            substantive_progress = sum(
+                1
+                for sig in recent_signals
+                if (sig.has_new_equation or sig.has_new_case_split or sig.has_new_constraint)
+                and sig.low_new_information_score < self.cfg.low_new_information_threshold * 0.75
+            )
+            if count >= 2 and mentions >= 2 and (verification >= 2 or low_info >= 2) and substantive_progress <= 1:
+                return DetectionResult(
+                    triggered=True,
+                    reason="repeated_candidate_answer_verification_loop",
+                    onset_step_id=recent[0].step_id,
+                    loop_type="answer_verification_loop",
+                    candidate_answer=candidate,
                 )
 
         skeletons = [normalize_step_skeleton(record.text) for record in recent if len(record.text.strip()) >= 20]
@@ -977,8 +1047,8 @@ class OwnershipController:
         self.repair_horizon = max(1, repair_horizon)
         self.repair_generated_steps = 0
 
-    def note_repair_step(self) -> None:
-        self.repair_generated_steps += 1
+    def note_repair_step(self, step_count: int = 1) -> None:
+        self.repair_generated_steps += max(0, int(step_count))
 
     def repair_horizon_satisfied(self) -> bool:
         return self.repair_generated_steps >= self.repair_horizon
