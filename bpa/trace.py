@@ -84,7 +84,7 @@ def result_summary(result: BPAResult) -> dict[str, Any]:
     total_decode_tokens = result.slm_decode_tokens + result.llm_decode_tokens
     llm_wall_time = result.state.llm_generation_wall_time + result.state.llm_scoring_wall_time
     model_wall_time = result.state.slm_wall_time + llm_wall_time
-    return {
+    summary = {
         "answer": result.answer,
         "correct": result.correct,
         "generation_protocol": result.state.generation_protocol,
@@ -111,3 +111,10 @@ def result_summary(result: BPAResult) -> dict[str, Any]:
         "llm_wall_time_share": (llm_wall_time / model_wall_time) if model_wall_time else 0.0,
         "stop_reason": result.state.stop_reason,
     }
+    for event in reversed(result.state.trace):
+        if event.event == "sarr_summary":
+            summary.update(event.data)
+            break
+    if "finish_reason" not in summary:
+        summary["finish_reason"] = result.state.stop_reason
+    return summary

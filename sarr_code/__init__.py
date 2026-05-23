@@ -2,16 +2,16 @@ from __future__ import annotations
 
 from .algorithm import run_sarr_code
 from .calibration import PercentileNormalizer
-from .config import CIODConfig, ConfidenceConfig, ControllerConfig, GenerationConfig, SARRConfig
-from .records import RollbackEvent, StepOutput, StepRecord
+from .config import ConfidenceConfig, ControllerConfig, GenerationConfig, RiskConfig, SARRConfig
+from .records import ControllerEvent, StepOutput, StepRecord
 
 __all__ = [
-    "CIODConfig",
     "ConfidenceConfig",
+    "ControllerEvent",
     "ControllerConfig",
     "GenerationConfig",
     "PercentileNormalizer",
-    "RollbackEvent",
+    "RiskConfig",
     "SARRConfig",
     "StepOutput",
     "StepRecord",

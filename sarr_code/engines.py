@@ -142,19 +142,16 @@ def _topk_entropy_from_logits(logits, topk: int) -> tuple[float, dict[str, Any]]
     entropy = -(probs * torch.log(probs + 1e-12)).sum()
     norm_entropy = entropy / math.log(k)
     confidence = 1.0 - float(norm_entropy)
+    top_probs = [float(x) for x in probs.detach().cpu().tolist()]
+    margin = top_probs[0] - top_probs[1] if len(top_probs) >= 2 else top_probs[0]
     return confidence, {
         "top_ids": [int(x) for x in top_ids.detach().cpu().tolist()],
-        "top_probs": [float(x) for x in probs.detach().cpu().tolist()],
+        "top_probs": top_probs,
+        "top1_prob": top_probs[0] if top_probs else 0.0,
+        "top2_prob": top_probs[1] if len(top_probs) >= 2 else 0.0,
+        "margin": float(margin),
         "norm_entropy": float(norm_entropy.detach().cpu()),
     }
-
-
-def _trim_to_first_stop(text: str, stop_strings: list[str]) -> str:
-    matches = [(text.find(stop), stop) for stop in stop_strings if stop and stop in text]
-    if not matches:
-        return text
-    pos, stop = min(matches, key=lambda item: item[0])
-    return text[: pos + len(stop)]
 
 
 class _StopOnSubstrings:
@@ -164,13 +161,15 @@ class _StopOnSubstrings:
         prompt_len: int,
         stop_strings: list[str],
         *,
-        lookahead_target: str | None = None,
-        lookahead_tokens: int = 0,
+        immediate_stop_strings: list[str] | None = None,
+        min_stop_tokens: int = 0,
     ):
         from transformers import StoppingCriteria
 
         self.stop_reason: str | None = None
-        self.first_stop_token_count: int | None = None
+        self.stop_text: str | None = None
+        self.min_stop_tokens = max(0, int(min_stop_tokens))
+        self.immediate_stop_strings = [s for s in (immediate_stop_strings or []) if s]
         outer = self
 
         class Stopper(StoppingCriteria):
@@ -179,20 +178,16 @@ class _StopOnSubstrings:
                 if not generated:
                     return False
                 text = _decode(tokenizer, generated)
-                if lookahead_target and lookahead_tokens > 0:
-                    if lookahead_target in text:
-                        outer.stop_reason = "lookahead_target"
+                for stop in outer.immediate_stop_strings:
+                    if stop in text:
+                        outer.stop_reason = "immediate_stop"
+                        outer.stop_text = stop
                         return True
-                    if any(stop in text for stop in stop_strings):
-                        if outer.first_stop_token_count is None:
-                            outer.first_stop_token_count = len(generated)
-                        if len(generated) - outer.first_stop_token_count >= lookahead_tokens:
-                            outer.stop_reason = "lookahead_exhausted"
-                            return True
-                        return False
+                if len(generated) < outer.min_stop_tokens:
                     return False
-                if any(stop in text for stop in stop_strings):
+                if any(text.endswith(stop) for stop in stop_strings):
                     outer.stop_reason = "stop"
+                    outer.stop_text = next(stop for stop in stop_strings if text.endswith(stop))
                     return True
                 return False
 
@@ -252,8 +247,8 @@ class LocalTransformersSLM:
         stop_delimiters: list[str] | None,
         capture_token_entropy: bool = False,
         topk_entropy: int = 20,
-        close_tag_lookahead: str | None = None,
-        close_tag_lookahead_tokens: int = 0,
+        immediate_stop_strings: list[str] | None = None,
+        min_stop_tokens: int = 0,
     ) -> StepOutput:
         import torch
         from transformers import StoppingCriteriaList
@@ -275,8 +270,17 @@ class LocalTransformersSLM:
                 self.tokenizer,
                 input_ids.shape[-1],
                 stop_strings,
-                lookahead_target=close_tag_lookahead,
-                lookahead_tokens=close_tag_lookahead_tokens,
+                immediate_stop_strings=immediate_stop_strings,
+                min_stop_tokens=min_stop_tokens,
+            )
+            stopping.append(stop_tracker.criteria)
+        elif immediate_stop_strings:
+            stop_tracker = _StopOnSubstrings(
+                self.tokenizer,
+                input_ids.shape[-1],
+                [],
+                immediate_stop_strings=immediate_stop_strings,
+                min_stop_tokens=min_stop_tokens,
             )
             stopping.append(stop_tracker.criteria)
 
@@ -304,23 +308,10 @@ class LocalTransformersSLM:
 
         sequence = output.sequences[0]
         new_token_ids = [int(x) for x in sequence[input_ids.shape[-1] :].detach().cpu().tolist()]
-        raw_text = self.decode(new_token_ids)
-        text = raw_text
+        text = self.decode(new_token_ids)
         visible_token_ids = new_token_ids
-        lookahead_discarded_text = ""
-        if (
-            stop_tracker is not None
-            and stop_tracker.stop_reason == "lookahead_exhausted"
-            and close_tag_lookahead
-            and close_tag_lookahead not in raw_text
-        ):
-            text = _trim_to_first_stop(raw_text, stop_strings)
-            lookahead_discarded_text = raw_text[len(text) :]
-            visible_token_ids = self.encode(text)
         finish = "length"
-        if close_tag_lookahead and close_tag_lookahead in text:
-            finish = "stop"
-        elif stop_strings and any(stop in text for stop in stop_strings):
+        if stop_tracker is not None and stop_tracker.stop_reason in {"immediate_stop", "stop"}:
             finish = "stop"
         elif eos_token_id is not None and new_token_ids and new_token_ids[-1] == int(eos_token_id):
             finish = "eos"
@@ -330,15 +321,29 @@ class LocalTransformersSLM:
         }
         if stop_tracker is not None and stop_tracker.stop_reason:
             extra["stop_reason_detail"] = stop_tracker.stop_reason
-        if lookahead_discarded_text:
-            extra["lookahead_discarded_text"] = lookahead_discarded_text
-            extra["lookahead_discarded_token_count"] = max(0, len(new_token_ids) - len(visible_token_ids))
         if capture_token_entropy and getattr(output, "scores", None):
             token_entropies = []
+            token_confidences = []
+            token_margins = []
+            first_info: dict[str, Any] | None = None
             for score in output.scores:
-                _, info = _topk_entropy_from_logits(score[0], topk_entropy)
+                confidence, info = _topk_entropy_from_logits(score[0], topk_entropy)
+                if first_info is None:
+                    first_info = dict(info)
                 token_entropies.append(info["norm_entropy"])
+                token_confidences.append(confidence)
+                token_margins.append(info["margin"])
             extra["token_norm_entropies"] = token_entropies
+            extra["token_margins"] = token_margins
+            extra["confidence"] = {
+                "raw_next_token_confidence": token_confidences[0] if token_confidences else None,
+                "entropy": token_entropies[0] if token_entropies else None,
+                "margin": token_margins[0] if token_margins else None,
+                "mean_token_confidence": sum(token_confidences) / len(token_confidences) if token_confidences else None,
+                "mean_token_entropy": sum(token_entropies) / len(token_entropies) if token_entropies else None,
+                "mean_token_margin": sum(token_margins) / len(token_margins) if token_margins else None,
+                "first_token": first_info or {},
+            }
 
         return StepOutput(
             text=text,

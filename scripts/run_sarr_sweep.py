@@ -18,22 +18,20 @@ DEFAULT_RUN_SCRIPT = REPO_ROOT / "scripts" / "run_sarr_code.py"
 @dataclass(frozen=True)
 class SweepVariant:
     name: str
-    delta: float
-    theta_s: float
-    tau_start: int
-    tau_D: int
-    B_max: int
+    local_entropy_delta: float
+    prefix_bad_ratio: float
+    degeneration_score_threshold: float
+    low_new_information_threshold: float
+    handoff_max_risk_rank: int
 
 
 SWEEP_VARIANTS = [
-    SweepVariant("D1_balanced_055", delta=0.55, theta_s=0.70, tau_start=1, tau_D=1, B_max=5),
-    SweepVariant("D2_balanced_050", delta=0.50, theta_s=0.70, tau_start=1, tau_D=1, B_max=5),
-    SweepVariant("D3_balanced_060", delta=0.60, theta_s=0.70, tau_start=1, tau_D=1, B_max=5),
-    SweepVariant("D4_aggressive_startup", delta=0.55, theta_s=0.75, tau_start=1, tau_D=1, B_max=4),
-    SweepVariant("D5_conservative", delta=0.50, theta_s=0.65, tau_start=2, tau_D=2, B_max=6),
-    SweepVariant("D6_event_aggressive", delta=0.65, theta_s=0.70, tau_start=1, tau_D=1, B_max=4),
-    SweepVariant("D7_high_theta_post_conservative", delta=0.55, theta_s=0.75, tau_start=1, tau_D=2, B_max=5),
-    SweepVariant("D8_low_theta_post_repair", delta=0.60, theta_s=0.60, tau_start=2, tau_D=1, B_max=6),
+    SweepVariant("O1_balanced", 0.15, 0.66, 0.62, 0.72, 1),
+    SweepVariant("O2_conservative_handoff", 0.15, 0.66, 0.62, 0.72, 0),
+    SweepVariant("O3_sensitive_prefix", 0.15, 0.50, 0.62, 0.72, 1),
+    SweepVariant("O4_conservative_prefix", 0.18, 0.75, 0.68, 0.78, 1),
+    SweepVariant("O5_sensitive_local", 0.10, 0.66, 0.62, 0.72, 1),
+    SweepVariant("O6_loop_sensitive", 0.15, 0.66, 0.55, 0.65, 1),
 ]
 
 
@@ -41,18 +39,20 @@ SUMMARY_KEYS = [
     "accuracy",
     "num_problems",
     "num_evaluated",
+    "avg_driver_switch_count",
+    "avg_llm_ownership_episodes",
+    "avg_handoff_probe_count",
+    "handoff_success_rate",
+    "handoff_failure_rate",
+    "answer_stability_rate",
+    "degenerative_loop_rate",
+    "prefix_contamination_rate",
     "rollback_rate",
-    "startup_rollback_rate",
-    "post_stable_rollback_rate",
-    "avg_stagnation_rollback_count",
-    "avg_llm_lease_count",
-    "avg_rollback_span",
-    "avg_recovery_steps",
-    "recovery_ready_rate",
-    "recovery_exhausted_rate",
-    "forced_close_think_rate",
-    "force_slm_after_recovery_fail_rate",
-    "llm_token_ratio",
+    "total_rollback_count",
+    "total_sealed_interval_count",
+    "total_repeated_rollback_blocked_count",
+    "avg_confidence_forward_count",
+    "avg_lookahead_count",
     "avg_problem_wall_time",
     "avg_llm_token_share",
     "total_slm_decode_tokens",
@@ -74,11 +74,12 @@ def write_json(path: Path, data: dict[str, Any]) -> None:
 
 def apply_variant(base_config: dict[str, Any], variant: SweepVariant) -> dict[str, Any]:
     cfg = json.loads(json.dumps(base_config))
-    cfg.setdefault("confidence", {})["delta"] = variant.delta
-    cfg.setdefault("stable", {})["theta_s"] = variant.theta_s
-    cfg.setdefault("stable", {})["tau_D"] = variant.tau_D
-    cfg.setdefault("startup", {})["tau_start"] = variant.tau_start
-    cfg.setdefault("startup", {})["B_max"] = variant.B_max
+    risk = cfg.setdefault("risk", {})
+    risk["local_entropy_delta"] = variant.local_entropy_delta
+    risk["prefix_bad_ratio"] = variant.prefix_bad_ratio
+    risk["degeneration_score_threshold"] = variant.degeneration_score_threshold
+    risk["low_new_information_threshold"] = variant.low_new_information_threshold
+    risk["handoff_max_risk_rank"] = variant.handoff_max_risk_rank
     cfg.setdefault("metadata", {})
     cfg["metadata"]["sweep_variant"] = asdict(variant)
     return cfg
@@ -181,7 +182,7 @@ def write_variant_manifest(output_root: Path, dataset: str, variants: list[Sweep
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the predefined SARR-CoDE D1-D8 parameter sweep.")
+    parser = argparse.ArgumentParser(description="Run the predefined SARR-CoDE ownership-controller sweep.")
     parser.add_argument("--base-config", default="configs/sarr_code_aggressive.json")
     parser.add_argument("--dataset", default="aime25", choices=["math500", "aime24", "aime25", "gpqa", "gpqa_diamond"])
     parser.add_argument("--max-problems", type=int, default=None)

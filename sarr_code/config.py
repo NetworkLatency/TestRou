@@ -28,108 +28,89 @@ class ModelRuntimeConfig:
 
 @dataclass
 class GenerationConfig:
-    max_new_tokens_per_step: int = 256
+    max_new_tokens_per_step: int = 512
+    min_new_tokens_per_step: int = 64
     think_token_budget: int = 8192
     answer_token_budget: int = 2048
     step_delimiters: list[str] = field(default_factory=lambda: ["\n\n"])
     final_answer_generator: str = "active"
-    force_close_think_on_budget: bool = True
-    force_close_think_text: str = (
-        "\nWe are out of reliable reasoning budget. Stop reasoning now. "
-        "Do not restart the solution after </think>. After </think>, give only the final answer "
-        "using the strongest conclusion above; if uncertain, make the best concise guess.\n</think>\n\n"
-    )
-    close_tag_lookahead_tokens: int = 16
+    force_close_think_text: str = "\n</think>\n\n"
 
     def __post_init__(self) -> None:
         if self.max_new_tokens_per_step < 1:
             raise ValueError("generation.max_new_tokens_per_step must be >= 1")
+        if self.min_new_tokens_per_step < 1:
+            raise ValueError("generation.min_new_tokens_per_step must be >= 1")
+        if self.min_new_tokens_per_step > self.max_new_tokens_per_step:
+            raise ValueError("generation.min_new_tokens_per_step must be <= max_new_tokens_per_step")
         if self.think_token_budget < 1:
             raise ValueError("generation.think_token_budget must be >= 1")
         if self.answer_token_budget < 1:
             raise ValueError("generation.answer_token_budget must be >= 1")
-        if self.close_tag_lookahead_tokens < 0:
-            raise ValueError("generation.close_tag_lookahead_tokens must be >= 0")
         if self.final_answer_generator not in {"slm", "llm", "active"}:
             raise ValueError("generation.final_answer_generator must be 'slm', 'llm', or 'active'")
 
 
 @dataclass
 class ControllerConfig:
-    mode: str = "ciod_driver_switching"
+    mode: str = "ownership_controller"
     initial_driver: str = "slm"
 
     def __post_init__(self) -> None:
-        if self.mode != "ciod_driver_switching":
-            raise ValueError("controller.mode must be 'ciod_driver_switching'")
+        if self.mode != "ownership_controller":
+            raise ValueError("controller.mode must be 'ownership_controller'")
         if self.initial_driver != "slm":
             raise ValueError("controller.initial_driver must be 'slm'")
 
 
 @dataclass
 class ConfidenceConfig:
-    """Confidence observation config. score_type is metadata; top_k and smooth_window are active."""
+    """Top-k logits captured during SLM generation for local confidence signals."""
 
-    score_type: str = "normalized_topk_entropy"
     top_k: int = 20
-    smooth_window: int = 3
 
     def __post_init__(self) -> None:
-        if self.score_type != "normalized_topk_entropy":
-            raise ValueError("confidence.score_type must be 'normalized_topk_entropy'")
         if self.top_k < 2:
             raise ValueError("confidence.top_k must be >= 2")
-        if self.smooth_window < 1:
-            raise ValueError("confidence.smooth_window must be >= 1")
 
 
 @dataclass
-class CIODConfig:
-    """CI-OD (Confidence-based Intervention on Degeneration) driver switching config.
-
-    Risk formula (v2):
-        hazard = hazard_scale * (1 + masked_memory) * max(0, post_masked_exposure - exposure_e0)^2
-        ciod_risk = 1 - exp(-hazard)
-
-    State equations per SLM step:
-        masked_uncertainty = (c_raw <= masked_low_threshold) AND (c_smooth > masked_low_threshold)
-        masked_memory_t = masked_decay * masked_memory_{t-1} + 1[masked_uncertainty]
-        exp_inc = 1 if (masked_memory > 0 AND c_smooth >= exposure_threshold) else 0
-        post_masked_exposure_t = exposure_decay * post_masked_exposure_{t-1} + exp_inc
-    """
-
-    masked_low_threshold: float = 0.35
-    exposure_threshold: float = 0.60
-    masked_decay: float = 0.98
-    exposure_decay: float = 0.98
-    min_masked_memory: float = 3.0
-    exposure_e0: float = 8.0
-    hazard_scale: float = 0.005
-    on_threshold: float = 0.10
-    off_threshold: float = 0.03
+class RiskConfig:
+    stable_reference_min_steps: int = 3
+    recent_window: int = 4
+    prefix_recent_steps: int = 3
+    local_entropy_delta: float = 0.15
+    local_margin_ratio: float = 0.55
+    degeneration_score_threshold: float = 0.62
+    low_new_information_threshold: float = 0.72
+    prefix_bad_ratio: float = 0.66
+    handoff_max_risk_rank: int = 1
+    answer_stability_min_mentions: int = 2
+    answer_stability_recent_window: int = 4
 
     def __post_init__(self) -> None:
+        if self.stable_reference_min_steps < 1:
+            raise ValueError("risk.stable_reference_min_steps must be >= 1")
+        if self.recent_window < 1:
+            raise ValueError("risk.recent_window must be >= 1")
+        if self.prefix_recent_steps < 1:
+            raise ValueError("risk.prefix_recent_steps must be >= 1")
         for name in [
-            "masked_low_threshold",
-            "exposure_threshold",
-            "masked_decay",
-            "exposure_decay",
-            "on_threshold",
-            "off_threshold",
+            "local_entropy_delta",
+            "local_margin_ratio",
+            "degeneration_score_threshold",
+            "low_new_information_threshold",
+            "prefix_bad_ratio",
         ]:
             v = getattr(self, name)
             if not 0.0 <= v <= 1.0:
-                raise ValueError(f"ciod.{name} must be in [0, 1]")
-        if self.min_masked_memory < 0.0:
-            raise ValueError("ciod.min_masked_memory must be >= 0")
-        if self.exposure_e0 < 0.0:
-            raise ValueError("ciod.exposure_e0 must be >= 0")
-        if self.hazard_scale < 0.0:
-            raise ValueError("ciod.hazard_scale must be >= 0")
-        if self.off_threshold > self.on_threshold:
-            raise ValueError("ciod.off_threshold must be <= ciod.on_threshold")
-        if self.exposure_threshold < self.masked_low_threshold:
-            raise ValueError("ciod.exposure_threshold must be >= ciod.masked_low_threshold")
+                raise ValueError(f"risk.{name} must be in [0, 1]")
+        if self.handoff_max_risk_rank < 0:
+            raise ValueError("risk.handoff_max_risk_rank must be >= 0")
+        if self.answer_stability_min_mentions < 2:
+            raise ValueError("risk.answer_stability_min_mentions must be >= 2")
+        if self.answer_stability_recent_window < 1:
+            raise ValueError("risk.answer_stability_recent_window must be >= 1")
 
 
 @dataclass
@@ -151,7 +132,7 @@ class RuntimeConfig:
 
 @dataclass
 class SARRConfig:
-    method: str = "sarr_code_v4_ciod_driver"
+    method: str = "sarr_code_v5_ownership_controller"
     metadata: dict[str, Any] = field(default_factory=dict)
     slm: ModelRuntimeConfig = field(default_factory=lambda: ModelRuntimeConfig(model_path=""))
     llm: ModelRuntimeConfig = field(default_factory=lambda: ModelRuntimeConfig(model_path="", backend="openai"))
@@ -160,7 +141,7 @@ class SARRConfig:
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     controller: ControllerConfig = field(default_factory=ControllerConfig)
     confidence: ConfidenceConfig = field(default_factory=ConfidenceConfig)
-    ciod: CIODConfig = field(default_factory=CIODConfig)
+    risk: RiskConfig = field(default_factory=RiskConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
@@ -185,7 +166,7 @@ class SARRConfig:
             ("generation", GenerationConfig),
             ("controller", ControllerConfig),
             ("confidence", ConfidenceConfig),
-            ("ciod", CIODConfig),
+            ("risk", RiskConfig),
             ("logging", LoggingConfig),
             ("runtime", RuntimeConfig),
         ]:
