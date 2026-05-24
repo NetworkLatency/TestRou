@@ -213,7 +213,8 @@ def _generate_slm_step(
         state.assistant_prefix_text,
         max_new_tokens=max_new_tokens,
         stop_delimiters=_stop_strings_for_slm(cfg),
-        capture_token_entropy=True,
+        capture_token_entropy=cfg.confidence.capture_topk_entropy,
+        capture_token_logprobs=cfg.confidence.capture_token_logprobs,
         topk_entropy=cfg.confidence.top_k,
         immediate_stop_strings=[CLOSE_THINK_TAG],
         min_stop_tokens=min(cfg.generation.min_new_tokens_per_step, max_new_tokens),
@@ -273,6 +274,20 @@ def _force_close_if_needed(state: GenerationState, cfg: SARRConfig, reason: str)
     return reason
 
 
+def _offline_probability_payload(output: StepOutput) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for key in [
+        "generated_token_logprobs",
+        "token_probability",
+        "token_norm_entropies",
+        "token_margins",
+        "confidence",
+    ]:
+        if key in output.extra:
+            payload[key] = output.extra[key]
+    return payload
+
+
 def _record_step(
     *,
     trajectory: TrajectoryState,
@@ -289,6 +304,7 @@ def _record_step(
 ) -> StepRecord:
     payload = dict(extra or {})
     payload.setdefault("text_step_count", _output_step_count(output, cfg))
+    payload.update(_offline_probability_payload(output))
     record = trajectory.append_active_step(
         output=output,
         source=source,
@@ -333,7 +349,7 @@ def _append_probe_discard(
         action="HANDOFF_PROBE_DISCARDED",
         attempt_id=attempt_id,
         reason=reason,
-        extra={"text_step_count": _output_step_count(output, cfg)},
+        extra={"text_step_count": _output_step_count(output, cfg), **_offline_probability_payload(output)},
     )
     step_logs.append(_serialize_step(record))
     return record

@@ -31,9 +31,6 @@ SOURCE_SYSTEM = "SYSTEM"
 
 _WORD_RE = re.compile(r"[A-Za-z0-9]+")
 _SENTENCE_RE = re.compile(r"[^.!?\n]+[.!?]?", re.M)
-_MATH_EQ_RE = re.compile(r"(?:=|\\frac|\\sqrt|\\sum|\\prod|\\binom|\d+\s*[+\-*/^]\s*\d+)")
-_CASE_SPLIT_RE = re.compile(r"\b(?:case|if|suppose|assume|otherwise|when)\b", re.I)
-_CONSTRAINT_RE = re.compile(r"\b(?:must|given|constraint|condition|require|since|because)\b", re.I)
 _REFLECTION_PATTERNS = [
     "wait",
     "let me check",
@@ -277,8 +274,8 @@ def _self_check_or_repetition(signals: "StepSignals") -> bool:
     )
 
 
-def _low_quality_without_progress(signals: "StepSignals") -> bool:
-    return (not signals.has_progress) and _self_check_or_repetition(signals)
+def _low_quality_step(signals: "StepSignals") -> bool:
+    return _self_check_or_repetition(signals)
 
 
 @dataclass
@@ -293,14 +290,10 @@ class StepSignals:
     repeated_answer_mention_count: int = 0
     low_new_information_score: float = 0.0
     reflection_pattern_count: int = 0
-    has_new_equation: bool = False
-    has_new_case_split: bool = False
-    has_new_constraint: bool = False
     has_candidate_answer: bool = False
     candidate_answer_value: str | None = None
     repeats_existing_candidate_answer: bool = False
     degeneration_score: float = 0.0
-    has_progress: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -500,16 +493,7 @@ class ObservableSignals:
         repeated_answer_count = self._known_candidate_mentions(text, candidate, known_candidates, recent)
         low_new_info = self._low_new_information_score(tokens, recent_tokens, text, recent_text)
 
-        has_new_equation = bool(_MATH_EQ_RE.search(text or ""))
-        has_new_case_split = bool(_CASE_SPLIT_RE.search(text or ""))
-        has_new_constraint = bool(_CONSTRAINT_RE.search(text or ""))
         repeats_candidate = bool(candidate and any(_contains_candidate(record.text, candidate) for record in recent))
-        has_progress = (
-            has_new_equation
-            or has_new_case_split
-            or has_new_constraint
-            or (candidate is not None and not repeats_candidate)
-        )
 
         degeneration_score = self._degeneration_score(
             ngram_ratio=ngram_ratio,
@@ -519,7 +503,6 @@ class ObservableSignals:
             repeated_answer_count=repeated_answer_count,
             low_new_info=low_new_info,
             reflection_count=reflection_count,
-            has_progress=has_progress,
         )
 
         return StepSignals(
@@ -533,14 +516,10 @@ class ObservableSignals:
             repeated_answer_mention_count=repeated_answer_count,
             low_new_information_score=low_new_info,
             reflection_pattern_count=reflection_count,
-            has_new_equation=has_new_equation,
-            has_new_case_split=has_new_case_split,
-            has_new_constraint=has_new_constraint,
             has_candidate_answer=candidate is not None,
             candidate_answer_value=candidate,
             repeats_existing_candidate_answer=repeats_candidate,
             degeneration_score=degeneration_score,
-            has_progress=has_progress,
         )
 
     def _repeated_ngram_ratio(self, tokens: list[str], recent_tokens: list[str], n: int = 4) -> float:
@@ -622,7 +601,6 @@ class ObservableSignals:
         repeated_answer_count: int,
         low_new_info: float,
         reflection_count: int,
-        has_progress: bool,
     ) -> float:
         score = 0.0
         score += 0.24 * ngram_ratio
@@ -632,8 +610,6 @@ class ObservableSignals:
         score += 0.14 * min(1.0, reflection_count / 3)
         score += 0.12 * min(1.0, repeated_answer_count / 3)
         score += 0.18 * low_new_info
-        if has_progress:
-            score -= 0.18
         return max(0.0, min(1.0, score))
 
 
@@ -654,7 +630,7 @@ class StableStepMemory:
     def add_if_stable(self, record: StepRecord, signals: StepSignals) -> bool:
         if record.source != SOURCE_SLM or record.status != ACTIVE:
             return False
-        if _low_quality_without_progress(signals):
+        if _low_quality_step(signals):
             return False
         if self.has_enough_reference():
             comparison = self.compare_to_stable(signals)
@@ -735,7 +711,7 @@ class RiskDetector:
         if (
             comparison["outside_stable_envelope"]
             and comparison["worse_votes"] > comparison["better_votes"]
-            and not _low_quality_without_progress(signals)
+            and not _low_quality_step(signals)
         ):
             return DetectionResult(
                 triggered=True,
@@ -753,27 +729,19 @@ class RiskDetector:
         if len(recent) < min(2, self.cfg.prefix_recent_steps):
             return DetectionResult()
         bad: list[StepRecord] = []
-        low_progress_count = 0
-        progress_count = 0
         for record in recent:
             signals = _signals_from_record(record)
             comparison = stable_memory.compare_to_stable(signals)
-            low_progress = not signals.has_progress
             if (
-                _low_quality_without_progress(signals)
+                _low_quality_step(signals)
                 or (
                     comparison["outside_stable_envelope"]
                     and comparison["worse_votes"] > comparison["better_votes"]
-                    and low_progress
                 )
             ):
                 bad.append(record)
-            if low_progress:
-                low_progress_count += 1
-            else:
-                progress_count += 1
 
-        if len(bad) > len(recent) - len(bad) and low_progress_count >= progress_count:
+        if len(bad) > len(recent) - len(bad):
             return DetectionResult(
                 triggered=True,
                 reason="recent_slm_steps_drifted_from_stable_memory",
@@ -788,7 +756,7 @@ class RiskDetector:
         if candidate_values:
             most_common, count = Counter(candidate_values).most_common(1)[0]
             verification = sum(_signals_from_record(record).repeated_verification_pattern_count for record in recent)
-            if count >= 2 and verification >= 2 and low_progress_count >= 2:
+            if count >= 2 and verification >= 2:
                 return DetectionResult(
                     triggered=True,
                     reason="recent_slm_steps_repeated_candidate_verification",
@@ -818,11 +786,10 @@ class RiskDetector:
             if sig.repeated_verification_pattern_count > 0 or sig.repeated_phrase_count > 0 or sig.repeated_sentence_count > 0
         )
         hesitation_count = sum(1 for sig in recent_signals if sig.reflection_pattern_count > 0)
-        no_progress_count = sum(1 for sig in recent_signals if not sig.has_progress)
-        loop_like_count = sum(1 for sig in recent_signals if _low_quality_without_progress(sig))
+        loop_like_count = sum(1 for sig in recent_signals if _low_quality_step(sig))
         if (
             loop_like_count > len(recent_signals) - loop_like_count
-            and repeated_template_count + hesitation_count >= no_progress_count
+            and repeated_template_count + hesitation_count >= loop_like_count
         ):
             return DetectionResult(
                 triggered=True,
@@ -878,7 +845,7 @@ class HandoffReadiness:
         comparison = stable_memory.compare_to_stable(probe_signals)
         if sealed_lock.reopens_sealed_problem(probe_text):
             return DetectionResult(triggered=False, reason="probe_reopens_sealed_interval")
-        if _low_quality_without_progress(probe_signals):
+        if _low_quality_step(probe_signals):
             return DetectionResult(triggered=False, reason="probe_returns_to_self_check_or_repetition")
 
         stable_signals = stable_memory.signal_records()
@@ -897,10 +864,9 @@ class HandoffReadiness:
             stable_memory.has_enough_reference()
             and comparison["outside_stable_envelope"]
             and comparison["worse_votes"] > comparison["better_votes"]
-            and not probe_signals.has_progress
         ):
             return DetectionResult(triggered=False, reason="probe_worse_than_stable_memory")
-        if best_good_distance is None and failure_distance is not None and not probe_signals.has_progress:
+        if best_good_distance is None and failure_distance is not None:
             return DetectionResult(triggered=False, reason="probe_has_no_online_handoff_evidence")
         return DetectionResult(triggered=True, reason="probe_continuation_stable")
 
@@ -914,7 +880,6 @@ class OwnershipController:
         self.repair_horizon = 0
         self.repair_generated_steps = 0
         self.llm_ownership_generated_steps = 0
-        self.llm_ownership_progress_steps = 0
         self.llm_ownership_stable_steps = 0
         self.llm_ownership_low_quality_steps = 0
         self.llm_ownership_last_quality: dict[str, Any] = {}
@@ -992,7 +957,6 @@ class OwnershipController:
 
     def reset_llm_ownership_counters(self) -> None:
         self.llm_ownership_generated_steps = 0
-        self.llm_ownership_progress_steps = 0
         self.llm_ownership_stable_steps = 0
         self.llm_ownership_low_quality_steps = 0
         self.llm_ownership_last_quality = {}
@@ -1032,8 +996,7 @@ class OwnershipController:
         units = max(1, int(step_count))
         self._llm_episode_signals.append(signals)
         comparison = stable_memory.compare_to_stable(signals) if stable_memory is not None else {}
-        low_quality = _low_quality_without_progress(signals)
-        progress = bool(signals.has_progress and not low_quality)
+        low_quality = _low_quality_step(signals)
         stable = not low_quality
         if comparison:
             stable = stable and not (
@@ -1041,8 +1004,6 @@ class OwnershipController:
             )
 
         self.llm_ownership_generated_steps += units
-        if progress:
-            self.llm_ownership_progress_steps += units
         if stable:
             self.llm_ownership_stable_steps += units
         else:
@@ -1050,12 +1011,10 @@ class OwnershipController:
 
         self.llm_ownership_last_quality = {
             "step_count": units,
-            "progress": progress,
             "stable": stable,
-            "low_quality_without_progress": low_quality,
+            "low_quality": low_quality,
             "stable_comparison": comparison,
             "generated_steps": self.llm_ownership_generated_steps,
-            "progress_steps": self.llm_ownership_progress_steps,
             "stable_steps": self.llm_ownership_stable_steps,
             "low_quality_steps": self.llm_ownership_low_quality_steps,
         }
@@ -1077,7 +1036,7 @@ class OwnershipController:
                 reason="llm_needs_second_online_observation",
             )
         latest = self._llm_episode_signals[-1]
-        if _low_quality_without_progress(latest):
+        if _low_quality_step(latest):
             return DetectionResult(
                 triggered=False,
                 reason="llm_latest_step_still_failure_like",
@@ -1108,17 +1067,16 @@ class OwnershipController:
             if (
                 comparison["outside_stable_envelope"]
                 and comparison["worse_votes"] > comparison["better_votes"]
-                and not latest.has_progress
             ):
                 return DetectionResult(
                     triggered=False,
                     reason="llm_latest_step_not_stable_like",
                 )
 
-        if self.llm_ownership_progress_steps <= 0 and self.llm_ownership_stable_steps <= self.llm_ownership_low_quality_steps:
+        if self.llm_ownership_stable_steps <= self.llm_ownership_low_quality_steps:
             return DetectionResult(
                 triggered=False,
-                reason="llm_episode_has_no_progress_or_stability_evidence",
+                reason="llm_episode_has_no_stability_evidence",
             )
 
         return DetectionResult(

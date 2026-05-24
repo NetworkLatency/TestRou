@@ -104,17 +104,23 @@ repeated_verification_pattern_count
 repeated_answer_mention_count
 low_new_information_score
 reflection_pattern_count
-has_new_equation
-has_new_case_split
-has_new_constraint
 has_candidate_answer
 candidate_answer_value
 repeats_existing_candidate_answer
 degeneration_score
-has_progress
 ```
 
 Confidence fields come from logits already captured during SLM generation. The main loop does not do an additional long-prefix confidence forward on every step.
+
+For offline probability-periodicity analysis, SLM step records also persist generated-token logprobs in `extra.generated_token_logprobs` and step-level aggregates in `extra.token_probability`. These fields are logged from the same generation scores and are not used by the online controller.
+
+Run token/step/chunk probability periodicity analysis:
+
+```bash
+python scripts/analyze_probability_periodicity.py \
+  --input sarr_results/aime25/sarr_code_v5_ownership_controller \
+  --output sarr_results/aime25/probability_periodicity
+```
 
 ## Summary Schema
 

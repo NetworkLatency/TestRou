@@ -45,7 +45,9 @@
     "initial_driver": "slm"
   },
   "confidence": {
-    "top_k": 20
+    "top_k": 20,
+    "capture_topk_entropy": true,
+    "capture_token_logprobs": true
   },
   "risk": {
     "enable_local_difficulty_routing": false,

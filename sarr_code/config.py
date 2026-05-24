@@ -68,6 +68,8 @@ class ConfidenceConfig:
     """Top-k logits captured during SLM generation for local confidence signals."""
 
     top_k: int = 20
+    capture_topk_entropy: bool = True
+    capture_token_logprobs: bool = True
 
     def __post_init__(self) -> None:
         if self.top_k < 2:

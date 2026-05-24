@@ -154,6 +154,27 @@ def _topk_entropy_from_logits(logits, topk: int) -> tuple[float, dict[str, Any]]
     }
 
 
+def _generated_token_logprob_from_logits(logits, token_id: int) -> float | None:
+    import torch
+
+    if int(token_id) < 0 or int(token_id) >= int(logits.shape[-1]):
+        return None
+    values = logits.float()
+    logprob = values[int(token_id)] - torch.logsumexp(values, dim=-1)
+    return float(logprob.detach().cpu())
+
+
+def _mean(values: list[float]) -> float | None:
+    return sum(values) / len(values) if values else None
+
+
+def _pstdev(values: list[float]) -> float | None:
+    if not values:
+        return None
+    mu = sum(values) / len(values)
+    return math.sqrt(sum((value - mu) ** 2 for value in values) / len(values))
+
+
 class _StopOnSubstrings:
     def __init__(
         self,
@@ -246,6 +267,7 @@ class LocalTransformersSLM:
         max_new_tokens: int,
         stop_delimiters: list[str] | None,
         capture_token_entropy: bool = False,
+        capture_token_logprobs: bool = False,
         topk_entropy: int = 20,
         immediate_stop_strings: list[str] | None = None,
         min_stop_tokens: int = 0,
@@ -302,7 +324,7 @@ class LocalTransformersSLM:
                 eos_token_id=eos_token_id,
                 stopping_criteria=stopping,
                 return_dict_in_generate=True,
-                output_scores=bool(capture_token_entropy),
+                output_scores=bool(capture_token_entropy or capture_token_logprobs),
             )
         wall_time = time.time() - start
 
@@ -321,29 +343,49 @@ class LocalTransformersSLM:
         }
         if stop_tracker is not None and stop_tracker.stop_reason:
             extra["stop_reason_detail"] = stop_tracker.stop_reason
-        if capture_token_entropy and getattr(output, "scores", None):
+        if (capture_token_entropy or capture_token_logprobs) and getattr(output, "scores", None):
             token_entropies = []
             token_confidences = []
             token_margins = []
+            generated_token_logprobs = []
             first_info: dict[str, Any] | None = None
-            for score in output.scores:
-                confidence, info = _topk_entropy_from_logits(score[0], topk_entropy)
-                if first_info is None:
-                    first_info = dict(info)
-                token_entropies.append(info["norm_entropy"])
-                token_confidences.append(confidence)
-                token_margins.append(info["margin"])
-            extra["token_norm_entropies"] = token_entropies
-            extra["token_margins"] = token_margins
-            extra["confidence"] = {
-                "raw_next_token_confidence": token_confidences[0] if token_confidences else None,
-                "entropy": token_entropies[0] if token_entropies else None,
-                "margin": token_margins[0] if token_margins else None,
-                "mean_token_confidence": sum(token_confidences) / len(token_confidences) if token_confidences else None,
-                "mean_token_entropy": sum(token_entropies) / len(token_entropies) if token_entropies else None,
-                "mean_token_margin": sum(token_margins) / len(token_margins) if token_margins else None,
-                "first_token": first_info or {},
-            }
+            for idx, score in enumerate(output.scores):
+                logits = score[0]
+                if capture_token_entropy:
+                    confidence, info = _topk_entropy_from_logits(logits, topk_entropy)
+                    if first_info is None:
+                        first_info = dict(info)
+                    token_entropies.append(info["norm_entropy"])
+                    token_confidences.append(confidence)
+                    token_margins.append(info["margin"])
+                if capture_token_logprobs and idx < len(new_token_ids):
+                    logprob = _generated_token_logprob_from_logits(logits, new_token_ids[idx])
+                    if logprob is not None:
+                        generated_token_logprobs.append(logprob)
+            if capture_token_entropy:
+                extra["token_norm_entropies"] = token_entropies
+                extra["token_margins"] = token_margins
+                extra["confidence"] = {
+                    "raw_next_token_confidence": token_confidences[0] if token_confidences else None,
+                    "entropy": token_entropies[0] if token_entropies else None,
+                    "margin": token_margins[0] if token_margins else None,
+                    "mean_token_confidence": _mean(token_confidences),
+                    "mean_token_entropy": _mean(token_entropies),
+                    "mean_token_margin": _mean(token_margins),
+                    "first_token": first_info or {},
+                }
+            if capture_token_logprobs:
+                generated_token_probs = [math.exp(value) for value in generated_token_logprobs]
+                extra["generated_token_logprobs"] = generated_token_logprobs
+                extra["token_probability"] = {
+                    "first_logprob": generated_token_logprobs[0] if generated_token_logprobs else None,
+                    "first_prob": generated_token_probs[0] if generated_token_probs else None,
+                    "mean_logprob": _mean(generated_token_logprobs),
+                    "mean_prob": _mean(generated_token_probs),
+                    "std_logprob": _pstdev(generated_token_logprobs),
+                    "min_logprob": min(generated_token_logprobs) if generated_token_logprobs else None,
+                    "token_count": len(generated_token_logprobs),
+                }
 
         return StepOutput(
             text=text,
