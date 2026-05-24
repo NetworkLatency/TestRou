@@ -18,20 +18,15 @@ DEFAULT_RUN_SCRIPT = REPO_ROOT / "scripts" / "run_sarr_code.py"
 @dataclass(frozen=True)
 class SweepVariant:
     name: str
-    local_entropy_delta: float
-    prefix_bad_ratio: float
-    degeneration_score_threshold: float
-    low_new_information_threshold: float
-    handoff_max_risk_rank: int
+    stable_reference_min_steps: int
+    recent_window: int
+    prefix_recent_steps: int
 
 
 SWEEP_VARIANTS = [
-    SweepVariant("O1_balanced", 0.15, 0.66, 0.62, 0.72, 1),
-    SweepVariant("O2_conservative_handoff", 0.15, 0.66, 0.62, 0.72, 0),
-    SweepVariant("O3_sensitive_prefix", 0.15, 0.50, 0.62, 0.72, 1),
-    SweepVariant("O4_conservative_prefix", 0.18, 0.75, 0.68, 0.78, 1),
-    SweepVariant("O5_sensitive_local", 0.10, 0.66, 0.62, 0.72, 1),
-    SweepVariant("O6_loop_sensitive", 0.15, 0.66, 0.55, 0.65, 1),
+    SweepVariant("O1_online_balanced", 3, 4, 3),
+    SweepVariant("O2_online_short_context", 2, 3, 2),
+    SweepVariant("O3_online_long_context", 4, 6, 4),
 ]
 
 
@@ -50,6 +45,7 @@ SUMMARY_KEYS = [
     "total_rollback_count",
     "total_sealed_interval_count",
     "total_repeated_rollback_blocked_count",
+    "total_llm_handoff_deferred_count",
     "avg_confidence_forward_count",
     "avg_lookahead_count",
     "avg_problem_wall_time",
@@ -74,11 +70,9 @@ def write_json(path: Path, data: dict[str, Any]) -> None:
 def apply_variant(base_config: dict[str, Any], variant: SweepVariant) -> dict[str, Any]:
     cfg = json.loads(json.dumps(base_config))
     risk = cfg.setdefault("risk", {})
-    risk["local_entropy_delta"] = variant.local_entropy_delta
-    risk["prefix_bad_ratio"] = variant.prefix_bad_ratio
-    risk["degeneration_score_threshold"] = variant.degeneration_score_threshold
-    risk["low_new_information_threshold"] = variant.low_new_information_threshold
-    risk["handoff_max_risk_rank"] = variant.handoff_max_risk_rank
+    risk["stable_reference_min_steps"] = variant.stable_reference_min_steps
+    risk["recent_window"] = variant.recent_window
+    risk["prefix_recent_steps"] = variant.prefix_recent_steps
     cfg.setdefault("metadata", {})
     cfg["metadata"]["sweep_variant"] = asdict(variant)
     return cfg

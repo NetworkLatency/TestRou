@@ -409,6 +409,7 @@ def run_sarr_code(
                 loop = risk_detector.degenerative_loop(trajectory)
                 if loop.triggered:
                     controller.degenerative_loop_count += 1
+                    controller.note_failure_step(signals, step_id=record.step_id, reason=loop.reason)
                     controller.note_event(
                         "degenerative_loop_detected",
                         step_id=record.step_id,
@@ -426,6 +427,7 @@ def run_sarr_code(
                 contamination = risk_detector.prefix_contamination(trajectory, stable_memory)
                 if contamination.triggered:
                     controller.prefix_contamination_count += 1
+                    controller.note_failure_step(signals, step_id=record.step_id, reason=contamination.reason)
                     onset = contamination.onset_step_id or record.step_id
                     if sealed_lock.blocks(onset, record.step_id):
                         controller.repeated_rollback_blocked_count += 1
@@ -504,6 +506,7 @@ def run_sarr_code(
                     local = risk_detector.local_difficulty(record, signals, stable_memory)
                     if local.triggered:
                         controller.local_difficulty_count += 1
+                        controller.note_failure_step(signals, step_id=record.step_id, reason=local.reason)
                         controller.note_event(
                             "local_difficulty_detected",
                             step_id=record.step_id,
@@ -555,13 +558,48 @@ def run_sarr_code(
                     controller.switch(CLOSE_OR_FINALIZE, step_id=record.step_id, reason=stop_reason)
                     break
 
+                output_step_count = _output_step_count(output, cfg)
+                llm_quality = controller.note_llm_ownership_step(
+                    signals,
+                    step_count=output_step_count,
+                    stable_memory=stable_memory,
+                )
+
                 if ownership_state == LLM_REPAIR_OWNERSHIP:
-                    controller.note_repair_step(_output_step_count(output, cfg))
+                    controller.note_repair_step(output_step_count)
                     if not controller.repair_horizon_satisfied():
                         continue
 
+                handoff_eligibility = controller.llm_ready_for_handoff_probe(ownership_state, stable_memory)
+                if not handoff_eligibility.triggered:
+                    controller.note_handoff_deferred()
+                    controller.note_event(
+                        "llm_handoff_probe_deferred",
+                        step_id=record.step_id,
+                        reason=handoff_eligibility.reason,
+                        data={
+                            **handoff_eligibility.to_dict(),
+                            "ownership_state": ownership_state,
+                            "repair_horizon": controller.repair_horizon,
+                            "repair_generated_steps": controller.repair_generated_steps,
+                            "llm_quality": llm_quality,
+                        },
+                    )
+                    continue
+
                 controller.previous_ownership_state = ownership_state
-                controller.switch(HANDOFF_PROBE, step_id=record.step_id, reason="llm_step_ready_for_slm_probe")
+                controller.switch(
+                    HANDOFF_PROBE,
+                    step_id=record.step_id,
+                    reason="llm_continuation_ready_for_slm_probe",
+                    data={
+                        **handoff_eligibility.to_dict(),
+                        "ownership_state": ownership_state,
+                        "repair_horizon": controller.repair_horizon,
+                        "repair_generated_steps": controller.repair_generated_steps,
+                        "llm_quality": llm_quality,
+                    },
+                )
                 continue
 
             if controller.driver_state == HANDOFF_PROBE:
@@ -580,6 +618,9 @@ def run_sarr_code(
                     probe_signals=signals,
                     stable_memory=stable_memory,
                     sealed_lock=sealed_lock,
+                    failure_signals=controller.failure_signals(),
+                    llm_episode_signals=controller.llm_episode_signals(),
+                    rejected_probe_signals=controller.rejected_probe_signals(),
                 )
                 if readiness.triggered:
                     controller.handoff_success_count += 1
@@ -608,6 +649,7 @@ def run_sarr_code(
                     continue
 
                 controller.handoff_failure_count += 1
+                controller.note_rejected_probe(signals)
                 _append_probe_discard(
                     trajectory=trajectory,
                     output=output,

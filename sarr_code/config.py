@@ -80,12 +80,6 @@ class RiskConfig:
     stable_reference_min_steps: int = 3
     recent_window: int = 4
     prefix_recent_steps: int = 3
-    local_entropy_delta: float = 0.15
-    local_margin_ratio: float = 0.55
-    degeneration_score_threshold: float = 0.62
-    low_new_information_threshold: float = 0.72
-    prefix_bad_ratio: float = 0.66
-    handoff_max_risk_rank: int = 1
 
     def __post_init__(self) -> None:
         if self.stable_reference_min_steps < 1:
@@ -94,18 +88,6 @@ class RiskConfig:
             raise ValueError("risk.recent_window must be >= 1")
         if self.prefix_recent_steps < 1:
             raise ValueError("risk.prefix_recent_steps must be >= 1")
-        for name in [
-            "local_entropy_delta",
-            "local_margin_ratio",
-            "degeneration_score_threshold",
-            "low_new_information_threshold",
-            "prefix_bad_ratio",
-        ]:
-            v = getattr(self, name)
-            if not 0.0 <= v <= 1.0:
-                raise ValueError(f"risk.{name} must be in [0, 1]")
-        if self.handoff_max_risk_rank < 0:
-            raise ValueError("risk.handoff_max_risk_rank must be >= 0")
 
 
 @dataclass

@@ -20,7 +20,7 @@ HANDOFF_PROBE
 CLOSE_OR_FINALIZE
 ```
 
-The controller switches by observable continuation signals, not by LLM token share, fixed LLM step counts, or decayed re-entry risk.
+The controller switches by observable continuation signals, not by LLM token share, fixed LLM step counts, fixed handoff thresholds, or decayed re-entry risk.
 
 ## Run Commands
 
@@ -66,13 +66,26 @@ Each problem directory contains:
 
 ## Routing Logic
 
-`SLM_ACTIVE` accepts normal SLM steps and updates observable signals, answer stability, and stable-step memory. It can transfer ownership to the LLM on local difficulty, prefix contamination, or a degenerative loop without a stable candidate answer.
+`SLM_ACTIVE` accepts normal SLM steps and updates observable signals and stable-step memory. It can transfer ownership to the LLM on local difficulty, prefix contamination, or a degenerative loop.
 
-`LLM_FORWARD_OWNERSHIP` lets the LLM continue from the current prefix for one coarse step, then asks for an SLM handoff probe.
+`LLM_FORWARD_OWNERSHIP` lets the LLM continue from the current prefix until the online episode looks less like the failure that triggered ownership and more like stable continuation evidence.
 
 `LLM_REPAIR_OWNERSHIP` is entered after a prefix-contamination rollback. The rollback interval is sealed, and the LLM must generate at least `repair_horizon` replacement steps before a handoff probe is allowed.
 
-`HANDOFF_PROBE` generates an SLM probe step without committing it. The probe is accepted only when it looks stable relative to local stable memory, does not repeat sealed content, and does not immediately degenerate. Failed probes are recorded as `probe_discarded` and do not affect the active prefix.
+`HANDOFF_PROBE` generates an SLM probe step without committing it. The probe is accepted only when it looks closer to local stable memory or the LLM continuation than to failure memory or rejected probe memory, does not repeat sealed content, and does not immediately return to self-check/repetition. Failed probes are recorded as `probe_discarded` and do not affect the active prefix.
+
+## Online Regime Logic
+
+SARR-CoDE now uses a fully online regime comparison for LLM ownership and handoff. During a problem it maintains four local memories:
+
+```text
+stable SLM steps
+failure-triggering SLM steps
+current LLM ownership episode
+rejected SLM handoff probes
+```
+
+Distances are computed only against signals observed inside the same problem. A handoff probe is requested when the LLM episode has enough online evidence to be distinguishable from the failure regime. A probe is accepted when it is closer to stable/LLM-continuation memory than to failure/rejected-probe memory. The controller does not use fixed LLM ownership step counts, max reflection counts, max verification counts, handoff risk-rank limits, or LLM token share as control rules.
 
 `CLOSE_OR_FINALIZE` closes thinking and generates the final answer. If no close marker appeared naturally, the controller appends a uniform `</think>` marker before the final-answer call.
 
@@ -126,6 +139,7 @@ degenerative_loop_count
 rollback_count
 sealed_interval_count
 repeated_rollback_blocked_count
+llm_handoff_deferred_count
 slm_thinking_tokens
 llm_thinking_tokens
 total_thinking_tokens

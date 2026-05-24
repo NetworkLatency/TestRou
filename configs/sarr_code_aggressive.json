@@ -51,13 +51,7 @@
     "enable_local_difficulty_routing": false,
     "stable_reference_min_steps": 3,
     "recent_window": 4,
-    "prefix_recent_steps": 3,
-    "local_entropy_delta": 0.15,
-    "local_margin_ratio": 0.55,
-    "degeneration_score_threshold": 0.62,
-    "low_new_information_threshold": 0.72,
-    "prefix_bad_ratio": 0.66,
-    "handoff_max_risk_rank": 1
+    "prefix_recent_steps": 3
   },
   "logging": {
     "save_step_records": true,

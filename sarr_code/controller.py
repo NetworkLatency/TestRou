@@ -182,6 +182,105 @@ def _jaccard_words(a: str, b: str) -> float:
     return len(wa & wb) / len(wa | wb)
 
 
+# Online regime comparisons use only signals observed inside the current problem.
+_ONLINE_SIGNAL_FIELDS = [
+    "entropy",
+    "margin",
+    "degeneration_score",
+    "low_new_information_score",
+    "repeated_ngram_ratio",
+    "repeated_sentence_count",
+    "repeated_phrase_count",
+    "repeated_verification_pattern_count",
+    "repeated_answer_mention_count",
+    "reflection_pattern_count",
+]
+_LOWER_IS_WORSE_FIELDS = {"margin"}
+
+
+def _signal_metric(signals: "StepSignals", name: str) -> float | None:
+    value = getattr(signals, name, None)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _badness_metric(signals: "StepSignals", name: str) -> float | None:
+    value = _signal_metric(signals, name)
+    if value is None:
+        return None
+    return -value if name in _LOWER_IS_WORSE_FIELDS else value
+
+
+def _signal_profile(signals_list: list["StepSignals"]) -> dict[str, float]:
+    profile: dict[str, float] = {}
+    for name in _ONLINE_SIGNAL_FIELDS:
+        vals = [_signal_metric(signals, name) for signals in signals_list]
+        clean = [float(value) for value in vals if value is not None]
+        if clean:
+            profile[name] = float(median(clean))
+    return profile
+
+
+def _profile_distance(signals: "StepSignals", references: list["StepSignals"]) -> float | None:
+    if not references:
+        return None
+    distances: list[float] = []
+    for name in _ONLINE_SIGNAL_FIELDS:
+        value = _signal_metric(signals, name)
+        ref_values = [_signal_metric(ref, name) for ref in references]
+        clean_refs = [float(item) for item in ref_values if item is not None]
+        if value is None or not clean_refs:
+            continue
+        values = [float(value), *clean_refs]
+        span = max(values) - min(values)
+        center = float(median(clean_refs))
+        distances.append(0.0 if span == 0.0 else abs(float(value) - center) / span)
+    if not distances:
+        return None
+    return sum(distances) / len(distances)
+
+
+def _profile_distance_for_many(signals_list: list["StepSignals"], references: list["StepSignals"]) -> float | None:
+    distances = [_profile_distance(signals, references) for signals in signals_list]
+    clean = [float(value) for value in distances if value is not None]
+    if not clean:
+        return None
+    return sum(clean) / len(clean)
+
+
+def _worse_better_votes(current: "StepSignals", reference: "StepSignals") -> tuple[int, int]:
+    worse = 0
+    better = 0
+    for name in _ONLINE_SIGNAL_FIELDS:
+        curr = _badness_metric(current, name)
+        ref = _badness_metric(reference, name)
+        if curr is None or ref is None or curr == ref:
+            continue
+        if curr > ref:
+            worse += 1
+        else:
+            better += 1
+    return worse, better
+
+
+def _self_check_or_repetition(signals: "StepSignals") -> bool:
+    return (
+        signals.repeated_sentence_count > 0
+        or signals.repeated_phrase_count > 0
+        or signals.repeated_verification_pattern_count > 0
+        or signals.reflection_pattern_count > 0
+        or signals.repeats_existing_candidate_answer
+    )
+
+
+def _low_quality_without_progress(signals: "StepSignals") -> bool:
+    return (not signals.has_progress) and _self_check_or_repetition(signals)
+
+
 @dataclass
 class StepSignals:
     raw_next_token_confidence: float | None = None
@@ -555,14 +654,12 @@ class StableStepMemory:
     def add_if_stable(self, record: StepRecord, signals: StepSignals) -> bool:
         if record.source != SOURCE_SLM or record.status != ACTIVE:
             return False
-        if signals.degeneration_score >= self.cfg.degeneration_score_threshold:
+        if _low_quality_without_progress(signals):
             return False
-        if signals.repeated_verification_pattern_count >= 3 and not signals.has_progress:
-            return False
-        if signals.repeats_existing_candidate_answer and signals.low_new_information_score >= 0.55:
-            return False
-        if not signals.has_progress and signals.low_new_information_score >= self.cfg.low_new_information_threshold:
-            return False
+        if self.has_enough_reference():
+            comparison = self.compare_to_stable(signals)
+            if comparison["outside_stable_envelope"] and comparison["worse_votes"] > comparison["better_votes"]:
+                return False
         self._records.append((record.step_id, signals))
         return True
 
@@ -572,58 +669,46 @@ class StableStepMemory:
     def has_enough_reference(self) -> bool:
         return len(self._records) >= self.cfg.stable_reference_min_steps
 
+    def signal_records(self) -> list[StepSignals]:
+        return [signals for _, signals in self._records]
+
     def get_reference_distribution(self) -> dict[str, float]:
-        if not self._records:
-            return {}
-
-        def values(name: str) -> list[float]:
-            out = []
-            for _, signals in self._records:
-                value = getattr(signals, name)
-                if value is not None:
-                    out.append(float(value))
-            return out
-
-        distribution = {}
-        for name in ["entropy", "margin", "degeneration_score", "low_new_information_score"]:
-            vals = values(name)
-            if vals:
-                distribution[name] = float(median(vals))
-        return distribution
+        return _signal_profile(self.signal_records())
 
     def compare_to_stable(self, signals: StepSignals) -> dict[str, Any]:
+        references = self.signal_records()
         ref = self.get_reference_distribution()
-        entropy_worse = False
-        margin_worse = False
-        degeneration_worse = False
-        low_info_worse = False
+        outside_fields: list[str] = []
+        better_fields: list[str] = []
+        worse_votes = 0
+        better_votes = 0
 
-        if self.has_enough_reference():
-            if signals.entropy is not None and "entropy" in ref:
-                entropy_worse = signals.entropy > ref["entropy"] + self.cfg.local_entropy_delta
-            if signals.margin is not None and "margin" in ref:
-                margin_worse = signals.margin < ref["margin"] * self.cfg.local_margin_ratio
-            if "degeneration_score" in ref:
-                degeneration_worse = signals.degeneration_score > max(
-                    self.cfg.degeneration_score_threshold,
-                    ref["degeneration_score"] + 0.22,
-                )
-            if "low_new_information_score" in ref:
-                low_info_worse = signals.low_new_information_score > max(
-                    self.cfg.low_new_information_threshold,
-                    ref["low_new_information_score"] + 0.25,
-                )
-        else:
-            degeneration_worse = signals.degeneration_score >= self.cfg.degeneration_score_threshold
-            low_info_worse = signals.low_new_information_score >= self.cfg.low_new_information_threshold
+        if references:
+            for name in _ONLINE_SIGNAL_FIELDS:
+                curr = _badness_metric(signals, name)
+                ref_values = [_badness_metric(reference, name) for reference in references]
+                clean_refs = [float(value) for value in ref_values if value is not None]
+                if curr is None or not clean_refs:
+                    continue
+                if curr > max(clean_refs):
+                    outside_fields.append(name)
+                if curr <= float(median(clean_refs)):
+                    better_fields.append(name)
+            for reference in references:
+                worse, better = _worse_better_votes(signals, reference)
+                worse_votes += worse
+                better_votes += better
 
-        risk_rank = sum([entropy_worse, margin_worse, degeneration_worse, low_info_worse])
+        outside_stable = bool(outside_fields)
+        risk_rank = len(outside_fields)
         return {
             "reference": ref,
-            "entropy_worse": entropy_worse,
-            "margin_worse": margin_worse,
-            "degeneration_worse": degeneration_worse,
-            "low_info_worse": low_info_worse,
+            "outside_fields": outside_fields,
+            "better_fields": better_fields,
+            "outside_stable_envelope": outside_stable,
+            "worse_votes": worse_votes,
+            "better_votes": better_votes,
+            "stable_distance": _profile_distance(signals, references),
             "risk_rank": risk_rank,
         }
 
@@ -647,7 +732,11 @@ class RiskDetector:
         if not stable_memory.has_enough_reference():
             return DetectionResult()
         comparison = stable_memory.compare_to_stable(signals)
-        if comparison["risk_rank"] >= 2 and signals.degeneration_score < self.cfg.degeneration_score_threshold:
+        if (
+            comparison["outside_stable_envelope"]
+            and comparison["worse_votes"] > comparison["better_votes"]
+            and not _low_quality_without_progress(signals)
+        ):
             return DetectionResult(
                 triggered=True,
                 reason="slm_step_confidence_drift_without_prefix_loop",
@@ -665,21 +754,26 @@ class RiskDetector:
             return DetectionResult()
         bad: list[StepRecord] = []
         low_progress_count = 0
+        progress_count = 0
         for record in recent:
             signals = _signals_from_record(record)
             comparison = stable_memory.compare_to_stable(signals)
-            low_progress = (not signals.has_progress) or signals.low_new_information_score >= self.cfg.low_new_information_threshold
+            low_progress = not signals.has_progress
             if (
-                comparison["risk_rank"] >= 2
-                or signals.degeneration_score >= self.cfg.degeneration_score_threshold
-                or (comparison["risk_rank"] >= 1 and low_progress)
+                _low_quality_without_progress(signals)
+                or (
+                    comparison["outside_stable_envelope"]
+                    and comparison["worse_votes"] > comparison["better_votes"]
+                    and low_progress
+                )
             ):
                 bad.append(record)
             if low_progress:
                 low_progress_count += 1
+            else:
+                progress_count += 1
 
-        bad_ratio = len(bad) / max(1, len(recent))
-        if bad_ratio >= self.cfg.prefix_bad_ratio and low_progress_count >= max(1, len(recent) // 2):
+        if len(bad) > len(recent) - len(bad) and low_progress_count >= progress_count:
             return DetectionResult(
                 triggered=True,
                 reason="recent_slm_steps_drifted_from_stable_memory",
@@ -718,14 +812,18 @@ class RiskDetector:
                 loop_type="repeated_fragment",
             )
 
-        reflection_total = sum(sig.reflection_pattern_count for sig in recent_signals)
-        low_info_count = sum(1 for sig in recent_signals if sig.low_new_information_score >= self.cfg.low_new_information_threshold)
         repeated_template_count = sum(
             1
             for sig in recent_signals
             if sig.repeated_verification_pattern_count > 0 or sig.repeated_phrase_count > 0 or sig.repeated_sentence_count > 0
         )
-        if reflection_total >= 3 and low_info_count >= 2 and repeated_template_count >= 2:
+        hesitation_count = sum(1 for sig in recent_signals if sig.reflection_pattern_count > 0)
+        no_progress_count = sum(1 for sig in recent_signals if not sig.has_progress)
+        loop_like_count = sum(1 for sig in recent_signals if _low_quality_without_progress(sig))
+        if (
+            loop_like_count > len(recent_signals) - loop_like_count
+            and repeated_template_count + hesitation_count >= no_progress_count
+        ):
             return DetectionResult(
                 triggered=True,
                 reason="reflection_and_low_information_loop",
@@ -773,21 +871,37 @@ class HandoffReadiness:
         probe_signals: StepSignals,
         stable_memory: StableStepMemory,
         sealed_lock: SealedIntervalLock,
+        failure_signals: list[StepSignals],
+        llm_episode_signals: list[StepSignals],
+        rejected_probe_signals: list[StepSignals],
     ) -> DetectionResult:
         comparison = stable_memory.compare_to_stable(probe_signals)
-        if stable_memory.has_enough_reference() and comparison["risk_rank"] > self.cfg.handoff_max_risk_rank:
-            return DetectionResult(triggered=False, reason="probe_worse_than_stable_memory")
-        if probe_signals.degeneration_score >= self.cfg.degeneration_score_threshold:
-            return DetectionResult(triggered=False, reason="probe_degenerated")
-        if (
-            probe_signals.low_new_information_score >= self.cfg.low_new_information_threshold
-            and not probe_signals.has_progress
-        ):
-            return DetectionResult(triggered=False, reason="probe_low_information_without_progress")
-        if probe_signals.reflection_pattern_count >= 3 and not probe_signals.has_progress:
-            return DetectionResult(triggered=False, reason="probe_immediate_hesitation_loop")
         if sealed_lock.reopens_sealed_problem(probe_text):
             return DetectionResult(triggered=False, reason="probe_reopens_sealed_interval")
+        if _low_quality_without_progress(probe_signals):
+            return DetectionResult(triggered=False, reason="probe_returns_to_self_check_or_repetition")
+
+        stable_signals = stable_memory.signal_records()
+        stable_distance = _profile_distance(probe_signals, stable_signals)
+        failure_distance = _profile_distance(probe_signals, failure_signals)
+        llm_distance = _profile_distance(probe_signals, llm_episode_signals)
+        rejected_distance = _profile_distance(probe_signals, rejected_probe_signals)
+        good_distances = [value for value in [stable_distance, llm_distance] if value is not None]
+        best_good_distance = min(good_distances) if good_distances else None
+
+        if rejected_distance is not None and best_good_distance is not None and rejected_distance < best_good_distance:
+            return DetectionResult(triggered=False, reason="probe_matches_rejected_probe_memory")
+        if failure_distance is not None and best_good_distance is not None and failure_distance < best_good_distance:
+            return DetectionResult(triggered=False, reason="probe_matches_failure_memory")
+        if (
+            stable_memory.has_enough_reference()
+            and comparison["outside_stable_envelope"]
+            and comparison["worse_votes"] > comparison["better_votes"]
+            and not probe_signals.has_progress
+        ):
+            return DetectionResult(triggered=False, reason="probe_worse_than_stable_memory")
+        if best_good_distance is None and failure_distance is not None and not probe_signals.has_progress:
+            return DetectionResult(triggered=False, reason="probe_has_no_online_handoff_evidence")
         return DetectionResult(triggered=True, reason="probe_continuation_stable")
 
 
@@ -799,6 +913,15 @@ class OwnershipController:
         self.previous_ownership_state: str | None = None
         self.repair_horizon = 0
         self.repair_generated_steps = 0
+        self.llm_ownership_generated_steps = 0
+        self.llm_ownership_progress_steps = 0
+        self.llm_ownership_stable_steps = 0
+        self.llm_ownership_low_quality_steps = 0
+        self.llm_ownership_last_quality: dict[str, Any] = {}
+        self._current_failure_signals: list[StepSignals] = []
+        self._failure_signal_memory: list[StepSignals] = []
+        self._llm_episode_signals: list[StepSignals] = []
+        self._rejected_probe_signals: list[StepSignals] = []
         self.events: list[dict[str, Any]] = []
         self.transition_events: list[dict[str, Any]] = []
 
@@ -813,6 +936,7 @@ class OwnershipController:
         self.degenerative_loop_count = 0
         self.rollback_count = 0
         self.repeated_rollback_blocked_count = 0
+        self.llm_handoff_deferred_count = 0
         self.confidence_forward_count = 0
         self.handoff_probe_forward_count = 0
         self.lookahead_count = 0
@@ -840,8 +964,10 @@ class OwnershipController:
         self.transition_events.append(event)
         if to_state == LLM_FORWARD_OWNERSHIP and from_state != HANDOFF_PROBE:
             self.llm_forward_episodes += 1
+            self.reset_llm_ownership_counters()
         elif to_state == LLM_REPAIR_OWNERSHIP and from_state != HANDOFF_PROBE:
             self.llm_repair_episodes += 1
+            self.reset_llm_ownership_counters()
 
     def note_event(self, event: str, *, step_id: int | None, reason: str, data: dict[str, Any] | None = None) -> None:
         self.events.append(
@@ -863,6 +989,145 @@ class OwnershipController:
 
     def repair_horizon_satisfied(self) -> bool:
         return self.repair_generated_steps >= self.repair_horizon
+
+    def reset_llm_ownership_counters(self) -> None:
+        self.llm_ownership_generated_steps = 0
+        self.llm_ownership_progress_steps = 0
+        self.llm_ownership_stable_steps = 0
+        self.llm_ownership_low_quality_steps = 0
+        self.llm_ownership_last_quality = {}
+        self._llm_episode_signals = []
+
+    def note_failure_step(self, signals: StepSignals, *, step_id: int | None, reason: str) -> None:
+        self._current_failure_signals = [signals]
+        self._failure_signal_memory.append(signals)
+        self.note_event(
+            "online_failure_memory_updated",
+            step_id=step_id,
+            reason=reason,
+            data={"failure_memory_size": len(self._failure_signal_memory)},
+        )
+
+    def note_rejected_probe(self, signals: StepSignals) -> None:
+        self._rejected_probe_signals.append(signals)
+
+    def failure_signals(self) -> list[StepSignals]:
+        if self._current_failure_signals:
+            return list(self._current_failure_signals)
+        return list(self._failure_signal_memory)
+
+    def llm_episode_signals(self) -> list[StepSignals]:
+        return list(self._llm_episode_signals)
+
+    def rejected_probe_signals(self) -> list[StepSignals]:
+        return list(self._rejected_probe_signals)
+
+    def note_llm_ownership_step(
+        self,
+        signals: StepSignals,
+        *,
+        step_count: int = 1,
+        stable_memory: StableStepMemory | None = None,
+    ) -> dict[str, Any]:
+        units = max(1, int(step_count))
+        self._llm_episode_signals.append(signals)
+        comparison = stable_memory.compare_to_stable(signals) if stable_memory is not None else {}
+        low_quality = _low_quality_without_progress(signals)
+        progress = bool(signals.has_progress and not low_quality)
+        stable = not low_quality
+        if comparison:
+            stable = stable and not (
+                comparison["outside_stable_envelope"] and comparison["worse_votes"] > comparison["better_votes"]
+            )
+
+        self.llm_ownership_generated_steps += units
+        if progress:
+            self.llm_ownership_progress_steps += units
+        if stable:
+            self.llm_ownership_stable_steps += units
+        else:
+            self.llm_ownership_low_quality_steps += units
+
+        self.llm_ownership_last_quality = {
+            "step_count": units,
+            "progress": progress,
+            "stable": stable,
+            "low_quality_without_progress": low_quality,
+            "stable_comparison": comparison,
+            "generated_steps": self.llm_ownership_generated_steps,
+            "progress_steps": self.llm_ownership_progress_steps,
+            "stable_steps": self.llm_ownership_stable_steps,
+            "low_quality_steps": self.llm_ownership_low_quality_steps,
+        }
+        return dict(self.llm_ownership_last_quality)
+
+    def llm_ready_for_handoff_probe(
+        self,
+        ownership_state: str,
+        stable_memory: StableStepMemory,
+    ) -> DetectionResult:
+        if not self._llm_episode_signals:
+            return DetectionResult(
+                triggered=False,
+                reason="llm_has_no_online_continuation_observation",
+            )
+        if len(self._llm_episode_signals) < 2 and self.llm_ownership_generated_steps < 2:
+            return DetectionResult(
+                triggered=False,
+                reason="llm_needs_second_online_observation",
+            )
+        latest = self._llm_episode_signals[-1]
+        if _low_quality_without_progress(latest):
+            return DetectionResult(
+                triggered=False,
+                reason="llm_latest_step_still_failure_like",
+            )
+        stable_refs = stable_memory.signal_records()
+        failure_refs = self.failure_signals()
+        episode_refs = self.llm_episode_signals()
+        stable_distance = _profile_distance_for_many(episode_refs, stable_refs)
+        failure_distance = _profile_distance_for_many(episode_refs, failure_refs)
+        latest_stable_distance = _profile_distance(latest, stable_refs)
+        latest_failure_distance = _profile_distance(latest, failure_refs)
+
+        if stable_distance is not None and failure_distance is not None:
+            if stable_distance > failure_distance:
+                return DetectionResult(
+                    triggered=False,
+                    reason="llm_episode_still_closer_to_failure_than_stable",
+                )
+            if latest_stable_distance is not None and latest_failure_distance is not None:
+                if latest_stable_distance > latest_failure_distance:
+                    return DetectionResult(
+                        triggered=False,
+                        reason="llm_latest_step_still_closer_to_failure_than_stable",
+                    )
+
+        if stable_refs:
+            comparison = stable_memory.compare_to_stable(latest)
+            if (
+                comparison["outside_stable_envelope"]
+                and comparison["worse_votes"] > comparison["better_votes"]
+                and not latest.has_progress
+            ):
+                return DetectionResult(
+                    triggered=False,
+                    reason="llm_latest_step_not_stable_like",
+                )
+
+        if self.llm_ownership_progress_steps <= 0 and self.llm_ownership_stable_steps <= self.llm_ownership_low_quality_steps:
+            return DetectionResult(
+                triggered=False,
+                reason="llm_episode_has_no_progress_or_stability_evidence",
+            )
+
+        return DetectionResult(
+            triggered=True,
+            reason="llm_online_episode_ready_for_slm_probe",
+        )
+
+    def note_handoff_deferred(self) -> None:
+        self.llm_handoff_deferred_count += 1
 
     def summary(
         self,
@@ -899,6 +1164,7 @@ class OwnershipController:
             "rollback_count": self.rollback_count,
             "sealed_interval_count": len(trajectory.sealed_intervals),
             "repeated_rollback_blocked_count": self.repeated_rollback_blocked_count,
+            "llm_handoff_deferred_count": self.llm_handoff_deferred_count,
             "slm_thinking_tokens": slm_tokens,
             "llm_thinking_tokens": llm_tokens,
             "total_thinking_tokens": slm_tokens + llm_tokens,

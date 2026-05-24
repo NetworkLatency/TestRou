@@ -159,6 +159,7 @@ def _problem_sarr_metrics(result, step_rows: list[dict[str, Any]], controller_ro
         "has_rollback": int(_num(summary.get("rollback_count"))) > 0,
         "sealed_interval_count": int(_num(summary.get("sealed_interval_count"))),
         "repeated_rollback_blocked_count": int(_num(summary.get("repeated_rollback_blocked_count"))),
+        "llm_handoff_deferred_count": int(_num(summary.get("llm_handoff_deferred_count"))),
         "slm_thinking_tokens": int(_num(summary.get("slm_thinking_tokens"))),
         "llm_thinking_tokens": int(_num(summary.get("llm_thinking_tokens"))),
         "total_thinking_tokens": int(_num(summary.get("total_thinking_tokens"))),
@@ -211,6 +212,7 @@ def _extra_sarr_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "total_rollback_count": total("rollback_count"),
         "total_sealed_interval_count": total("sealed_interval_count"),
         "total_repeated_rollback_blocked_count": total("repeated_rollback_blocked_count"),
+        "total_llm_handoff_deferred_count": total("llm_handoff_deferred_count"),
         "avg_confidence_forward_count": avg("confidence_forward_count"),
         "avg_lookahead_count": avg("lookahead_count"),
     }
