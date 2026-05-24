@@ -241,14 +241,6 @@ def _profile_distance(signals: "StepSignals", references: list["StepSignals"]) -
     return sum(distances) / len(distances)
 
 
-def _profile_distance_for_many(signals_list: list["StepSignals"], references: list["StepSignals"]) -> float | None:
-    distances = [_profile_distance(signals, references) for signals in signals_list]
-    clean = [float(value) for value in distances if value is not None]
-    if not clean:
-        return None
-    return sum(clean) / len(clean)
-
-
 def _worse_better_votes(current: "StepSignals", reference: "StepSignals") -> tuple[int, int]:
     worse = 0
     better = 0
@@ -264,18 +256,31 @@ def _worse_better_votes(current: "StepSignals", reference: "StepSignals") -> tup
     return worse, better
 
 
-def _self_check_or_repetition(signals: "StepSignals") -> bool:
-    return (
-        signals.repeated_sentence_count > 0
-        or signals.repeated_phrase_count > 0
-        or signals.repeated_verification_pattern_count > 0
-        or signals.reflection_pattern_count > 0
-        or signals.repeats_existing_candidate_answer
-    )
-
-
 def _low_quality_step(signals: "StepSignals") -> bool:
-    return _self_check_or_repetition(signals)
+    strong_repetition = (
+        signals.repeated_sentence_count > 0
+        or signals.repeated_phrase_count >= 2
+        or signals.repeated_ngram_ratio >= 0.35
+    )
+    repeated_answer_loop = signals.repeats_existing_candidate_answer and (
+        signals.repeated_answer_mention_count >= 2 or signals.low_new_information_score >= 0.45
+    )
+    low_information_repetition = signals.low_new_information_score >= 0.65 and (
+        signals.repeated_phrase_count > 0
+        or signals.repeated_ngram_ratio >= 0.20
+        or signals.repeated_verification_pattern_count >= 2
+    )
+    excessive_self_check_stagnation = (
+        signals.low_new_information_score >= 0.60
+        and signals.repeated_verification_pattern_count >= 3
+        and signals.reflection_pattern_count >= 2
+    )
+    return (
+        strong_repetition
+        or repeated_answer_loop
+        or low_information_repetition
+        or excessive_self_check_stagnation
+    )
 
 
 @dataclass
@@ -462,6 +467,20 @@ class TrajectoryState:
 
     def source_step_count(self, source: str) -> int:
         return sum(1 for record in self.records if record.status == ACTIVE and record.source == source)
+
+    def status_token_count(self, status: str, *, source: str | None = None) -> int:
+        return sum(
+            record.token_count
+            for record in self.records
+            if record.status == status and (source is None or record.source == source)
+        )
+
+    def status_step_count(self, status: str, *, source: str | None = None) -> int:
+        return sum(
+            1
+            for record in self.records
+            if record.status == status and (source is None or record.source == source)
+        )
 
 
 class ObservableSignals:
@@ -880,9 +899,7 @@ class OwnershipController:
         self.repair_horizon = 0
         self.repair_generated_steps = 0
         self.llm_ownership_generated_steps = 0
-        self.llm_ownership_stable_steps = 0
-        self.llm_ownership_low_quality_steps = 0
-        self.llm_ownership_last_quality: dict[str, Any] = {}
+        self._llm_recent_stability: list[bool] = []
         self._current_failure_signals: list[StepSignals] = []
         self._failure_signal_memory: list[StepSignals] = []
         self._llm_episode_signals: list[StepSignals] = []
@@ -901,7 +918,7 @@ class OwnershipController:
         self.degenerative_loop_count = 0
         self.rollback_count = 0
         self.repeated_rollback_blocked_count = 0
-        self.llm_handoff_deferred_count = 0
+        self.handoff_probe_skipped_count = 0
         self.confidence_forward_count = 0
         self.handoff_probe_forward_count = 0
         self.lookahead_count = 0
@@ -952,14 +969,9 @@ class OwnershipController:
     def note_repair_step(self, step_count: int = 1) -> None:
         self.repair_generated_steps += max(0, int(step_count))
 
-    def repair_horizon_satisfied(self) -> bool:
-        return self.repair_generated_steps >= self.repair_horizon
-
     def reset_llm_ownership_counters(self) -> None:
         self.llm_ownership_generated_steps = 0
-        self.llm_ownership_stable_steps = 0
-        self.llm_ownership_low_quality_steps = 0
-        self.llm_ownership_last_quality = {}
+        self._llm_recent_stability = []
         self._llm_episode_signals = []
 
     def note_failure_step(self, signals: StepSignals, *, step_id: int | None, reason: str) -> None:
@@ -1004,88 +1016,58 @@ class OwnershipController:
             )
 
         self.llm_ownership_generated_steps += units
-        if stable:
-            self.llm_ownership_stable_steps += units
-        else:
-            self.llm_ownership_low_quality_steps += units
-
-        self.llm_ownership_last_quality = {
+        self._llm_recent_stability.extend([stable] * units)
+        self._llm_recent_stability = self._llm_recent_stability[-self.cfg.recent_window :]
+        recent_stable = sum(1 for item in self._llm_recent_stability if item)
+        recent_unstable = len(self._llm_recent_stability) - recent_stable
+        return {
             "step_count": units,
             "stable": stable,
             "low_quality": low_quality,
             "stable_comparison": comparison,
             "generated_steps": self.llm_ownership_generated_steps,
-            "stable_steps": self.llm_ownership_stable_steps,
-            "low_quality_steps": self.llm_ownership_low_quality_steps,
+            "recent_window": self.cfg.recent_window,
+            "recent_stable_steps": recent_stable,
+            "recent_unstable_steps": recent_unstable,
         }
-        return dict(self.llm_ownership_last_quality)
 
-    def llm_ready_for_handoff_probe(
+    def handoff_probe_schedule(
         self,
         ownership_state: str,
-        stable_memory: StableStepMemory,
     ) -> DetectionResult:
-        if not self._llm_episode_signals:
+        del ownership_state
+        generated_steps = self.llm_ownership_generated_steps
+        if generated_steps < 1:
             return DetectionResult(
                 triggered=False,
-                reason="llm_has_no_online_continuation_observation",
+                reason="handoff_probe_needs_llm_observation",
             )
-        if len(self._llm_episode_signals) < 2 and self.llm_ownership_generated_steps < 2:
+        strategy = self.cfg.handoff_probe_strategy
+        interval = max(1, int(self.cfg.handoff_probe_interval))
+
+        if strategy == "eager":
+            return DetectionResult(triggered=True, reason="handoff_probe_eager")
+
+        if strategy == "periodic":
+            if generated_steps % interval == 0:
+                return DetectionResult(triggered=True, reason="handoff_probe_periodic")
             return DetectionResult(
                 triggered=False,
-                reason="llm_needs_second_online_observation",
+                reason="handoff_probe_waiting_for_period",
             )
-        latest = self._llm_episode_signals[-1]
-        if _low_quality_step(latest):
+
+        warmup = max(0, int(self.cfg.handoff_probe_warmup_steps))
+        if generated_steps < warmup:
             return DetectionResult(
                 triggered=False,
-                reason="llm_latest_step_still_failure_like",
+                reason="handoff_probe_waiting_for_warmup",
             )
-        stable_refs = stable_memory.signal_records()
-        failure_refs = self.failure_signals()
-        episode_refs = self.llm_episode_signals()
-        stable_distance = _profile_distance_for_many(episode_refs, stable_refs)
-        failure_distance = _profile_distance_for_many(episode_refs, failure_refs)
-        latest_stable_distance = _profile_distance(latest, stable_refs)
-        latest_failure_distance = _profile_distance(latest, failure_refs)
+        if (generated_steps - warmup) % interval == 0:
+            return DetectionResult(triggered=True, reason="handoff_probe_hybrid")
+        return DetectionResult(triggered=False, reason="handoff_probe_waiting_for_period")
 
-        if stable_distance is not None and failure_distance is not None:
-            if stable_distance > failure_distance:
-                return DetectionResult(
-                    triggered=False,
-                    reason="llm_episode_still_closer_to_failure_than_stable",
-                )
-            if latest_stable_distance is not None and latest_failure_distance is not None:
-                if latest_stable_distance > latest_failure_distance:
-                    return DetectionResult(
-                        triggered=False,
-                        reason="llm_latest_step_still_closer_to_failure_than_stable",
-                    )
-
-        if stable_refs:
-            comparison = stable_memory.compare_to_stable(latest)
-            if (
-                comparison["outside_stable_envelope"]
-                and comparison["worse_votes"] > comparison["better_votes"]
-            ):
-                return DetectionResult(
-                    triggered=False,
-                    reason="llm_latest_step_not_stable_like",
-                )
-
-        if self.llm_ownership_stable_steps <= self.llm_ownership_low_quality_steps:
-            return DetectionResult(
-                triggered=False,
-                reason="llm_episode_has_no_stability_evidence",
-            )
-
-        return DetectionResult(
-            triggered=True,
-            reason="llm_online_episode_ready_for_slm_probe",
-        )
-
-    def note_handoff_deferred(self) -> None:
-        self.llm_handoff_deferred_count += 1
+    def note_handoff_probe_skipped(self) -> None:
+        self.handoff_probe_skipped_count += 1
 
     def summary(
         self,
@@ -1103,11 +1085,18 @@ class OwnershipController:
     ) -> dict[str, Any]:
         slm_tokens = trajectory.source_token_count(SOURCE_SLM)
         llm_tokens = trajectory.source_token_count(SOURCE_LLM)
+        probe_discarded_tokens = trajectory.status_token_count(PROBE_DISCARDED)
+        slm_probe_discarded_tokens = trajectory.status_token_count(PROBE_DISCARDED, source=SOURCE_SLM)
+        llm_probe_discarded_tokens = trajectory.status_token_count(PROBE_DISCARDED, source=SOURCE_LLM)
+        probe_discarded_steps = trajectory.status_step_count(PROBE_DISCARDED)
         return {
             "problem_id": problem_id,
             "finish_reason": finish_reason,
             "final_answer": final_answer,
             "final_answer_generator": final_answer_generator,
+            "handoff_probe_strategy": self.cfg.handoff_probe_strategy,
+            "handoff_probe_interval": self.cfg.handoff_probe_interval,
+            "handoff_probe_warmup_steps": self.cfg.handoff_probe_warmup_steps,
             "driver_state": self.driver_state,
             "driver_switch_count": self.driver_switch_count,
             "llm_ownership_episodes": self.llm_ownership_episodes,
@@ -1122,10 +1111,17 @@ class OwnershipController:
             "rollback_count": self.rollback_count,
             "sealed_interval_count": len(trajectory.sealed_intervals),
             "repeated_rollback_blocked_count": self.repeated_rollback_blocked_count,
-            "llm_handoff_deferred_count": self.llm_handoff_deferred_count,
+            "handoff_probe_skipped_count": self.handoff_probe_skipped_count,
             "slm_thinking_tokens": slm_tokens,
             "llm_thinking_tokens": llm_tokens,
             "total_thinking_tokens": slm_tokens + llm_tokens,
+            "probe_discarded_tokens": probe_discarded_tokens,
+            "slm_probe_discarded_tokens": slm_probe_discarded_tokens,
+            "llm_probe_discarded_tokens": llm_probe_discarded_tokens,
+            "probe_discarded_step_count": probe_discarded_steps,
+            "slm_generated_thinking_tokens": slm_tokens + slm_probe_discarded_tokens,
+            "llm_generated_thinking_tokens": llm_tokens + llm_probe_discarded_tokens,
+            "total_generated_thinking_tokens": slm_tokens + llm_tokens + probe_discarded_tokens,
             "slm_step_count": trajectory.source_step_count(SOURCE_SLM),
             "llm_step_count": trajectory.source_step_count(SOURCE_LLM),
             "confidence_forward_count": self.confidence_forward_count,

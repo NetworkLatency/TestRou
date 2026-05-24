@@ -109,23 +109,6 @@ def _final_answer_prefix(thinking_text: str) -> str:
     return f"{thinking.rstrip()}\n{CLOSE_THINK_TAG}\n\n"
 
 
-def _resolve_final_answer_generator(
-    *,
-    cfg: SARRConfig,
-    trajectory: TrajectoryState,
-    controller: OwnershipController,
-) -> str:
-    account = cfg.generation.final_answer_generator
-    if account != "active":
-        return account
-    last_active = next((record for record in reversed(trajectory.records) if record.status == ACTIVE), None)
-    if last_active is not None and last_active.source == SOURCE_LLM:
-        return "llm"
-    if controller.driver_state in {LLM_FORWARD_OWNERSHIP, LLM_REPAIR_OWNERSHIP}:
-        return "llm"
-    return "slm"
-
-
 def _append_final_answer(
     *,
     problem_id: str,
@@ -135,10 +118,9 @@ def _append_final_answer(
     llm,
     cfg: SARRConfig,
     trajectory: TrajectoryState,
-    controller: OwnershipController,
     fallback_answer: str | None,
 ) -> tuple[str | None, str]:
-    account = _resolve_final_answer_generator(cfg=cfg, trajectory=trajectory, controller=controller)
+    account = cfg.generation.final_answer_generator
     engine = llm if account == "llm" else slm
     prefix = _final_answer_prefix(state.assistant_prefix_text)
     output = engine.generate_text(
@@ -243,6 +225,8 @@ def _generate_llm_step(
         state.assistant_prefix_text,
         max_new_tokens=max_new_tokens,
         stop_delimiters=_stop_strings_for_llm(cfg),
+        capture_token_logprobs=cfg.confidence.capture_token_logprobs,
+        topk_logprobs=1,
     )
     output.text = _ensure_step_terminator(output.text, output.finish_reason, cfg.generation.step_delimiters)
     _account_generation_cost(
@@ -583,22 +567,23 @@ def run_sarr_code(
 
                 if ownership_state == LLM_REPAIR_OWNERSHIP:
                     controller.note_repair_step(output_step_count)
-                    if not controller.repair_horizon_satisfied():
-                        continue
 
-                handoff_eligibility = controller.llm_ready_for_handoff_probe(ownership_state, stable_memory)
-                if not handoff_eligibility.triggered:
-                    controller.note_handoff_deferred()
+                handoff_schedule = controller.handoff_probe_schedule(ownership_state)
+                if not handoff_schedule.triggered:
+                    controller.note_handoff_probe_skipped()
                     controller.note_event(
-                        "llm_handoff_probe_deferred",
+                        "handoff_probe_skipped",
                         step_id=record.step_id,
-                        reason=handoff_eligibility.reason,
+                        reason=handoff_schedule.reason,
                         data={
-                            **handoff_eligibility.to_dict(),
+                            **handoff_schedule.to_dict(),
                             "ownership_state": ownership_state,
                             "repair_horizon": controller.repair_horizon,
                             "repair_generated_steps": controller.repair_generated_steps,
                             "llm_quality": llm_quality,
+                            "handoff_probe_strategy": cfg.risk.handoff_probe_strategy,
+                            "handoff_probe_interval": cfg.risk.handoff_probe_interval,
+                            "handoff_probe_warmup_steps": cfg.risk.handoff_probe_warmup_steps,
                         },
                     )
                     continue
@@ -607,13 +592,16 @@ def run_sarr_code(
                 controller.switch(
                     HANDOFF_PROBE,
                     step_id=record.step_id,
-                    reason="llm_continuation_ready_for_slm_probe",
+                    reason=handoff_schedule.reason,
                     data={
-                        **handoff_eligibility.to_dict(),
+                        **handoff_schedule.to_dict(),
                         "ownership_state": ownership_state,
                         "repair_horizon": controller.repair_horizon,
                         "repair_generated_steps": controller.repair_generated_steps,
                         "llm_quality": llm_quality,
+                        "handoff_probe_strategy": cfg.risk.handoff_probe_strategy,
+                        "handoff_probe_interval": cfg.risk.handoff_probe_interval,
+                        "handoff_probe_warmup_steps": cfg.risk.handoff_probe_warmup_steps,
                     },
                 )
                 continue
@@ -728,7 +716,6 @@ def run_sarr_code(
                 llm=llm,
                 cfg=cfg,
                 trajectory=trajectory,
-                controller=controller,
                 fallback_answer=None,
             )
         except ContextBudgetExceeded as exc:

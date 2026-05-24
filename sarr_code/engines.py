@@ -175,6 +175,33 @@ def _pstdev(values: list[float]) -> float | None:
     return math.sqrt(sum((value - mu) ** 2 for value in values) / len(values))
 
 
+def _token_probability_payload(generated_token_logprobs: list[float]) -> dict[str, Any]:
+    generated_token_probs = [math.exp(value) for value in generated_token_logprobs]
+    return {
+        "generated_token_logprobs": generated_token_logprobs,
+        "token_probability": {
+            "first_logprob": generated_token_logprobs[0] if generated_token_logprobs else None,
+            "first_prob": generated_token_probs[0] if generated_token_probs else None,
+            "mean_logprob": _mean(generated_token_logprobs),
+            "mean_prob": _mean(generated_token_probs),
+            "std_logprob": _pstdev(generated_token_logprobs),
+            "min_logprob": min(generated_token_logprobs) if generated_token_logprobs else None,
+            "token_count": len(generated_token_logprobs),
+        },
+    }
+
+
+def _logprob_value(value: Any) -> float | None:
+    if value is None:
+        return None
+    raw = getattr(value, "logprob", value)
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
 class _StopOnSubstrings:
     def __init__(
         self,
@@ -375,17 +402,7 @@ class LocalTransformersSLM:
                     "first_token": first_info or {},
                 }
             if capture_token_logprobs:
-                generated_token_probs = [math.exp(value) for value in generated_token_logprobs]
-                extra["generated_token_logprobs"] = generated_token_logprobs
-                extra["token_probability"] = {
-                    "first_logprob": generated_token_logprobs[0] if generated_token_logprobs else None,
-                    "first_prob": generated_token_probs[0] if generated_token_probs else None,
-                    "mean_logprob": _mean(generated_token_logprobs),
-                    "mean_prob": _mean(generated_token_probs),
-                    "std_logprob": _pstdev(generated_token_logprobs),
-                    "min_logprob": min(generated_token_logprobs) if generated_token_logprobs else None,
-                    "token_count": len(generated_token_logprobs),
-                }
+                extra.update(_token_probability_payload(generated_token_logprobs))
 
         return StepOutput(
             text=text,
@@ -552,6 +569,8 @@ class CompletionEngine:
         max_new_tokens: int,
         stop_delimiters: list[str] | None = None,
         include_stop_str_in_output: bool = True,
+        capture_token_logprobs: bool = False,
+        topk_logprobs: int = 1,
     ) -> StepOutput:
         self.load()
         rendered = self.render(problem_text, assistant_prefix_text)
@@ -563,6 +582,8 @@ class CompletionEngine:
                 max_tokens=max_tokens,
                 stop=stop_delimiters,
                 include_stop_str_in_output=include_stop_str_in_output,
+                capture_token_logprobs=capture_token_logprobs,
+                topk_logprobs=topk_logprobs,
             )
         else:
             output = self._generate_vllm(
@@ -570,6 +591,8 @@ class CompletionEngine:
                 max_tokens=max_tokens,
                 stop=stop_delimiters,
                 include_stop_str_in_output=include_stop_str_in_output,
+                capture_token_logprobs=capture_token_logprobs,
+                topk_logprobs=topk_logprobs,
             )
         output.wall_time = time.time() - start
         output.prompt_tokens = prompt_tokens
@@ -582,6 +605,8 @@ class CompletionEngine:
         *,
         max_new_tokens: int,
         stop_delimiters: list[str] | None,
+        capture_token_logprobs: bool = False,
+        topk_logprobs: int = 1,
     ) -> StepOutput:
         return self.generate_text(
             problem_text,
@@ -589,6 +614,8 @@ class CompletionEngine:
             max_new_tokens=max_new_tokens,
             stop_delimiters=stop_delimiters,
             include_stop_str_in_output=True,
+            capture_token_logprobs=capture_token_logprobs,
+            topk_logprobs=topk_logprobs,
         )
 
     def _generate_openai(
@@ -598,6 +625,8 @@ class CompletionEngine:
         max_tokens: int,
         stop: list[str] | None,
         include_stop_str_in_output: bool,
+        capture_token_logprobs: bool,
+        topk_logprobs: int,
     ) -> StepOutput:
         kwargs: dict[str, Any] = {
             "model": self.cfg.api_model or self.cfg.model_path,
@@ -605,6 +634,8 @@ class CompletionEngine:
             "max_tokens": max_tokens,
             "temperature": 0.0,
         }
+        if capture_token_logprobs:
+            kwargs["logprobs"] = max(1, int(topk_logprobs))
         if stop:
             kwargs["stop"] = stop
             kwargs["extra_body"] = {"include_stop_str_in_output": include_stop_str_in_output}
@@ -613,10 +644,28 @@ class CompletionEngine:
         choice = choices[0] if choices else SimpleNamespace(text="", finish_reason="")
         text = str(getattr(choice, "text", "") or "")
         finish = str(getattr(choice, "finish_reason", "") or "")
+        token_ids = self.encode(text)
+        extra: dict[str, Any] = {}
+        if capture_token_logprobs:
+            logprobs_obj = getattr(choice, "logprobs", None)
+            tokens = list(getattr(logprobs_obj, "tokens", None) or []) if logprobs_obj is not None else []
+            token_logprobs = (
+                list(getattr(logprobs_obj, "token_logprobs", None) or []) if logprobs_obj is not None else []
+            )
+            if tokens:
+                token_ids = [self._token_id_for_openai_token(str(token)) for token in tokens]
+            generated_token_logprobs = [
+                parsed
+                for value in token_logprobs
+                for parsed in [_logprob_value(value)]
+                if parsed is not None
+            ]
+            extra.update(_token_probability_payload(generated_token_logprobs))
         return StepOutput(
             text=text,
-            token_ids=self.encode(text),
+            token_ids=token_ids,
             finish_reason=finish,
+            extra=extra,
         )
 
     def _generate_vllm(
@@ -626,13 +675,18 @@ class CompletionEngine:
         max_tokens: int,
         stop: list[str] | None,
         include_stop_str_in_output: bool,
+        capture_token_logprobs: bool,
+        topk_logprobs: int,
     ) -> StepOutput:
-        sampling = self._sampling_params(
-            max_tokens=max_tokens,
-            temperature=0.0,
-            stop=stop,
-            include_stop_str_in_output=include_stop_str_in_output,
-        )
+        sampling_kwargs: dict[str, Any] = {
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "stop": stop,
+            "include_stop_str_in_output": include_stop_str_in_output,
+        }
+        if capture_token_logprobs:
+            sampling_kwargs["logprobs"] = max(1, int(topk_logprobs))
+        sampling = self._sampling_params(**sampling_kwargs)
         out = self.llm.generate(prompt, sampling)[0]
         completion = out.outputs[0]
         text = str(getattr(completion, "text", "") or "")
@@ -640,7 +694,32 @@ class CompletionEngine:
         if not token_ids:
             token_ids = self.encode(text)
         finish = str(getattr(completion, "finish_reason", "") or "")
-        return StepOutput(text=text, token_ids=token_ids, finish_reason=finish)
+        extra: dict[str, Any] = {}
+        if capture_token_logprobs:
+            generated_token_logprobs = self._generated_logprobs_from_vllm_completion(completion, token_ids)
+            extra.update(_token_probability_payload(generated_token_logprobs))
+        return StepOutput(text=text, token_ids=token_ids, finish_reason=finish, extra=extra)
+
+    def _token_id_for_openai_token(self, token: str) -> int:
+        token_ids = self.encode(token)
+        return int(token_ids[0]) if token_ids else 0
+
+    def _generated_logprobs_from_vllm_completion(self, completion: Any, token_ids: list[int]) -> list[float]:
+        logprob_steps = list(getattr(completion, "logprobs", None) or [])
+        generated: list[float] = []
+        for idx, token_id in enumerate(token_ids):
+            if idx >= len(logprob_steps):
+                break
+            step = logprob_steps[idx] or {}
+            value = None
+            if isinstance(step, dict):
+                value = step.get(token_id)
+                if value is None:
+                    value = step.get(str(token_id))
+            parsed = _logprob_value(value)
+            if parsed is not None:
+                generated.append(parsed)
+        return generated
 
     def clear_runtime_cache(self) -> bool:
         if self.cfg.backend == "openai":

@@ -33,7 +33,7 @@ class GenerationConfig:
     think_token_budget: int = 8192
     answer_token_budget: int = 2048
     step_delimiters: list[str] = field(default_factory=lambda: ["\n\n"])
-    final_answer_generator: str = "active"
+    final_answer_generator: str = "slm"
     force_close_think_text: str = "\n</think>\n\n"
 
     def __post_init__(self) -> None:
@@ -47,8 +47,8 @@ class GenerationConfig:
             raise ValueError("generation.think_token_budget must be >= 1")
         if self.answer_token_budget < 1:
             raise ValueError("generation.answer_token_budget must be >= 1")
-        if self.final_answer_generator not in {"slm", "llm", "active"}:
-            raise ValueError("generation.final_answer_generator must be 'slm', 'llm', or 'active'")
+        if self.final_answer_generator not in {"slm", "llm"}:
+            raise ValueError("generation.final_answer_generator must be 'slm' or 'llm'")
 
 
 @dataclass
@@ -82,6 +82,9 @@ class RiskConfig:
     stable_reference_min_steps: int = 3
     recent_window: int = 4
     prefix_recent_steps: int = 3
+    handoff_probe_strategy: str = "eager"
+    handoff_probe_interval: int = 1
+    handoff_probe_warmup_steps: int = 2
 
     def __post_init__(self) -> None:
         if self.stable_reference_min_steps < 1:
@@ -90,6 +93,12 @@ class RiskConfig:
             raise ValueError("risk.recent_window must be >= 1")
         if self.prefix_recent_steps < 1:
             raise ValueError("risk.prefix_recent_steps must be >= 1")
+        if self.handoff_probe_strategy not in {"eager", "periodic", "hybrid"}:
+            raise ValueError("risk.handoff_probe_strategy must be one of: eager, periodic, hybrid")
+        if self.handoff_probe_interval < 1:
+            raise ValueError("risk.handoff_probe_interval must be >= 1")
+        if self.handoff_probe_warmup_steps < 0:
+            raise ValueError("risk.handoff_probe_warmup_steps must be >= 0")
 
 
 @dataclass

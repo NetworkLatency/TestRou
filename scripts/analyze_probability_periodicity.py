@@ -185,14 +185,17 @@ def _step_probability_summary(extra: dict[str, Any], logprobs: list[float]) -> d
     }
 
 
-def load_step_points(problem_dir: Path, *, source: str) -> list[StepProbPoint]:
+def load_step_points(problem_dir: Path, *, source: str, statuses: set[str]) -> list[StepProbPoint]:
     path = _steps_path(problem_dir)
     if path is None:
         return []
     problem_id = problem_dir.stem if problem_dir.is_file() else problem_dir.name
     points: list[StepProbPoint] = []
     for row in _read_jsonl(path):
-        if row.get("is_final_answer") or row.get("status") != "active":
+        if row.get("is_final_answer"):
+            continue
+        row_status = str(row.get("status") or "")
+        if "ALL" not in statuses and row_status not in statuses:
             continue
         row_source = str(row.get("source") or row.get("generator") or "").upper()
         if source != "ALL" and row_source != source:
@@ -211,7 +214,7 @@ def load_step_points(problem_dir: Path, *, source: str) -> list[StepProbPoint]:
                 problem_id=problem_id,
                 step_id=int(row.get("step_id") or len(points) + 1),
                 source=row_source,
-                status=str(row.get("status") or ""),
+                status=row_status,
                 text=str(row.get("text") or ""),
                 token_ids=token_ids,
                 logprobs=logprobs,
@@ -246,6 +249,7 @@ def step_rows(points: list[StepProbPoint]) -> list[dict[str, Any]]:
                 "problem_id": point.problem_id,
                 "step_id": point.step_id,
                 "source": point.source,
+                "status": point.status,
                 "token_count": len(point.token_ids),
                 "has_token_logprobs": bool(point.logprobs),
                 "mean_logprob": point.mean_logprob,
@@ -385,6 +389,8 @@ def flatten_tokens(points: list[StepProbPoint]) -> list[dict[str, Any]]:
             tokens.append(
                 {
                     "problem_id": point.problem_id,
+                    "source": point.source,
+                    "status": point.status,
                     "token_pos": pos,
                     "step_id": point.step_id,
                     "token_index_in_step": idx,
@@ -465,11 +471,21 @@ def _parse_int_list(text: str) -> list[int]:
     return [int(item.strip()) for item in str(text or "").split(",") if item.strip()]
 
 
+def _parse_statuses(text: str) -> set[str]:
+    values = {
+        "ALL" if item.strip().lower() == "all" else item.strip()
+        for item in str(text or "").split(",")
+        if item.strip()
+    }
+    return values or {"active"}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Analyze generated-token probability periodicity in SARR step traces.")
     parser.add_argument("--input", required=True, help="Experiment root, problem directory, or *.steps.jsonl file.")
     parser.add_argument("--output", required=True, help="Output directory for CSV/JSON analysis files.")
-    parser.add_argument("--source", default="SLM", choices=["SLM", "LLM", "ALL"])
+    parser.add_argument("--source", default="ALL", choices=["SLM", "LLM", "ALL"])
+    parser.add_argument("--statuses", default="active,sealed,probe_discarded")
     parser.add_argument("--max-step-lag", type=int, default=12)
     parser.add_argument("--max-token-lag", type=int, default=256)
     parser.add_argument("--step-window-sizes", default="4,8,12")
@@ -483,6 +499,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     step_windows = _parse_int_list(args.step_window_sizes)
     chunk_sizes = _parse_int_list(args.chunk_sizes)
+    statuses = _parse_statuses(args.statuses)
 
     all_step_points: list[StepProbPoint] = []
     step_csv_rows: list[dict[str, Any]] = []
@@ -493,7 +510,7 @@ def main() -> None:
 
     problem_count = 0
     for problem_dir in _problem_dirs(root):
-        points = load_step_points(problem_dir, source=args.source)
+        points = load_step_points(problem_dir, source=args.source, statuses=statuses)
         if not points:
             continue
         problem_count += 1
@@ -552,6 +569,7 @@ def main() -> None:
         "input": str(root),
         "output": str(out_dir),
         "source": args.source,
+        "statuses": sorted(statuses),
         "problem_count": problem_count,
         "step_count": len(all_step_points),
         "steps_with_token_logprobs": steps_with_token_logprobs,
@@ -565,6 +583,7 @@ def main() -> None:
             "text_similarity": "Jaccard similarity over word 4-grams for step/chunk units.",
             "token_match_rate": "Exact token-id match rate at a token lag.",
             "probability_signal": "Generated-token logprob; probability can be recovered as exp(logprob).",
+            "source": "Use --source SLM, --source LLM, or --source ALL. Default ALL treats both generators as analysis subjects.",
         },
     }
     (out_dir / "analysis_metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")

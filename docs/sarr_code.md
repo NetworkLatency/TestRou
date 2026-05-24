@@ -20,7 +20,7 @@ HANDOFF_PROBE
 CLOSE_OR_FINALIZE
 ```
 
-The controller switches by observable continuation signals, not by LLM token share, fixed LLM step counts, fixed handoff thresholds, or decayed re-entry risk.
+The controller switches by observable continuation signals and SLM handoff probes, not by LLM token share, LLM self-judgment, or answer correctness.
 
 ## Run Commands
 
@@ -68,15 +68,21 @@ Each problem directory contains:
 
 `SLM_ACTIVE` accepts normal SLM steps and updates observable signals and stable-step memory. It can transfer ownership to the LLM on local difficulty, prefix contamination, or a degenerative loop.
 
-`LLM_FORWARD_OWNERSHIP` lets the LLM continue from the current prefix until the online episode looks less like the failure that triggered ownership and more like stable continuation evidence.
+`LLM_FORWARD_OWNERSHIP` lets the LLM continue from the current prefix. After each LLM step, the controller schedules an SLM handoff probe according to `risk.handoff_probe_strategy`:
 
-`LLM_REPAIR_OWNERSHIP` is entered after a prefix-contamination rollback. The rollback interval is sealed, and the LLM must generate at least `repair_horizon` replacement steps before a handoff probe is allowed.
+```text
+eager    = probe after every eligible LLM step
+periodic = probe every risk.handoff_probe_interval LLM steps
+hybrid   = wait risk.handoff_probe_warmup_steps, then probe every interval
+```
+
+`LLM_REPAIR_OWNERSHIP` is entered after a prefix-contamination rollback. The rollback interval is sealed, and `repair_horizon` is logged as the removed-step replacement target, but it no longer blocks SLM handoff probes.
 
 `HANDOFF_PROBE` generates an SLM probe step without committing it. The probe is accepted only when it looks closer to local stable memory or the LLM continuation than to failure memory or rejected probe memory, does not repeat sealed content, and does not immediately return to self-check/repetition. Failed probes are recorded as `probe_discarded` and do not affect the active prefix.
 
 ## Online Regime Logic
 
-SARR-CoDE now uses a fully online regime comparison for LLM ownership and handoff. During a problem it maintains four local memories:
+SARR-CoDE now uses a fully online regime comparison for handoff acceptance. During a problem it maintains four local memories:
 
 ```text
 stable SLM steps
@@ -85,9 +91,9 @@ current LLM ownership episode
 rejected SLM handoff probes
 ```
 
-Distances are computed only against signals observed inside the same problem. A handoff probe is requested when the LLM episode has enough online evidence to be distinguishable from the failure regime. A probe is accepted when it is closer to stable/LLM-continuation memory than to failure/rejected-probe memory. The controller does not use fixed LLM ownership step counts, max reflection counts, max verification counts, handoff risk-rank limits, or LLM token share as control rules.
+Distances are computed only against signals observed inside the same problem. A handoff probe is requested by the configured probe schedule, then accepted when the SLM continuation is closer to stable/LLM-continuation memory than to failure/rejected-probe memory. LLM step quality is logged with a recent-window diagnostic, but it no longer gates whether the SLM is allowed to try taking ownership back.
 
-`CLOSE_OR_FINALIZE` closes thinking and generates the final answer. If no close marker appeared naturally, the controller appends a uniform `</think>` marker before the final-answer call.
+`CLOSE_OR_FINALIZE` closes thinking and generates the final answer with `generation.final_answer_generator`, which defaults to `slm`. If no close marker appeared naturally, the controller appends a uniform `</think>` marker before the final-answer call.
 
 ## Signals
 
@@ -112,7 +118,7 @@ degeneration_score
 
 Confidence fields come from logits already captured during SLM generation. The main loop does not do an additional long-prefix confidence forward on every step.
 
-For offline probability-periodicity analysis, SLM step records also persist generated-token logprobs in `extra.generated_token_logprobs` and step-level aggregates in `extra.token_probability`. These fields are logged from the same generation scores and are not used by the online controller.
+For offline probability-periodicity analysis, SLM and LLM step records persist generated-token logprobs in `extra.generated_token_logprobs` and step-level aggregates in `extra.token_probability` when the backend exposes them. These fields are logged from generation scores and are not used by the online controller.
 
 Run token/step/chunk probability periodicity analysis:
 
@@ -121,6 +127,8 @@ python scripts/analyze_probability_periodicity.py \
   --input sarr_results/aime25/sarr_code_v5_ownership_controller \
   --output sarr_results/aime25/probability_periodicity
 ```
+
+The analysis defaults to `--source ALL --statuses active,sealed,probe_discarded` so SLM and LLM generations are reviewed symmetrically. Use `--source SLM` or `--source LLM` only for source-specific diagnostics.
 
 ## Summary Schema
 
@@ -131,6 +139,9 @@ problem_id
 finish_reason
 final_answer
 final_answer_generator
+handoff_probe_strategy
+handoff_probe_interval
+handoff_probe_warmup_steps
 driver_state
 driver_switch_count
 llm_ownership_episodes
@@ -145,10 +156,17 @@ degenerative_loop_count
 rollback_count
 sealed_interval_count
 repeated_rollback_blocked_count
-llm_handoff_deferred_count
+handoff_probe_skipped_count
 slm_thinking_tokens
 llm_thinking_tokens
 total_thinking_tokens
+probe_discarded_tokens
+slm_probe_discarded_tokens
+llm_probe_discarded_tokens
+probe_discarded_step_count
+slm_generated_thinking_tokens
+llm_generated_thinking_tokens
+total_generated_thinking_tokens
 slm_step_count
 llm_step_count
 confidence_forward_count

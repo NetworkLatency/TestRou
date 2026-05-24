@@ -38,7 +38,7 @@
     "think_token_budget": 12288,
     "answer_token_budget": 4096,
     "step_delimiters": ["\n\n"],
-    "final_answer_generator": "active"
+    "final_answer_generator": "slm"
   },
   "controller": {
     "mode": "ownership_controller",
@@ -53,7 +53,10 @@
     "enable_local_difficulty_routing": false,
     "stable_reference_min_steps": 3,
     "recent_window": 4,
-    "prefix_recent_steps": 3
+    "prefix_recent_steps": 3,
+    "handoff_probe_strategy": "eager",
+    "handoff_probe_interval": 1,
+    "handoff_probe_warmup_steps": 2
   },
   "logging": {
     "save_step_records": true,

@@ -131,20 +131,53 @@ def _problem_sarr_metrics(result, step_rows: list[dict[str, Any]], controller_ro
     summary = _sarr_summary_from_trace(result)
     active_steps = [row for row in step_rows if _truthy(row.get("active"))]
     discarded_probes = [row for row in step_rows if row.get("status") == "probe_discarded"]
+    active_slm_tokens = sum(int(_num(row.get("token_count"))) for row in active_steps if row.get("source") == "SLM")
+    active_llm_tokens = sum(int(_num(row.get("token_count"))) for row in active_steps if row.get("source") == "LLM")
+    discarded_probe_tokens = sum(int(_num(row.get("token_count"))) for row in discarded_probes)
+    slm_discarded_probe_tokens = sum(
+        int(_num(row.get("token_count"))) for row in discarded_probes if row.get("source") == "SLM"
+    )
+    llm_discarded_probe_tokens = sum(
+        int(_num(row.get("token_count"))) for row in discarded_probes if row.get("source") == "LLM"
+    )
     if not summary:
         summary = {
             "driver_switch_count": sum(1 for row in controller_rows if row.get("event") == "driver_switch"),
             "handoff_probe_count": len(discarded_probes),
             "handoff_success_count": 0,
             "handoff_failure_count": len(discarded_probes),
+            "handoff_probe_skipped_count": sum(1 for row in controller_rows if row.get("event") == "handoff_probe_skipped"),
             "rollback_count": sum(1 for row in controller_rows if row.get("event") == "prefix_contamination_rollback"),
             "sealed_interval_count": sum(1 for row in controller_rows if row.get("event") == "prefix_contamination_rollback"),
+            "probe_discarded_tokens": discarded_probe_tokens,
+            "slm_probe_discarded_tokens": slm_discarded_probe_tokens,
+            "llm_probe_discarded_tokens": llm_discarded_probe_tokens,
+            "probe_discarded_step_count": len(discarded_probes),
+            "slm_generated_thinking_tokens": active_slm_tokens + slm_discarded_probe_tokens,
+            "llm_generated_thinking_tokens": active_llm_tokens + llm_discarded_probe_tokens,
+            "total_generated_thinking_tokens": active_slm_tokens + active_llm_tokens + discarded_probe_tokens,
             "lookahead_count": 0,
         }
     return {
         "active_thinking_step_count": len(active_steps),
         "generated_thinking_attempt_count": len(step_rows),
         "probe_discarded_count": len(discarded_probes),
+        "probe_discarded_tokens": int(_num(summary.get("probe_discarded_tokens") or discarded_probe_tokens)),
+        "slm_probe_discarded_tokens": int(_num(summary.get("slm_probe_discarded_tokens") or slm_discarded_probe_tokens)),
+        "llm_probe_discarded_tokens": int(_num(summary.get("llm_probe_discarded_tokens") or llm_discarded_probe_tokens)),
+        "probe_discarded_step_count": int(_num(summary.get("probe_discarded_step_count") or len(discarded_probes))),
+        "slm_generated_thinking_tokens": int(
+            _num(summary.get("slm_generated_thinking_tokens") or active_slm_tokens + slm_discarded_probe_tokens)
+        ),
+        "llm_generated_thinking_tokens": int(
+            _num(summary.get("llm_generated_thinking_tokens") or active_llm_tokens + llm_discarded_probe_tokens)
+        ),
+        "total_generated_thinking_tokens": int(
+            _num(summary.get("total_generated_thinking_tokens") or active_slm_tokens + active_llm_tokens + discarded_probe_tokens)
+        ),
+        "handoff_probe_strategy": summary.get("handoff_probe_strategy") or "",
+        "handoff_probe_interval": int(_num(summary.get("handoff_probe_interval"))),
+        "handoff_probe_warmup_steps": int(_num(summary.get("handoff_probe_warmup_steps"))),
         "driver_switch_count": int(_num(summary.get("driver_switch_count"))),
         "llm_ownership_episodes": int(_num(summary.get("llm_ownership_episodes"))),
         "llm_forward_episodes": int(_num(summary.get("llm_forward_episodes"))),
@@ -159,7 +192,7 @@ def _problem_sarr_metrics(result, step_rows: list[dict[str, Any]], controller_ro
         "has_rollback": int(_num(summary.get("rollback_count"))) > 0,
         "sealed_interval_count": int(_num(summary.get("sealed_interval_count"))),
         "repeated_rollback_blocked_count": int(_num(summary.get("repeated_rollback_blocked_count"))),
-        "llm_handoff_deferred_count": int(_num(summary.get("llm_handoff_deferred_count"))),
+        "handoff_probe_skipped_count": int(_num(summary.get("handoff_probe_skipped_count"))),
         "slm_thinking_tokens": int(_num(summary.get("slm_thinking_tokens"))),
         "llm_thinking_tokens": int(_num(summary.get("llm_thinking_tokens"))),
         "total_thinking_tokens": int(_num(summary.get("total_thinking_tokens"))),
@@ -212,7 +245,11 @@ def _extra_sarr_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "total_rollback_count": total("rollback_count"),
         "total_sealed_interval_count": total("sealed_interval_count"),
         "total_repeated_rollback_blocked_count": total("repeated_rollback_blocked_count"),
-        "total_llm_handoff_deferred_count": total("llm_handoff_deferred_count"),
+        "total_handoff_probe_skipped_count": total("handoff_probe_skipped_count"),
+        "total_probe_discarded_tokens": total("probe_discarded_tokens"),
+        "total_slm_probe_discarded_tokens": total("slm_probe_discarded_tokens"),
+        "total_llm_probe_discarded_tokens": total("llm_probe_discarded_tokens"),
+        "avg_probe_discarded_tokens": avg("probe_discarded_tokens"),
         "avg_confidence_forward_count": avg("confidence_forward_count"),
         "avg_lookahead_count": avg("lookahead_count"),
     }
@@ -260,7 +297,14 @@ def run_experiment(args: argparse.Namespace, cfg: SARRConfig) -> None:
         ]
 
     _validate_ownership_config(cfg)
-    print("[sarr] controller=ownership handoff_probe=enabled lookahead=disabled", flush=True)
+    print(
+        "[sarr] controller=ownership "
+        f"handoff_probe_strategy={cfg.risk.handoff_probe_strategy} "
+        f"interval={cfg.risk.handoff_probe_interval} "
+        f"warmup={cfg.risk.handoff_probe_warmup_steps} "
+        f"final_answer_generator={cfg.generation.final_answer_generator}",
+        flush=True,
+    )
     from sarr_code.engines import build_llm, build_slm
 
     slm = build_slm(cfg.slm, cfg.runtime)
