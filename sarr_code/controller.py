@@ -1,1135 +1,924 @@
 from __future__ import annotations
 
+import math
 import re
 import time
-from collections import Counter
+from bisect import bisect_right
 from dataclasses import asdict, dataclass, field
-from statistics import median
+from pathlib import Path
 from typing import Any
 
-from bpa.safety import CLOSE_THINK_TAG, clean_latex_answer, extract_last_boxed, normalize_step_skeleton
-
-from .config import RiskConfig
-from .records import StepOutput, StepRecord
+from .config import ControllerConfig
+from .records import StepOutput
 
 
-SLM_ACTIVE = "SLM_ACTIVE"
-LLM_FORWARD_OWNERSHIP = "LLM_FORWARD_OWNERSHIP"
-LLM_REPAIR_OWNERSHIP = "LLM_REPAIR_OWNERSHIP"
-HANDOFF_PROBE = "HANDOFF_PROBE"
-CLOSE_OR_FINALIZE = "CLOSE_OR_FINALIZE"
+OWNER_SLM = "SLM"
+OWNER_LLM = "LLM"
 
-ACTIVE = "active"
-REMOVED = "removed"
-SEALED = "sealed"
-PROBE_DISCARDED = "probe_discarded"
+MODE_COLD_START = "COLD_START"
+MODE_SLM_NORMAL = "SLM_NORMAL"
+MODE_LLM_REPAIR = "LLM_REPAIR"
+MODE_SLM_PROBATION = "SLM_PROBATION"
+MODE_FINALIZE = "FINALIZE"
+MODE_LLM_FINALIZE = "LLM_FINALIZE"
 
-SOURCE_SLM = "SLM"
-SOURCE_LLM = "LLM"
-SOURCE_SYSTEM = "SYSTEM"
+WINDOW_TRUSTED = "trusted"
+WINDOW_SUSPECT = "suspect"
+WINDOW_FAILURE = "failure"
+WINDOW_INVALID = "invalid"
+
+STEP_ACTIVE = "active"
+STEP_REMOVED = "removed"
+STEP_FINAL_ANSWER = "final_answer"
 
 
-_WORD_RE = re.compile(r"[A-Za-z0-9]+")
-_SENTENCE_RE = re.compile(r"[^.!?\n]+[.!?]?", re.M)
-_REFLECTION_PATTERNS = [
-    "wait",
-    "let me check",
-    "check again",
-    "verify",
-    "maybe",
-    "but",
-    "however",
-    "reconsider",
-    "let's see",
-    "alternatively",
-]
-_VERIFICATION_PATTERNS = [
-    "check",
-    "verify",
-    "again",
-    "confirm",
-    "make sure",
-    "wait",
-    "maybe",
-]
-_ANSWER_PATTERNS = [
-    re.compile(
-        r"(?is)\b(?:final\s+answer|the\s+answer|answer|result)\b\s*(?:is|=|:)?\s*([^\n.;]{1,100})"
-    ),
-    re.compile(r"(?is)\b(?:therefore|thus|so)\b\s+([^\n.;]{1,100})"),
+_ANSWER_INTENT_PATTERNS = [
+    re.compile(r"final\s+answer", re.I),
+    re.compile(r"the\s+answer\s+is", re.I),
+    re.compile(r"therefore\s+the\s+answer", re.I),
+    re.compile(r"answer\s*:", re.I),
+    re.compile(r"\\boxed\s*\{", re.I),
 ]
 
 
-def _word_tokens(text: str) -> list[str]:
-    return _WORD_RE.findall(str(text or "").lower())
-
-
-def _ngram_counter(tokens: list[str], n: int) -> Counter[tuple[str, ...]]:
-    if len(tokens) < n:
-        return Counter()
-    return Counter(tuple(tokens[i : i + n]) for i in range(len(tokens) - n + 1))
-
-
-def _normalize_text(text: str) -> str:
-    text = str(text or "").lower()
-    text = re.sub(r"</?think>", " ", text)
-    text = re.sub(r"\\[a-zA-Z]+", " ", text)
-    text = re.sub(r"[-+]?\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?", "#", text)
-    text = re.sub(r"[^a-z0-9#]+", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def _normalize_candidate(value: str | None) -> str | None:
-    if value is None:
-        return None
-    candidate = clean_latex_answer(str(value).strip())
-    if not candidate:
-        return None
-    candidate = candidate.strip(" \t\r\n\"'`")
-    candidate = re.sub(r"^(?:is|=|:)\s*", "", candidate, flags=re.I).strip()
-    candidate = re.split(r"[\r\n]", candidate, maxsplit=1)[0].strip()
-    candidate = candidate.strip(" ,;:.")
-    if not candidate:
-        return None
-    if not _is_strong_candidate(candidate):
-        return None
-    return candidate[:100]
-
-
-def _is_strong_candidate(candidate: str) -> bool:
-    value = str(candidate or "").strip()
-    if not value:
-        return False
-    if re.fullmatch(r"[A-Za-z]", value):
-        return False
-    if re.fullmatch(r"(?:the|a|an|it|this|that|yes|no)", value, flags=re.I):
-        return False
-    return bool(re.search(r"\d|\\(?:frac|sqrt)|[=+\-*/^%]", value))
-
-
-def extract_candidate_answer(text: str) -> str | None:
-    boxed = extract_last_boxed(text)
-    if boxed is not None:
-        return _normalize_candidate(boxed)
-
-    for pattern in _ANSWER_PATTERNS:
-        matches = list(pattern.finditer(text or ""))
-        for match in reversed(matches):
-            candidate = _short_candidate(match.group(1))
-            if candidate is not None:
-                return candidate
-    return None
-
-
-def _short_candidate(raw: str) -> str | None:
-    text = str(raw or "").strip()
-    boxed = extract_last_boxed(text)
-    if boxed is not None:
-        return _normalize_candidate(boxed)
-    math_match = re.search(
-        r"(\\frac\s*\{[^{}\r\n]{1,80}\}\s*\{[^{}\r\n]{1,80}\}|[-+]?\d+(?:\.\d+)?(?:\s*/\s*[-+]?\d+(?:\.\d+)?)?%?)",
-        text,
-        flags=re.I,
-    )
-    if math_match:
-        return _normalize_candidate(math_match.group(1))
-    expression = re.split(r"(?<!\d)\.(?!\d)|[,;]", text, maxsplit=1)[0].strip()
-    if re.search(r"\d|\\frac|\\sqrt|[=+\-*/^]", expression):
-        return _normalize_candidate(expression)
-    return None
-
-
-def _candidate_mention_count(text: str, candidate: str | None) -> int:
-    if not candidate:
-        return 0
-    raw = str(text or "")
-    if not raw:
-        return 0
-    escaped_parts = [re.escape(part) for part in str(candidate).split()]
-    if not escaped_parts:
-        return 0
-    pattern = r"\s+".join(escaped_parts)
-    pattern = pattern.replace(r"\/", r"\s*/\s*")
-    pattern = pattern.replace(r"\+", r"\s*\+\s*")
-    pattern = pattern.replace(r"\-", r"\s*-\s*")
-    try:
-        return len(re.findall(rf"(?<![A-Za-z0-9]){pattern}(?![A-Za-z0-9])", raw, flags=re.I))
-    except re.error:
-        return raw.lower().count(candidate.lower())
-
-
-def _contains_candidate(text: str, candidate: str | None) -> bool:
-    return _candidate_mention_count(text, candidate) > 0
-
-
-def _sentence_fingerprints(text: str) -> list[str]:
-    values = []
-    for match in _SENTENCE_RE.finditer(text or ""):
-        sent = _normalize_text(match.group(0))
-        if len(sent) >= 12:
-            values.append(sent)
-    return values
-
-
-def _jaccard_words(a: str, b: str) -> float:
-    wa = set(_word_tokens(a))
-    wb = set(_word_tokens(b))
-    if not wa or not wb:
-        return 0.0
-    return len(wa & wb) / len(wa | wb)
-
-
-# Online regime comparisons use only signals observed inside the current problem.
-_ONLINE_SIGNAL_FIELDS = [
-    "entropy",
-    "margin",
-    "degeneration_score",
-    "low_new_information_score",
-    "repeated_ngram_ratio",
-    "repeated_sentence_count",
-    "repeated_phrase_count",
-    "repeated_verification_pattern_count",
-    "repeated_answer_mention_count",
-    "reflection_pattern_count",
-]
-_LOWER_IS_WORSE_FIELDS = {"margin"}
-
-
-def _signal_metric(signals: "StepSignals", name: str) -> float | None:
-    value = getattr(signals, name, None)
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _badness_metric(signals: "StepSignals", name: str) -> float | None:
-    value = _signal_metric(signals, name)
-    if value is None:
-        return None
-    return -value if name in _LOWER_IS_WORSE_FIELDS else value
-
-
-def _signal_profile(signals_list: list["StepSignals"]) -> dict[str, float]:
-    profile: dict[str, float] = {}
-    for name in _ONLINE_SIGNAL_FIELDS:
-        vals = [_signal_metric(signals, name) for signals in signals_list]
-        clean = [float(value) for value in vals if value is not None]
-        if clean:
-            profile[name] = float(median(clean))
-    return profile
-
-
-def _profile_distance(signals: "StepSignals", references: list["StepSignals"]) -> float | None:
-    if not references:
-        return None
-    distances: list[float] = []
-    for name in _ONLINE_SIGNAL_FIELDS:
-        value = _signal_metric(signals, name)
-        ref_values = [_signal_metric(ref, name) for ref in references]
-        clean_refs = [float(item) for item in ref_values if item is not None]
-        if value is None or not clean_refs:
-            continue
-        values = [float(value), *clean_refs]
-        span = max(values) - min(values)
-        center = float(median(clean_refs))
-        distances.append(0.0 if span == 0.0 else abs(float(value) - center) / span)
-    if not distances:
-        return None
-    return sum(distances) / len(distances)
-
-
-def _worse_better_votes(current: "StepSignals", reference: "StepSignals") -> tuple[int, int]:
-    worse = 0
-    better = 0
-    for name in _ONLINE_SIGNAL_FIELDS:
-        curr = _badness_metric(current, name)
-        ref = _badness_metric(reference, name)
-        if curr is None or ref is None or curr == ref:
-            continue
-        if curr > ref:
-            worse += 1
-        else:
-            better += 1
-    return worse, better
-
-
-def _low_quality_step(signals: "StepSignals") -> bool:
-    strong_repetition = (
-        signals.repeated_sentence_count > 0
-        or signals.repeated_phrase_count >= 2
-        or signals.repeated_ngram_ratio >= 0.35
-    )
-    repeated_answer_loop = signals.repeats_existing_candidate_answer and (
-        signals.repeated_answer_mention_count >= 2 or signals.low_new_information_score >= 0.45
-    )
-    low_information_repetition = signals.low_new_information_score >= 0.65 and (
-        signals.repeated_phrase_count > 0
-        or signals.repeated_ngram_ratio >= 0.20
-        or signals.repeated_verification_pattern_count >= 2
-    )
-    excessive_self_check_stagnation = (
-        signals.low_new_information_score >= 0.60
-        and signals.repeated_verification_pattern_count >= 3
-        and signals.reflection_pattern_count >= 2
-    )
-    return (
-        strong_repetition
-        or repeated_answer_loop
-        or low_information_repetition
-        or excessive_self_check_stagnation
-    )
+class InvalidControllerState(RuntimeError):
+    pass
 
 
 @dataclass
-class StepSignals:
-    raw_next_token_confidence: float | None = None
-    entropy: float | None = None
-    margin: float | None = None
-    repeated_ngram_ratio: float = 0.0
-    repeated_sentence_count: int = 0
-    repeated_phrase_count: int = 0
-    repeated_verification_pattern_count: int = 0
-    repeated_answer_mention_count: int = 0
-    low_new_information_score: float = 0.0
-    reflection_pattern_count: int = 0
-    has_candidate_answer: bool = False
-    candidate_answer_value: str | None = None
-    repeats_existing_candidate_answer: bool = False
-    degeneration_score: float = 0.0
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
-class DetectionResult:
-    triggered: bool = False
-    reason: str = ""
-    onset_step_id: int | None = None
-    loop_type: str | None = None
-    candidate_answer: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
-class SealedInterval:
-    anchor_step_id: int
-    removed_start_step_id: int
-    removed_end_step_id: int
-    reason: str
-    repair_horizon: int
-    removed_signatures: list[str] = field(default_factory=list)
-
-    def overlaps(self, start_step_id: int, end_step_id: int) -> bool:
-        return not (end_step_id < self.removed_start_step_id or start_step_id > self.removed_end_step_id)
-
-
-class TrajectoryState:
-    def __init__(self, problem_id: str) -> None:
-        self.problem_id = problem_id
-        self.records: list[StepRecord] = []
-        self.next_step_id = 1
-        self.sealed_intervals: list[SealedInterval] = []
-
-    def append_active_step(
-        self,
-        *,
-        output: StepOutput,
-        source: str,
-        driver_state: str,
-        observed_signals: StepSignals,
-        action: str,
-        attempt_id: int,
-        extra: dict[str, Any] | None = None,
-    ) -> StepRecord:
-        record = StepRecord(
-            problem_id=self.problem_id,
-            step_id=self.next_step_id,
-            text=output.text,
-            token_ids=list(output.token_ids),
-            source=source,
-            status=ACTIVE,
-            driver_state_when_generated=driver_state,
-            observed_signals=observed_signals.to_dict(),
-            created_at=time.time(),
-            action=action,
-            finish_reason=output.finish_reason,
-            prompt_tokens=output.prompt_tokens,
-            wall_time=output.wall_time,
-            attempt_id=attempt_id,
-            extra=dict(extra or {}),
-        )
-        self.records.append(record)
-        self.next_step_id += 1
-        return record
-
-    def append_probe_discarded(
-        self,
-        *,
-        output: StepOutput,
-        source: str,
-        driver_state: str,
-        observed_signals: StepSignals,
-        action: str,
-        attempt_id: int,
-        reason: str,
-        extra: dict[str, Any] | None = None,
-    ) -> StepRecord:
-        payload = dict(extra or {})
-        payload["discard_reason"] = reason
-        record = StepRecord(
-            problem_id=self.problem_id,
-            step_id=self.next_step_id,
-            text=output.text,
-            token_ids=list(output.token_ids),
-            source=source,
-            status=PROBE_DISCARDED,
-            driver_state_when_generated=driver_state,
-            observed_signals=observed_signals.to_dict(),
-            created_at=time.time(),
-            action=action,
-            finish_reason=output.finish_reason,
-            prompt_tokens=output.prompt_tokens,
-            wall_time=output.wall_time,
-            attempt_id=attempt_id,
-            extra=payload,
-        )
-        self.records.append(record)
-        self.next_step_id += 1
-        return record
-
-    def rollback_to_step(self, anchor_step_id: int) -> list[StepRecord]:
-        removed: list[StepRecord] = []
-        for record in self.records:
-            if record.status == ACTIVE and record.step_id > anchor_step_id:
-                record.status = REMOVED
-                record.action = "REMOVED_BY_PREFIX_CONTAMINATION_ROLLBACK"
-                removed.append(record)
-        return removed
-
-    def seal_interval(
-        self,
-        *,
-        anchor_step_id: int,
-        removed_start_step_id: int,
-        removed_end_step_id: int,
-        reason: str,
-        repair_horizon: int,
-        removed_steps: list[StepRecord],
-    ) -> SealedInterval:
-        for record in removed_steps:
-            if removed_start_step_id <= record.step_id <= removed_end_step_id:
-                record.status = SEALED
-        interval = SealedInterval(
-            anchor_step_id=anchor_step_id,
-            removed_start_step_id=removed_start_step_id,
-            removed_end_step_id=removed_end_step_id,
-            reason=reason,
-            repair_horizon=repair_horizon,
-            removed_signatures=[normalize_step_skeleton(record.text) for record in removed_steps if record.text.strip()],
-        )
-        self.sealed_intervals.append(interval)
-        return interval
-
-    def get_active_prefix(self) -> str:
-        return "".join(record.text for record in self.records if record.status == ACTIVE)
-
-    def get_recent_steps(self, k: int, *, source: str | None = None, active_only: bool = True) -> list[StepRecord]:
-        rows = [
-            record
-            for record in self.records
-            if (not active_only or record.status == ACTIVE) and (source is None or record.source == source)
-        ]
-        return rows[-k:]
-
-    def get_active_steps_between(self, a: int, b: int) -> list[StepRecord]:
-        return [record for record in self.records if record.status == ACTIVE and a <= record.step_id <= b]
-
-    def count_active_steps_between(self, a: int, b: int) -> int:
-        return len(self.get_active_steps_between(a, b))
-
-    def active_steps(self) -> list[StepRecord]:
-        return [record for record in self.records if record.status == ACTIVE]
-
-    def detect_finish_marker(self) -> bool:
-        return CLOSE_THINK_TAG in self.get_active_prefix()
-
-    def visible_token_count(self) -> int:
-        return sum(record.token_count for record in self.records if record.status == ACTIVE)
-
-    def source_token_count(self, source: str) -> int:
-        return sum(record.token_count for record in self.records if record.status == ACTIVE and record.source == source)
-
-    def source_step_count(self, source: str) -> int:
-        return sum(1 for record in self.records if record.status == ACTIVE and record.source == source)
-
-    def status_token_count(self, status: str, *, source: str | None = None) -> int:
-        return sum(
-            record.token_count
-            for record in self.records
-            if record.status == status and (source is None or record.source == source)
-        )
-
-    def status_step_count(self, status: str, *, source: str | None = None) -> int:
-        return sum(
-            1
-            for record in self.records
-            if record.status == status and (source is None or record.source == source)
-        )
-
-
-class ObservableSignals:
-    def __init__(self, cfg: RiskConfig) -> None:
-        self.cfg = cfg
-
-    def compute(
-        self,
-        *,
-        text: str,
-        source: str,
-        output_extra: dict[str, Any] | None,
-        trajectory: TrajectoryState,
-        known_candidates: list[str],
-    ) -> StepSignals:
-        extra = output_extra or {}
-        confidence = extra.get("confidence") if isinstance(extra.get("confidence"), dict) else {}
-        recent = trajectory.get_recent_steps(self.cfg.recent_window)
-        recent_text = "\n".join(record.text for record in recent)
-        tokens = _word_tokens(text)
-        recent_tokens = _word_tokens(recent_text)
-
-        ngram_ratio = self._repeated_ngram_ratio(tokens, recent_tokens)
-        repeated_sentences = self._repeated_sentence_count(text, recent)
-        repeated_phrases = self._repeated_phrase_count(tokens, recent_tokens)
-        verification_count = self._pattern_count(text, _VERIFICATION_PATTERNS)
-        reflection_count = self._pattern_count(text, _REFLECTION_PATTERNS)
-        candidate = extract_candidate_answer(text)
-        repeated_answer_count = self._known_candidate_mentions(text, candidate, known_candidates, recent)
-        low_new_info = self._low_new_information_score(tokens, recent_tokens, text, recent_text)
-
-        repeats_candidate = bool(candidate and any(_contains_candidate(record.text, candidate) for record in recent))
-
-        degeneration_score = self._degeneration_score(
-            ngram_ratio=ngram_ratio,
-            repeated_sentences=repeated_sentences,
-            repeated_phrases=repeated_phrases,
-            verification_count=verification_count,
-            repeated_answer_count=repeated_answer_count,
-            low_new_info=low_new_info,
-            reflection_count=reflection_count,
-        )
-
-        return StepSignals(
-            raw_next_token_confidence=_as_float(confidence.get("raw_next_token_confidence")),
-            entropy=_as_float(confidence.get("entropy")),
-            margin=_as_float(confidence.get("margin")),
-            repeated_ngram_ratio=ngram_ratio,
-            repeated_sentence_count=repeated_sentences,
-            repeated_phrase_count=repeated_phrases,
-            repeated_verification_pattern_count=verification_count,
-            repeated_answer_mention_count=repeated_answer_count,
-            low_new_information_score=low_new_info,
-            reflection_pattern_count=reflection_count,
-            has_candidate_answer=candidate is not None,
-            candidate_answer_value=candidate,
-            repeats_existing_candidate_answer=repeats_candidate,
-            degeneration_score=degeneration_score,
-        )
-
-    def _repeated_ngram_ratio(self, tokens: list[str], recent_tokens: list[str], n: int = 4) -> float:
-        grams = _ngram_counter(tokens, n)
-        if not grams:
-            return 0.0
-        repeated_inside = sum(count - 1 for count in grams.values() if count > 1)
-        recent_grams = set(_ngram_counter(recent_tokens, n))
-        overlap = sum(count for gram, count in grams.items() if gram in recent_grams)
-        return min(1.0, (repeated_inside + overlap) / max(1, sum(grams.values())))
-
-    def _repeated_sentence_count(self, text: str, recent: list[StepRecord]) -> int:
-        current = _sentence_fingerprints(text)
-        if not current:
-            return 0
-        recent_sentences = set()
-        for record in recent:
-            recent_sentences.update(_sentence_fingerprints(record.text))
-        inside = len(current) - len(set(current))
-        overlap = sum(1 for sent in current if sent in recent_sentences)
-        return inside + overlap
-
-    def _repeated_phrase_count(self, tokens: list[str], recent_tokens: list[str], n: int = 6) -> int:
-        grams = _ngram_counter(tokens, n)
-        if not grams:
-            return 0
-        recent_grams = set(_ngram_counter(recent_tokens, n))
-        return sum(1 for gram in grams if gram in recent_grams)
-
-    def _pattern_count(self, text: str, patterns: list[str]) -> int:
-        lowered = str(text or "").lower()
-        return sum(lowered.count(pattern) for pattern in patterns)
-
-    def _known_candidate_mentions(
-        self,
-        text: str,
-        candidate: str | None,
-        known_candidates: list[str],
-        recent: list[StepRecord],
-    ) -> int:
-        candidates = [c for c in known_candidates if c]
-        if candidate:
-            candidates.append(candidate)
-        seen = set()
-        count = 0
-        for value in candidates:
-            norm = value.lower()
-            if norm in seen:
-                continue
-            seen.add(norm)
-            count += _candidate_mention_count(text, value)
-            count += sum(1 for record in recent if _contains_candidate(record.text, value))
-        return count
-
-    def _low_new_information_score(
-        self,
-        tokens: list[str],
-        recent_tokens: list[str],
-        text: str,
-        recent_text: str,
-    ) -> float:
-        if not tokens:
-            return 1.0
-        if not recent_tokens:
-            return 0.0
-        recent_set = set(recent_tokens)
-        new_count = sum(1 for token in tokens if token not in recent_set)
-        new_ratio = new_count / max(1, len(tokens))
-        jaccard = _jaccard_words(text, recent_text)
-        return max(0.0, min(1.0, 0.55 * (1.0 - new_ratio) + 0.45 * jaccard))
-
-    def _degeneration_score(
-        self,
-        *,
-        ngram_ratio: float,
-        repeated_sentences: int,
-        repeated_phrases: int,
-        verification_count: int,
-        repeated_answer_count: int,
-        low_new_info: float,
-        reflection_count: int,
-    ) -> float:
-        score = 0.0
-        score += 0.24 * ngram_ratio
-        score += 0.14 * min(1.0, repeated_sentences / 2)
-        score += 0.12 * min(1.0, repeated_phrases / 3)
-        score += 0.14 * min(1.0, verification_count / 3)
-        score += 0.14 * min(1.0, reflection_count / 3)
-        score += 0.12 * min(1.0, repeated_answer_count / 3)
-        score += 0.18 * low_new_info
-        return max(0.0, min(1.0, score))
-
-
-def _as_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-class StableStepMemory:
-    def __init__(self, cfg: RiskConfig) -> None:
-        self.cfg = cfg
-        self._records: list[tuple[int, StepSignals]] = []
-
-    def add_if_stable(self, record: StepRecord, signals: StepSignals) -> bool:
-        if record.source != SOURCE_SLM or record.status != ACTIVE:
-            return False
-        if _low_quality_step(signals):
-            return False
-        if self.has_enough_reference():
-            comparison = self.compare_to_stable(signals)
-            if comparison["outside_stable_envelope"] and comparison["worse_votes"] > comparison["better_votes"]:
-                return False
-        self._records.append((record.step_id, signals))
-        return True
-
-    def remove_after(self, anchor_step_id: int) -> None:
-        self._records = [(step_id, signals) for step_id, signals in self._records if step_id <= anchor_step_id]
-
-    def has_enough_reference(self) -> bool:
-        return len(self._records) >= self.cfg.stable_reference_min_steps
-
-    def signal_records(self) -> list[StepSignals]:
-        return [signals for _, signals in self._records]
-
-    def get_reference_distribution(self) -> dict[str, float]:
-        return _signal_profile(self.signal_records())
-
-    def compare_to_stable(self, signals: StepSignals) -> dict[str, Any]:
-        references = self.signal_records()
-        ref = self.get_reference_distribution()
-        outside_fields: list[str] = []
-        better_fields: list[str] = []
-        worse_votes = 0
-        better_votes = 0
-
-        if references:
-            for name in _ONLINE_SIGNAL_FIELDS:
-                curr = _badness_metric(signals, name)
-                ref_values = [_badness_metric(reference, name) for reference in references]
-                clean_refs = [float(value) for value in ref_values if value is not None]
-                if curr is None or not clean_refs:
-                    continue
-                if curr > max(clean_refs):
-                    outside_fields.append(name)
-                if curr <= float(median(clean_refs)):
-                    better_fields.append(name)
-            for reference in references:
-                worse, better = _worse_better_votes(signals, reference)
-                worse_votes += worse
-                better_votes += better
-
-        outside_stable = bool(outside_fields)
-        risk_rank = len(outside_fields)
-        return {
-            "reference": ref,
-            "outside_fields": outside_fields,
-            "better_fields": better_fields,
-            "outside_stable_envelope": outside_stable,
-            "worse_votes": worse_votes,
-            "better_votes": better_votes,
-            "stable_distance": _profile_distance(signals, references),
-            "risk_rank": risk_rank,
-        }
-
-    def latest_anchor_before(self, step_id: int) -> int | None:
-        anchors = [anchor_id for anchor_id, _ in self._records if anchor_id < step_id]
-        return max(anchors) if anchors else None
-
-
-class RiskDetector:
-    def __init__(self, cfg: RiskConfig) -> None:
-        self.cfg = cfg
-
-    def local_difficulty(
-        self,
-        record: StepRecord,
-        signals: StepSignals,
-        stable_memory: StableStepMemory,
-    ) -> DetectionResult:
-        if record.source != SOURCE_SLM:
-            return DetectionResult()
-        if not stable_memory.has_enough_reference():
-            return DetectionResult()
-        comparison = stable_memory.compare_to_stable(signals)
-        if (
-            comparison["outside_stable_envelope"]
-            and comparison["worse_votes"] > comparison["better_votes"]
-            and not _low_quality_step(signals)
-        ):
-            return DetectionResult(
-                triggered=True,
-                reason="slm_step_confidence_drift_without_prefix_loop",
-                onset_step_id=record.step_id,
-            )
-        return DetectionResult()
-
-    def prefix_contamination(
-        self,
-        trajectory: TrajectoryState,
-        stable_memory: StableStepMemory,
-    ) -> DetectionResult:
-        recent = trajectory.get_recent_steps(self.cfg.prefix_recent_steps, source=SOURCE_SLM)
-        if len(recent) < min(2, self.cfg.prefix_recent_steps):
-            return DetectionResult()
-        bad: list[StepRecord] = []
-        for record in recent:
-            signals = _signals_from_record(record)
-            comparison = stable_memory.compare_to_stable(signals)
-            if (
-                _low_quality_step(signals)
-                or (
-                    comparison["outside_stable_envelope"]
-                    and comparison["worse_votes"] > comparison["better_votes"]
-                )
-            ):
-                bad.append(record)
-
-        if len(bad) > len(recent) - len(bad):
-            return DetectionResult(
-                triggered=True,
-                reason="recent_slm_steps_drifted_from_stable_memory",
-                onset_step_id=bad[0].step_id if bad else recent[0].step_id,
-            )
-
-        candidate_values = [
-            str(_signals_from_record(record).candidate_answer_value)
-            for record in recent
-            if _signals_from_record(record).candidate_answer_value
-        ]
-        if candidate_values:
-            most_common, count = Counter(candidate_values).most_common(1)[0]
-            verification = sum(_signals_from_record(record).repeated_verification_pattern_count for record in recent)
-            if count >= 2 and verification >= 2:
-                return DetectionResult(
-                    triggered=True,
-                    reason="recent_slm_steps_repeated_candidate_verification",
-                    onset_step_id=recent[0].step_id,
-                    candidate_answer=most_common,
-                )
-        return DetectionResult()
-
-    def degenerative_loop(self, trajectory: TrajectoryState) -> DetectionResult:
-        recent = trajectory.get_recent_steps(self.cfg.recent_window)
-        if len(recent) < 2:
-            return DetectionResult()
-        recent_signals = [_signals_from_record(record) for record in recent]
-
-        skeletons = [normalize_step_skeleton(record.text) for record in recent if len(record.text.strip()) >= 20]
-        if len(skeletons) >= 2 and (skeletons[-1] == skeletons[-2] or (len(skeletons) >= 3 and skeletons[-1] == skeletons[-3])):
-            return DetectionResult(
-                triggered=True,
-                reason="repeated_reasoning_fragment",
-                onset_step_id=recent[-2].step_id,
-                loop_type="repeated_fragment",
-            )
-
-        repeated_template_count = sum(
-            1
-            for sig in recent_signals
-            if sig.repeated_verification_pattern_count > 0 or sig.repeated_phrase_count > 0 or sig.repeated_sentence_count > 0
-        )
-        hesitation_count = sum(1 for sig in recent_signals if sig.reflection_pattern_count > 0)
-        loop_like_count = sum(1 for sig in recent_signals if _low_quality_step(sig))
-        if (
-            loop_like_count > len(recent_signals) - loop_like_count
-            and repeated_template_count + hesitation_count >= loop_like_count
-        ):
-            return DetectionResult(
-                triggered=True,
-                reason="reflection_and_low_information_loop",
-                onset_step_id=recent[0].step_id,
-                loop_type="reflection_loop",
-            )
-        return DetectionResult()
-
-
-def _signals_from_record(record: StepRecord) -> StepSignals:
-    data = record.observed_signals if isinstance(record.observed_signals, dict) else {}
-    valid_fields = StepSignals.__dataclass_fields__
-    return StepSignals(**{key: data.get(key) for key in valid_fields if key in data})
-
-
-class SealedIntervalLock:
-    def __init__(self) -> None:
-        self.intervals: list[SealedInterval] = []
-
-    def add(self, interval: SealedInterval) -> None:
-        self.intervals.append(interval)
-
-    def blocks(self, onset_step_id: int, current_step_id: int) -> bool:
-        return any(interval.overlaps(onset_step_id, current_step_id) for interval in self.intervals)
-
-    def reopens_sealed_problem(self, text: str) -> bool:
-        signature = normalize_step_skeleton(text)
-        if not signature:
-            return False
-        for interval in self.intervals:
-            for removed in interval.removed_signatures:
-                if removed and _jaccard_words(signature, removed) >= 0.55:
-                    return True
-        return False
-
-
-class HandoffReadiness:
-    def __init__(self, cfg: RiskConfig) -> None:
-        self.cfg = cfg
-
-    def evaluate(
-        self,
-        *,
-        probe_text: str,
-        probe_signals: StepSignals,
-        stable_memory: StableStepMemory,
-        sealed_lock: SealedIntervalLock,
-        failure_signals: list[StepSignals],
-        llm_episode_signals: list[StepSignals],
-        rejected_probe_signals: list[StepSignals],
-    ) -> DetectionResult:
-        comparison = stable_memory.compare_to_stable(probe_signals)
-        if sealed_lock.reopens_sealed_problem(probe_text):
-            return DetectionResult(triggered=False, reason="probe_reopens_sealed_interval")
-        if _low_quality_step(probe_signals):
-            return DetectionResult(triggered=False, reason="probe_returns_to_self_check_or_repetition")
-
-        stable_signals = stable_memory.signal_records()
-        stable_distance = _profile_distance(probe_signals, stable_signals)
-        failure_distance = _profile_distance(probe_signals, failure_signals)
-        llm_distance = _profile_distance(probe_signals, llm_episode_signals)
-        rejected_distance = _profile_distance(probe_signals, rejected_probe_signals)
-        good_distances = [value for value in [stable_distance, llm_distance] if value is not None]
-        best_good_distance = min(good_distances) if good_distances else None
-
-        if rejected_distance is not None and best_good_distance is not None and rejected_distance < best_good_distance:
-            return DetectionResult(triggered=False, reason="probe_matches_rejected_probe_memory")
-        if failure_distance is not None and best_good_distance is not None and failure_distance < best_good_distance:
-            return DetectionResult(triggered=False, reason="probe_matches_failure_memory")
-        if (
-            stable_memory.has_enough_reference()
-            and comparison["outside_stable_envelope"]
-            and comparison["worse_votes"] > comparison["better_votes"]
-        ):
-            return DetectionResult(triggered=False, reason="probe_worse_than_stable_memory")
-        if best_good_distance is None and failure_distance is not None:
-            return DetectionResult(triggered=False, reason="probe_has_no_online_handoff_evidence")
-        return DetectionResult(triggered=True, reason="probe_continuation_stable")
-
-
-class OwnershipController:
-    def __init__(self, problem_id: str, cfg: RiskConfig, initial_driver: str = "slm") -> None:
-        self.problem_id = problem_id
-        self.cfg = cfg
-        self.driver_state = SLM_ACTIVE if initial_driver.lower() == "slm" else initial_driver.upper()
-        self.previous_ownership_state: str | None = None
-        self.repair_horizon = 0
-        self.repair_generated_steps = 0
-        self.llm_ownership_generated_steps = 0
-        self._llm_recent_stability: list[bool] = []
-        self._current_failure_signals: list[StepSignals] = []
-        self._failure_signal_memory: list[StepSignals] = []
-        self._llm_episode_signals: list[StepSignals] = []
-        self._rejected_probe_signals: list[StepSignals] = []
-        self.events: list[dict[str, Any]] = []
-        self.transition_events: list[dict[str, Any]] = []
-
-        self.driver_switch_count = 0
-        self.llm_forward_episodes = 0
-        self.llm_repair_episodes = 0
-        self.handoff_probe_count = 0
-        self.handoff_success_count = 0
-        self.handoff_failure_count = 0
-        self.local_difficulty_count = 0
-        self.prefix_contamination_count = 0
-        self.degenerative_loop_count = 0
-        self.rollback_count = 0
-        self.repeated_rollback_blocked_count = 0
-        self.handoff_probe_skipped_count = 0
-        self.confidence_forward_count = 0
-        self.handoff_probe_forward_count = 0
-        self.lookahead_count = 0
+class Step:
+    step_id: int
+    owner: str
+    mode: str
+    text: str
+    token_ids: list[int]
+    logprobs: list[float]
+    start_token_idx: int
+    end_token_idx: int
+    episode_id: int
+    active: bool = True
+    action: str = ""
+    finish_reason: str | None = None
+    prompt_tokens: int = 0
+    wall_time: float = 0.0
+    attempt_id: int | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+    created_at: float = field(default_factory=time.time)
 
     @property
-    def llm_ownership_episodes(self) -> int:
-        return self.llm_forward_episodes + self.llm_repair_episodes
+    def token_count(self) -> int:
+        return len(self.token_ids)
 
-    def switch(self, to_state: str, *, step_id: int | None, reason: str, data: dict[str, Any] | None = None) -> None:
-        from_state = self.driver_state
-        if from_state == to_state:
-            return
-        self.driver_state = to_state
-        self.driver_switch_count += 1
+    @property
+    def scored_token_count(self) -> int:
+        return min(len(self.token_ids), len(self.logprobs))
+
+    @property
+    def status(self) -> str:
+        return STEP_ACTIVE if self.active else STEP_REMOVED
+
+    def to_dict(self, problem_id: str) -> dict[str, Any]:
+        row = asdict(self)
+        row.update(
+            {
+                "problem_id": problem_id,
+                "source": self.owner,
+                "generator": self.owner.lower(),
+                "status": self.status,
+                "token_count": self.token_count,
+                "scored_token_count": self.scored_token_count,
+            }
+        )
+        return row
+
+
+@dataclass
+class PDIWindow:
+    window_id: int
+    owner: str
+    covered_step_ids: list[int]
+    start_token_idx: int
+    end_token_idx: int
+    pdi: float
+    status: str
+    episode_id: int
+    token_count: int
+    q_percentile: float | None = None
+    upper_excess: float | None = None
+    upper_evidence: float | None = None
+
+    def overlaps(self, start_token_idx: int, end_token_idx: int) -> bool:
+        return self.start_token_idx <= end_token_idx and self.end_token_idx >= start_token_idx
+
+
+@dataclass
+class UpperEvidencePoint:
+    window: PDIWindow
+    q_percentile: float
+    upper_excess: float
+    upper_evidence: float
+
+
+@dataclass
+class EpisodeState:
+    owner: str = OWNER_SLM
+    mode: str = MODE_COLD_START
+    trusted_buffer: list[PDIWindow] = field(default_factory=list)
+    failure_buffer: list[PDIWindow] = field(default_factory=list)
+    pre_suspect_snapshot: list[float] = field(default_factory=list)
+    upper_evidence_history: list[UpperEvidencePoint] = field(default_factory=list)
+    lower_tail_history: list[bool] = field(default_factory=list)
+    handoff_history: list[float] = field(default_factory=list)
+    handoff_point_token_idx: int | None = None
+    probation_stable_count: int = 0
+
+
+@dataclass
+class ControllerDecision:
+    action: str
+    step: Step | None = None
+    window: PDIWindow | None = None
+    q_percentile: float | None = None
+    upper_excess: float | None = None
+    upper_evidence: float | None = None
+    rollback_start_token_idx: int | None = None
+    handoff_q_slm_side: float | None = None
+    probation_status: str | None = None
+
+
+class EmpiricalCDF:
+    def __init__(self, values: list[float]) -> None:
+        self.values = sorted(float(v) for v in values if math.isfinite(float(v)))
+
+    def __call__(self, value: float) -> float:
+        if not self.values:
+            return 0.5
+        return bisect_right(self.values, float(value)) / len(self.values)
+
+    def to_list(self) -> list[float]:
+        return list(self.values)
+
+
+class EffectiveCDF:
+    def __init__(self, *, prior: list[float], trusted: list[float], lambda0: float) -> None:
+        self.prior = EmpiricalCDF(prior)
+        self.trusted = EmpiricalCDF(trusted)
+        self.lambda0 = max(0.0, float(lambda0)) if self.prior.values else 0.0
+        self.n_trusted = len(self.trusted.values)
+
+    @property
+    def denominator(self) -> float:
+        return self.lambda0 + self.n_trusted
+
+    @property
+    def prior_weight(self) -> float:
+        denom = self.denominator
+        return self.lambda0 / denom if denom > 0 else 0.0
+
+    def __call__(self, value: float) -> float:
+        denom = self.denominator
+        if denom <= 0:
+            return 0.5
+        prior_part = self.lambda0 * self.prior(value)
+        trusted_part = self.n_trusted * self.trusted(value) if self.n_trusted else 0.0
+        return float((prior_part + trusted_part) / denom)
+
+
+def load_prior_distribution(cfg: ControllerConfig) -> list[float]:
+    if cfg.prior_distribution_path:
+        path = Path(cfg.prior_distribution_path)
+        if not path.exists():
+            raise FileNotFoundError(f"controller.prior_distribution_path not found: {path}")
+        text = path.read_text(encoding="utf-8")
+        if path.suffix.lower() == ".json":
+            import json
+
+            data = json.loads(text)
+            if isinstance(data, dict):
+                data = data.get("raw_values") or data.get("values") or data.get("calibration_values") or []
+            return _clean_floats(list(data))
+        values: list[float] = []
+        for line in text.splitlines():
+            for piece in re.split(r"[,\s]+", line.strip()):
+                if piece:
+                    values.append(float(piece))
+        return _clean_floats(values)
+    return _clean_floats(list(cfg.prior_distribution))
+
+
+def _clean_floats(values: list[Any]) -> list[float]:
+    cleaned: list[float] = []
+    for value in values:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(parsed):
+            cleaned.append(parsed)
+    return cleaned
+
+
+def _step_logprobs(output: StepOutput) -> list[float]:
+    values = output.extra.get("generated_token_logprobs")
+    if not isinstance(values, list):
+        return []
+    return _clean_floats(values)
+
+
+def spans_overlap(start_a: int, end_a: int, start_b: int, end_b: int) -> bool:
+    if end_a < start_a or end_b < start_b:
+        return False
+    return start_a <= end_b and end_a >= start_b
+
+
+def has_answer_intent(text: str) -> bool:
+    return any(pattern.search(text or "") for pattern in _ANSWER_INTENT_PATTERNS)
+
+
+class PDIController:
+    def __init__(self, problem_id: str, cfg: ControllerConfig) -> None:
+        self.problem_id = problem_id
+        self.cfg = cfg
+        self.prior_distribution = load_prior_distribution(cfg)
+        self.lambda0 = float(cfg.lambda0)
+        self.state = EpisodeState()
+        self.steps: list[Step] = []
+        self.windows: list[PDIWindow] = []
+        self.events: list[dict[str, Any]] = []
+
+        self._next_step_id = 1
+        self._next_window_id = 1
+        self._episode_id = 1
+        self._repair_step_count = 0
+        self._probation_windows: list[PDIWindow] = []
+        self._last_no_valid_pdi_window: dict[str, Any] = {}
+
+        self.driver_switch_count = 0
+        self.llm_repair_episodes = 0
+        self.rollback_count = 0
+        self.handoff_attempt_count = 0
+        self.handoff_success_count = 0
+        self.handoff_failure_count = 0
+        self.probation_failure_count = 0
+        self.early_stop_trigger_count = 0
+        self.pdi_decision_count = 0
+        self.no_valid_pdi_window_count = 0
+        self.no_valid_pdi_window_reasons: dict[str, int] = {}
+        self.answer_intent_seen = False
+
+    @property
+    def q_handoff(self) -> float:
+        return self.cfg.q_handoff if self.cfg.q_handoff is not None else self.cfg.q_high
+
+    @property
+    def next_step_id(self) -> int:
+        return self._next_step_id
+
+    def validate_state(self) -> None:
+        mode = self.state.mode
+        owner = self.state.owner
+        if mode in {MODE_COLD_START, MODE_SLM_NORMAL, MODE_SLM_PROBATION} and owner != OWNER_SLM:
+            raise InvalidControllerState(f"Invalid owner/mode pair: owner={owner}, mode={mode}")
+        if mode in {MODE_LLM_REPAIR, MODE_LLM_FINALIZE} and owner != OWNER_LLM:
+            raise InvalidControllerState(f"Invalid owner/mode pair: owner={owner}, mode={mode}")
+        if mode == MODE_FINALIZE and owner not in {OWNER_SLM, OWNER_LLM}:
+            raise InvalidControllerState(f"Invalid owner/mode pair: owner={owner}, mode={mode}")
+
+    def append_step(self, output: StepOutput, *, owner: str, action: str, attempt_id: int | None = None) -> Step:
+        start = self.visible_token_count()
+        token_ids = list(output.token_ids)
+        end = start + len(token_ids) - 1
+        step = Step(
+            step_id=self._next_step_id,
+            owner=owner,
+            mode=self.state.mode,
+            text=output.text,
+            token_ids=token_ids,
+            logprobs=_step_logprobs(output),
+            start_token_idx=start,
+            end_token_idx=end,
+            episode_id=self._episode_id,
+            action=action,
+            finish_reason=output.finish_reason,
+            prompt_tokens=output.prompt_tokens,
+            wall_time=output.wall_time,
+            attempt_id=attempt_id,
+            extra=dict(output.extra),
+        )
+        self.steps.append(step)
+        self._next_step_id += 1
+        if has_answer_intent(step.text):
+            self.answer_intent_seen = True
+        return step
+
+    def active_steps(self) -> list[Step]:
+        return [step for step in self.steps if step.active]
+
+    def active_text(self) -> str:
+        return "".join(step.text for step in self.active_steps())
+
+    def visible_token_count(self) -> int:
+        return sum(step.token_count for step in self.steps if step.active)
+
+    def source_token_count(self, owner: str) -> int:
+        return sum(step.token_count for step in self.steps if step.active and step.owner == owner)
+
+    def source_step_count(self, owner: str) -> int:
+        return sum(1 for step in self.steps if step.active and step.owner == owner)
+
+    def build_step_window(self, active_steps: list[Step] | None = None) -> PDIWindow | None:
+        self._last_no_valid_pdi_window = {}
+        source_steps = active_steps if active_steps is not None else self.active_steps()
+        candidates = [
+            step
+            for step in source_steps
+            if step.active and step.owner == self.state.owner and step.episode_id == self._episode_id
+        ]
+        if not candidates:
+            self._set_no_valid_pdi_window(
+                reason="no_episode_steps",
+                candidates=[],
+                scored_count=0,
+            )
+            return None
+
+        missing_logprob_steps = [step for step in candidates if step.scored_token_count <= 0]
+        if missing_logprob_steps:
+            self._set_no_valid_pdi_window(
+                reason="missing_logprobs",
+                candidates=candidates,
+                scored_count=sum(step.scored_token_count for step in candidates),
+                missing_step_ids=[step.step_id for step in missing_logprob_steps],
+            )
+            return None
+
+        if self._has_current_episode_window():
+            selected_steps: list[Step] = []
+            scored_count = 0
+            for step in reversed(candidates):
+                selected_steps.append(step)
+                scored_count += step.scored_token_count
+                if scored_count >= self.cfg.t_min:
+                    break
+            selected_steps.reverse()
+        else:
+            selected_steps = list(candidates)
+            scored_count = sum(step.scored_token_count for step in selected_steps)
+
+        if scored_count < self.cfg.t_min:
+            self._set_no_valid_pdi_window(
+                reason="insufficient_scored_tokens",
+                candidates=candidates,
+                scored_count=scored_count,
+            )
+            return None
+
+        owners = {step.owner for step in selected_steps}
+        if len(owners) != 1:
+            raise InvalidControllerState("PDI window crossed an ownership boundary.")
+
+        logprob_sum = 0.0
+        for step in selected_steps:
+            logprob_sum += sum(step.logprobs[: step.scored_token_count])
+        pdi = -logprob_sum / scored_count
+        window = PDIWindow(
+            window_id=self._next_window_id,
+            owner=selected_steps[0].owner,
+            covered_step_ids=[step.step_id for step in selected_steps],
+            start_token_idx=selected_steps[0].start_token_idx,
+            end_token_idx=selected_steps[-1].end_token_idx,
+            pdi=float(pdi),
+            status=WINDOW_SUSPECT,
+            episode_id=self._episode_id,
+            token_count=scored_count,
+        )
+        self._next_window_id += 1
+        self.windows.append(window)
+        return window
+
+    def _has_current_episode_window(self) -> bool:
+        return any(
+            window.owner == self.state.owner
+            and window.episode_id == self._episode_id
+            and window.status not in {WINDOW_FAILURE, WINDOW_INVALID}
+            for window in self.windows
+        )
+
+    def _set_no_valid_pdi_window(
+        self,
+        *,
+        reason: str,
+        candidates: list[Step],
+        scored_count: int,
+        missing_step_ids: list[int] | None = None,
+    ) -> None:
+        self._last_no_valid_pdi_window = {
+            "reason": reason,
+            "owner": self.state.owner,
+            "mode": self.state.mode,
+            "episode_id": self._episode_id,
+            "candidate_step_ids": [step.step_id for step in candidates],
+            "candidate_step_count": len(candidates),
+            "scored_token_count": int(scored_count),
+            "required_token_count": self.cfg.t_min,
+            "missing_step_ids": list(missing_step_ids or []),
+        }
+
+    def effective_cdf(self, trusted_buffer: list[PDIWindow] | None = None) -> EffectiveCDF:
+        windows = self.state.trusted_buffer if trusted_buffer is None else trusted_buffer
+        return EffectiveCDF(
+            prior=self.prior_distribution,
+            trusted=[window.pdi for window in windows if window.status == WINDOW_TRUSTED],
+            lambda0=self.lambda0,
+        )
+
+    def effective_cdf_from_values(self, trusted_values: list[float]) -> EffectiveCDF:
+        return EffectiveCDF(
+            prior=self.prior_distribution,
+            trusted=list(trusted_values),
+            lambda0=self.lambda0,
+        )
+
+    def percentile_rank(self, value: float, cdf: EffectiveCDF) -> float:
+        return cdf(value)
+
+    def upper_excess(self, q_percentile: float) -> float:
+        q_high = float(self.cfg.q_high)
+        return max(0.0, float(q_percentile) - q_high) / max(1e-12, 1.0 - q_high)
+
+    def update_upper_evidence(self, window: PDIWindow, q_percentile: float) -> tuple[float, float]:
+        upper_excess = self.upper_excess(q_percentile)
+        recent_before = self.state.upper_evidence_history[-(self.cfg.r_upper - 1) :] if self.cfg.r_upper > 1 else []
+        had_active_upper_region = any(point.upper_excess > 0 for point in recent_before)
+        if upper_excess > 0 and not had_active_upper_region:
+            self.state.pre_suspect_snapshot = [w.pdi for w in self.state.trusted_buffer]
+
+        point = UpperEvidencePoint(
+            window=window,
+            q_percentile=q_percentile,
+            upper_excess=upper_excess,
+            upper_evidence=0.0,
+        )
+        self.state.upper_evidence_history.append(point)
+        self.state.upper_evidence_history = self.state.upper_evidence_history[-self.cfg.r_upper :]
+        upper_evidence = sum(item.upper_excess for item in self.state.upper_evidence_history) / self.cfg.r_upper
+        point.upper_evidence = upper_evidence
+        window.q_percentile = q_percentile
+        window.upper_excess = upper_excess
+        window.upper_evidence = upper_evidence
+        return upper_excess, upper_evidence
+
+    def alarm_start_window(self) -> PDIWindow | None:
+        positives = [point.window for point in self.state.upper_evidence_history if point.upper_excess > 0]
+        return positives[0] if positives else None
+
+    def process_slm_window(self, step: Step) -> ControllerDecision:
+        mode_at_decision = self.state.mode
+        window = self.build_step_window()
+        if window is None:
+            self._log_no_valid_pdi_window(step=step, mode=mode_at_decision)
+            return ControllerDecision(action="NO_VALID_PDI_WINDOW", step=step)
+
+        cdf = self.effective_cdf()
+        q_percentile = self.percentile_rank(window.pdi, cdf)
+        upper_excess, upper_evidence = self.update_upper_evidence(window, q_percentile)
+        self.pdi_decision_count += 1
+
+        if upper_excess == 0:
+            window.status = WINDOW_TRUSTED
+            self.state.trusted_buffer.append(window)
+            action = "TRUST_PDI_WINDOW"
+        else:
+            window.status = WINDOW_SUSPECT
+            action = "SUSPECT_UPPER_TAIL"
+
+        if self.state.mode == MODE_COLD_START and len(self.state.trusted_buffer) >= self.cfg.n_min:
+            self._switch(MODE_SLM_NORMAL, OWNER_SLM, step_id=step.step_id, reason="trusted_buffer_reached_n_min")
+
+        if upper_evidence > self.cfg.eta_upper:
+            alarm = self.alarm_start_window()
+            if alarm is None:
+                raise InvalidControllerState("Upper-tail alarm fired without a positive evidence window.")
+            rollback_start = alarm.start_token_idx
+            self._log_pdi_decision(
+                step=step,
+                window=window,
+                mode=mode_at_decision,
+                action="ROLLBACK_TO_LLM_REPAIR",
+                cdf=cdf,
+                rollback_start_token_idx=rollback_start,
+            )
+            self.rollback_to_window(alarm)
+            return ControllerDecision(
+                action="ROLLBACK_TO_LLM_REPAIR",
+                step=step,
+                window=window,
+                q_percentile=q_percentile,
+                upper_excess=upper_excess,
+                upper_evidence=upper_evidence,
+                rollback_start_token_idx=rollback_start,
+            )
+
+        early_stop = False
+        if self.state.mode != MODE_COLD_START:
+            lower_hit = q_percentile <= self.cfg.q_low
+            self.state.lower_tail_history.append(lower_hit)
+            self.state.lower_tail_history = self.state.lower_tail_history[-self.cfg.r_low :]
+            early_stop = (
+                self.answer_intent_seen
+                and len(self.state.trusted_buffer) >= self.cfg.n_min
+                and len(self.state.lower_tail_history) >= self.cfg.r_low
+                and all(self.state.lower_tail_history[-self.cfg.r_low :])
+            )
+
+        if early_stop:
+            self.early_stop_trigger_count += 1
+            action = "EARLY_STOP_LOWER_TAIL_AFTER_ANSWER_INTENT"
+            self._switch(MODE_FINALIZE, self.state.owner, step_id=step.step_id, reason=action)
+
+        self._log_pdi_decision(step=step, window=window, mode=mode_at_decision, action=action, cdf=cdf)
+        return ControllerDecision(
+            action=action,
+            step=step,
+            window=window,
+            q_percentile=q_percentile,
+            upper_excess=upper_excess,
+            upper_evidence=upper_evidence,
+        )
+
+    def process_probation_window(self, step: Step) -> ControllerDecision:
+        mode_at_decision = self.state.mode
+        window = self.build_step_window()
+        if window is None:
+            self._log_no_valid_pdi_window(step=step, mode=mode_at_decision)
+            return ControllerDecision(action="NO_VALID_PDI_WINDOW", step=step)
+
+        cdf = self.effective_cdf()
+        q_percentile = self.percentile_rank(window.pdi, cdf)
+        upper_excess, upper_evidence = self.update_upper_evidence(window, q_percentile)
+        self.pdi_decision_count += 1
+        window.status = WINDOW_SUSPECT
+
+        if upper_evidence > self.cfg.eta_upper:
+            self.probation_failure_count += 1
+            rollback_start = self.state.handoff_point_token_idx
+            self._log_pdi_decision(
+                step=step,
+                window=window,
+                mode=mode_at_decision,
+                action="PROBATION_FAILED_ROLLBACK_TO_LLM_REPAIR",
+                cdf=cdf,
+                rollback_start_token_idx=rollback_start,
+                probation_status="failed",
+            )
+            if rollback_start is None:
+                raise InvalidControllerState("Probation failed without a handoff point.")
+            self.rollback_to_token(rollback_start, reason="probation_upper_tail_failure")
+            self.handoff_failure_count += 1
+            return ControllerDecision(
+                action="PROBATION_FAILED_ROLLBACK_TO_LLM_REPAIR",
+                step=step,
+                window=window,
+                q_percentile=q_percentile,
+                upper_excess=upper_excess,
+                upper_evidence=upper_evidence,
+                rollback_start_token_idx=rollback_start,
+                probation_status="failed",
+            )
+
+        if upper_excess == 0:
+            self.state.probation_stable_count += 1
+            self._probation_windows.append(window)
+            probation_status = "stable"
+        else:
+            self.state.probation_stable_count = 0
+            self._probation_windows = []
+            probation_status = "suspect"
+
+        action = "SLM_PROBATION_CONTINUE"
+        if self.state.probation_stable_count >= self.cfg.m_probation:
+            for probation_window in self._probation_windows:
+                probation_window.status = WINDOW_TRUSTED
+                if probation_window not in self.state.trusted_buffer:
+                    self.state.trusted_buffer.append(probation_window)
+            self._probation_windows = []
+            self._reset_evidence_histories()
+            self._switch(MODE_SLM_NORMAL, OWNER_SLM, step_id=step.step_id, reason="probation_passed")
+            action = "SLM_PROBATION_PASSED"
+            probation_status = "passed"
+
+        self._log_pdi_decision(
+            step=step,
+            window=window,
+            mode=mode_at_decision,
+            action=action,
+            cdf=cdf,
+            probation_status=probation_status,
+        )
+        return ControllerDecision(
+            action=action,
+            step=step,
+            window=window,
+            q_percentile=q_percentile,
+            upper_excess=upper_excess,
+            upper_evidence=upper_evidence,
+            probation_status=probation_status,
+        )
+
+    def repair_suffix_for_handoff(self) -> tuple[str, str, list[Step]] | None:
+        repair_steps = [
+            step
+            for step in self.active_steps()
+            if step.owner == OWNER_LLM and step.episode_id == self._episode_id
+        ]
+        if not repair_steps:
+            return None
+        suffix: list[Step] = []
+        token_count = 0
+        for step in reversed(repair_steps):
+            suffix.append(step)
+            token_count += max(1, step.token_count)
+            if token_count >= self.cfg.t_min:
+                break
+        if token_count < self.cfg.t_min:
+            return None
+        suffix.reverse()
+        first_step_id = suffix[0].step_id
+        prefix_text = "".join(step.text for step in self.active_steps() if step.step_id < first_step_id)
+        suffix_text = "".join(step.text for step in suffix)
+        return prefix_text, suffix_text, suffix
+
+    def process_handoff_score(self, *, step: Step, slm_side_pdi: float) -> ControllerDecision:
+        self.handoff_attempt_count += 1
+        cdf = self.effective_cdf_from_values(self.state.pre_suspect_snapshot)
+        q_slm_side = self.percentile_rank(slm_side_pdi, cdf)
+        self.state.handoff_history.append(q_slm_side)
+        self.state.handoff_history = self.state.handoff_history[-self.cfg.r_handoff :]
+        ready = (
+            len(self.state.handoff_history) >= self.cfg.r_handoff
+            and all(q <= self.q_handoff for q in self.state.handoff_history[-self.cfg.r_handoff :])
+        )
         event = {
             "problem_id": self.problem_id,
-            "event": "driver_switch",
-            "step_id": step_id,
-            "from_state": from_state,
-            "to_state": to_state,
-            "reason": reason,
-            "data": dict(data or {}),
+            "event": "handoff_readiness",
+            "step_id": step.step_id,
+            "owner": self.state.owner,
+            "mode": self.state.mode,
+            "slm_side_pdi": slm_side_pdi,
+            "handoff_q_slm_side": q_slm_side,
+            "q_handoff": self.q_handoff,
+            "r_handoff": self.cfg.r_handoff,
+            "ready": ready,
+            "trusted_buffer_size": len(self.state.trusted_buffer),
+            "prior_weight": cdf.prior_weight,
         }
         self.events.append(event)
-        self.transition_events.append(event)
-        if to_state == LLM_FORWARD_OWNERSHIP and from_state != HANDOFF_PROBE:
-            self.llm_forward_episodes += 1
-            self.reset_llm_ownership_counters()
-        elif to_state == LLM_REPAIR_OWNERSHIP and from_state != HANDOFF_PROBE:
-            self.llm_repair_episodes += 1
-            self.reset_llm_ownership_counters()
 
-    def note_event(self, event: str, *, step_id: int | None, reason: str, data: dict[str, Any] | None = None) -> None:
+        if ready:
+            self.handoff_success_count += 1
+            self.state.handoff_point_token_idx = self.visible_token_count()
+            self._reset_evidence_histories()
+            self.state.probation_stable_count = 0
+            self._probation_windows = []
+            self._new_episode()
+            self._switch(MODE_SLM_PROBATION, OWNER_SLM, step_id=step.step_id, reason="slm_side_handoff_ready")
+            return ControllerDecision(
+                action="HANDOFF_TO_SLM_PROBATION",
+                step=step,
+                handoff_q_slm_side=q_slm_side,
+            )
+
+        return ControllerDecision(action="LLM_REPAIR_CONTINUE", step=step, handoff_q_slm_side=q_slm_side)
+
+    def note_llm_repair_step(self, step: Step) -> ControllerDecision:
+        self._repair_step_count += 1
+        if self._repair_step_count >= self.cfg.max_llm_repair_steps:
+            self.handoff_failure_count += 1
+            self._switch(MODE_LLM_FINALIZE, OWNER_LLM, step_id=step.step_id, reason="max_llm_repair_steps")
+            return ControllerDecision(action="LLM_FINALIZE", step=step)
+        return ControllerDecision(action="LLM_REPAIR_CONTINUE", step=step)
+
+    def rollback_to_window(self, alarm_start_window: PDIWindow) -> None:
+        self.rollback_to_token(alarm_start_window.start_token_idx, reason="upper_tail_alarm")
+
+    def rollback_to_token(self, rollback_start_token_idx: int, *, reason: str) -> None:
+        end = self.visible_token_count() - 1
+        if end < rollback_start_token_idx:
+            end = rollback_start_token_idx
+        self.rollback_count += 1
+
+        for step in self.steps:
+            if step.active and spans_overlap(step.start_token_idx, step.end_token_idx, rollback_start_token_idx, end):
+                step.active = False
+                step.action = f"REMOVED_BY_{reason.upper()}"
+
+        kept_trusted: list[PDIWindow] = []
+        for window in self.state.trusted_buffer:
+            if window.overlaps(rollback_start_token_idx, end):
+                window.status = WINDOW_INVALID
+                self.state.failure_buffer.append(window)
+            else:
+                kept_trusted.append(window)
+        self.state.trusted_buffer = kept_trusted
+
+        for window in self.windows:
+            if window.status == WINDOW_SUSPECT and window.overlaps(rollback_start_token_idx, end):
+                window.status = WINDOW_FAILURE
+                if window not in self.state.failure_buffer:
+                    self.state.failure_buffer.append(window)
+
+        self._reset_evidence_histories()
+        self._probation_windows = []
+        self.state.probation_stable_count = 0
+        self.state.handoff_point_token_idx = None
+        self._new_episode()
+        self.llm_repair_episodes += 1
+        self._repair_step_count = 0
+        self._switch(MODE_LLM_REPAIR, OWNER_LLM, step_id=None, reason=reason)
         self.events.append(
             {
                 "problem_id": self.problem_id,
-                "event": event,
-                "step_id": step_id,
+                "event": "rollback",
                 "reason": reason,
-                "data": dict(data or {}),
+                "rollback_start_token_idx": rollback_start_token_idx,
+                "rollback_end_token_idx": end,
+                "trusted_buffer_size": len(self.state.trusted_buffer),
+                "failure_buffer_size": len(self.state.failure_buffer),
             }
         )
 
-    def start_repair(self, *, repair_horizon: int) -> None:
-        self.repair_horizon = max(1, repair_horizon)
-        self.repair_generated_steps = 0
+    def mark_finished(self, step: Step, *, reason: str) -> None:
+        step.action = "FINISHED" if reason == "finished" else f"STOP_{reason.upper()}"
+        self._switch(MODE_FINALIZE, self.state.owner, step_id=step.step_id, reason=reason)
 
-    def note_repair_step(self, step_count: int = 1) -> None:
-        self.repair_generated_steps += max(0, int(step_count))
+    def force_finalize(self, *, owner: str | None = None, reason: str) -> None:
+        self._switch(MODE_FINALIZE, owner or self.state.owner, step_id=None, reason=reason)
 
-    def reset_llm_ownership_counters(self) -> None:
-        self.llm_ownership_generated_steps = 0
-        self._llm_recent_stability = []
-        self._llm_episode_signals = []
+    def serialize_steps(self) -> list[dict[str, Any]]:
+        return [step.to_dict(self.problem_id) for step in self.steps]
 
-    def note_failure_step(self, signals: StepSignals, *, step_id: int | None, reason: str) -> None:
-        self._current_failure_signals = [signals]
-        self._failure_signal_memory.append(signals)
-        self.note_event(
-            "online_failure_memory_updated",
-            step_id=step_id,
-            reason=reason,
-            data={"failure_memory_size": len(self._failure_signal_memory)},
-        )
-
-    def note_rejected_probe(self, signals: StepSignals) -> None:
-        self._rejected_probe_signals.append(signals)
-
-    def failure_signals(self) -> list[StepSignals]:
-        if self._current_failure_signals:
-            return list(self._current_failure_signals)
-        return list(self._failure_signal_memory)
-
-    def llm_episode_signals(self) -> list[StepSignals]:
-        return list(self._llm_episode_signals)
-
-    def rejected_probe_signals(self) -> list[StepSignals]:
-        return list(self._rejected_probe_signals)
-
-    def note_llm_ownership_step(
-        self,
-        signals: StepSignals,
-        *,
-        step_count: int = 1,
-        stable_memory: StableStepMemory | None = None,
-    ) -> dict[str, Any]:
-        units = max(1, int(step_count))
-        self._llm_episode_signals.append(signals)
-        comparison = stable_memory.compare_to_stable(signals) if stable_memory is not None else {}
-        low_quality = _low_quality_step(signals)
-        stable = not low_quality
-        if comparison:
-            stable = stable and not (
-                comparison["outside_stable_envelope"] and comparison["worse_votes"] > comparison["better_votes"]
-            )
-
-        self.llm_ownership_generated_steps += units
-        self._llm_recent_stability.extend([stable] * units)
-        self._llm_recent_stability = self._llm_recent_stability[-self.cfg.recent_window :]
-        recent_stable = sum(1 for item in self._llm_recent_stability if item)
-        recent_unstable = len(self._llm_recent_stability) - recent_stable
-        return {
-            "step_count": units,
-            "stable": stable,
-            "low_quality": low_quality,
-            "stable_comparison": comparison,
-            "generated_steps": self.llm_ownership_generated_steps,
-            "recent_window": self.cfg.recent_window,
-            "recent_stable_steps": recent_stable,
-            "recent_unstable_steps": recent_unstable,
-        }
-
-    def handoff_probe_schedule(
-        self,
-        ownership_state: str,
-    ) -> DetectionResult:
-        del ownership_state
-        generated_steps = self.llm_ownership_generated_steps
-        if generated_steps < 1:
-            return DetectionResult(
-                triggered=False,
-                reason="handoff_probe_needs_llm_observation",
-            )
-        strategy = self.cfg.handoff_probe_strategy
-        interval = max(1, int(self.cfg.handoff_probe_interval))
-
-        if strategy == "eager":
-            return DetectionResult(triggered=True, reason="handoff_probe_eager")
-
-        if strategy == "periodic":
-            if generated_steps % interval == 0:
-                return DetectionResult(triggered=True, reason="handoff_probe_periodic")
-            return DetectionResult(
-                triggered=False,
-                reason="handoff_probe_waiting_for_period",
-            )
-
-        warmup = max(0, int(self.cfg.handoff_probe_warmup_steps))
-        if generated_steps < warmup:
-            return DetectionResult(
-                triggered=False,
-                reason="handoff_probe_waiting_for_warmup",
-            )
-        if (generated_steps - warmup) % interval == 0:
-            return DetectionResult(triggered=True, reason="handoff_probe_hybrid")
-        return DetectionResult(triggered=False, reason="handoff_probe_waiting_for_period")
-
-    def note_handoff_probe_skipped(self) -> None:
-        self.handoff_probe_skipped_count += 1
+    def serialize_windows(self) -> list[dict[str, Any]]:
+        return [asdict(window) for window in self.windows]
 
     def summary(
         self,
         *,
-        problem_id: str,
         finish_reason: str,
         final_answer: str | None,
         final_answer_generator: str | None,
-        trajectory: TrajectoryState,
         total_wall_time: float,
         slm_wall_time: float,
         llm_wall_time: float,
+        slm_scoring_wall_time: float,
+        slm_scoring_count: int,
         slm_prefill_count: int,
         llm_prefill_count: int,
     ) -> dict[str, Any]:
-        slm_tokens = trajectory.source_token_count(SOURCE_SLM)
-        llm_tokens = trajectory.source_token_count(SOURCE_LLM)
-        probe_discarded_tokens = trajectory.status_token_count(PROBE_DISCARDED)
-        slm_probe_discarded_tokens = trajectory.status_token_count(PROBE_DISCARDED, source=SOURCE_SLM)
-        llm_probe_discarded_tokens = trajectory.status_token_count(PROBE_DISCARDED, source=SOURCE_LLM)
-        probe_discarded_steps = trajectory.status_step_count(PROBE_DISCARDED)
+        slm_tokens = self.source_token_count(OWNER_SLM)
+        llm_tokens = self.source_token_count(OWNER_LLM)
+        total_tokens = slm_tokens + llm_tokens
+        handoff_rate = (
+            self.handoff_success_count / self.handoff_attempt_count if self.handoff_attempt_count else 0.0
+        )
         return {
-            "problem_id": problem_id,
+            "problem_id": self.problem_id,
             "finish_reason": finish_reason,
             "final_answer": final_answer,
             "final_answer_generator": final_answer_generator,
-            "handoff_probe_strategy": self.cfg.handoff_probe_strategy,
-            "handoff_probe_interval": self.cfg.handoff_probe_interval,
-            "handoff_probe_warmup_steps": self.cfg.handoff_probe_warmup_steps,
-            "driver_state": self.driver_state,
+            "controller_mode": "pdi_step_window",
+            "owner": self.state.owner,
+            "mode": self.state.mode,
             "driver_switch_count": self.driver_switch_count,
-            "llm_ownership_episodes": self.llm_ownership_episodes,
-            "llm_forward_episodes": self.llm_forward_episodes,
+            "llm_ownership_episodes": self.llm_repair_episodes,
             "llm_repair_episodes": self.llm_repair_episodes,
-            "handoff_probe_count": self.handoff_probe_count,
+            "rollback_count": self.rollback_count,
+            "handoff_attempt_count": self.handoff_attempt_count,
             "handoff_success_count": self.handoff_success_count,
             "handoff_failure_count": self.handoff_failure_count,
-            "local_difficulty_count": self.local_difficulty_count,
-            "prefix_contamination_count": self.prefix_contamination_count,
-            "degenerative_loop_count": self.degenerative_loop_count,
-            "rollback_count": self.rollback_count,
-            "sealed_interval_count": len(trajectory.sealed_intervals),
-            "repeated_rollback_blocked_count": self.repeated_rollback_blocked_count,
-            "handoff_probe_skipped_count": self.handoff_probe_skipped_count,
+            "handoff_success_rate": handoff_rate,
+            "probation_failure_count": self.probation_failure_count,
+            "probation_failure_rate": (
+                self.probation_failure_count / self.handoff_success_count if self.handoff_success_count else 0.0
+            ),
+            "early_stop_trigger_count": self.early_stop_trigger_count,
+            "pdi_decision_count": self.pdi_decision_count,
+            "no_valid_pdi_window_count": self.no_valid_pdi_window_count,
+            "no_valid_pdi_window_reasons": dict(self.no_valid_pdi_window_reasons),
+            "pdi_window_count": len(self.windows),
+            "trusted_buffer_size": len(self.state.trusted_buffer),
+            "failure_buffer_size": len(self.state.failure_buffer),
+            "prior_size": len(self.prior_distribution),
+            "prior_weight": self.effective_cdf().prior_weight,
             "slm_thinking_tokens": slm_tokens,
             "llm_thinking_tokens": llm_tokens,
-            "total_thinking_tokens": slm_tokens + llm_tokens,
-            "probe_discarded_tokens": probe_discarded_tokens,
-            "slm_probe_discarded_tokens": slm_probe_discarded_tokens,
-            "llm_probe_discarded_tokens": llm_probe_discarded_tokens,
-            "probe_discarded_step_count": probe_discarded_steps,
-            "slm_generated_thinking_tokens": slm_tokens + slm_probe_discarded_tokens,
-            "llm_generated_thinking_tokens": llm_tokens + llm_probe_discarded_tokens,
-            "total_generated_thinking_tokens": slm_tokens + llm_tokens + probe_discarded_tokens,
-            "slm_step_count": trajectory.source_step_count(SOURCE_SLM),
-            "llm_step_count": trajectory.source_step_count(SOURCE_LLM),
-            "confidence_forward_count": self.confidence_forward_count,
-            "handoff_probe_forward_count": self.handoff_probe_forward_count,
-            "lookahead_count": self.lookahead_count,
+            "total_thinking_tokens": total_tokens,
+            "llm_participation_rate": (llm_tokens / total_tokens) if total_tokens else 0.0,
+            "slm_step_count": self.source_step_count(OWNER_SLM),
+            "llm_step_count": self.source_step_count(OWNER_LLM),
             "slm_prefill_count": slm_prefill_count,
             "llm_prefill_count": llm_prefill_count,
             "total_wall_time": total_wall_time,
             "slm_wall_time": slm_wall_time,
             "llm_wall_time": llm_wall_time,
+            "slm_scoring_overhead": slm_scoring_wall_time,
+            "slm_scoring_count": slm_scoring_count,
+            "config": {
+                "t_min": self.cfg.t_min,
+                "lambda0": self.cfg.lambda0,
+                "n_min": self.cfg.n_min,
+                "q_high": self.cfg.q_high,
+                "r_upper": self.cfg.r_upper,
+                "eta_upper": self.cfg.eta_upper,
+                "q_handoff": self.q_handoff,
+                "r_handoff": self.cfg.r_handoff,
+                "m_probation": self.cfg.m_probation,
+                "q_low": self.cfg.q_low,
+                "r_low": self.cfg.r_low,
+                "max_llm_repair_steps": self.cfg.max_llm_repair_steps,
+            },
         }
+
+    def _switch(self, mode: str, owner: str, *, step_id: int | None, reason: str) -> None:
+        old_mode = self.state.mode
+        old_owner = self.state.owner
+        if old_mode == mode and old_owner == owner:
+            return
+        self.state.mode = mode
+        self.state.owner = owner
+        self.driver_switch_count += 1
+        self.events.append(
+            {
+                "problem_id": self.problem_id,
+                "event": "driver_switch",
+                "step_id": step_id,
+                "from_mode": old_mode,
+                "to_mode": mode,
+                "from_owner": old_owner,
+                "to_owner": owner,
+                "reason": reason,
+            }
+        )
+
+    def _new_episode(self) -> None:
+        self._episode_id += 1
+
+    def _reset_evidence_histories(self) -> None:
+        self.state.upper_evidence_history = []
+        self.state.lower_tail_history = []
+        self.state.handoff_history = []
+
+    def _log_pdi_decision(
+        self,
+        *,
+        step: Step,
+        window: PDIWindow,
+        mode: str,
+        action: str,
+        cdf: EffectiveCDF,
+        rollback_start_token_idx: int | None = None,
+        handoff_q_slm_side: float | None = None,
+        probation_status: str | None = None,
+    ) -> None:
+        self.events.append(
+            {
+                "problem_id": self.problem_id,
+                "event": "pdi_decision",
+                "step_id": step.step_id,
+                "window_id": window.window_id,
+                "owner": window.owner,
+                "mode": mode,
+                "start_token_idx": window.start_token_idx,
+                "end_token_idx": window.end_token_idx,
+                "pdi": window.pdi,
+                "q_percentile": window.q_percentile,
+                "upper_excess": window.upper_excess,
+                "upper_evidence": window.upper_evidence,
+                "lower_tail_count": sum(1 for item in self.state.lower_tail_history[-self.cfg.r_low :] if item),
+                "answer_intent_seen": self.answer_intent_seen,
+                "action": action,
+                "trusted_buffer_size": len(self.state.trusted_buffer),
+                "prior_weight": cdf.prior_weight,
+                "rollback_start_token_idx": rollback_start_token_idx,
+                "handoff_q_slm_side": handoff_q_slm_side,
+                "probation_status": probation_status,
+            }
+        )
+
+    def _log_no_valid_pdi_window(self, *, step: Step, mode: str) -> None:
+        detail = dict(self._last_no_valid_pdi_window)
+        reason = str(detail.get("reason") or "unknown")
+        self.no_valid_pdi_window_count += 1
+        self.no_valid_pdi_window_reasons[reason] = self.no_valid_pdi_window_reasons.get(reason, 0) + 1
+        self.events.append(
+            {
+                "problem_id": self.problem_id,
+                "event": "no_valid_pdi_window",
+                "step_id": step.step_id,
+                "owner": self.state.owner,
+                "mode": mode,
+                "reason": reason,
+                "action": "NO_VALID_PDI_WINDOW",
+                "trusted_buffer_size": len(self.state.trusted_buffer),
+                **detail,
+            }
+        )

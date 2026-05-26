@@ -1,5 +1,5 @@
 {
-  "method": "sarr_code_v5_ownership_controller",
+  "method": "pdi_step_window_controller_v0",
   "slm": {
     "model_path": "/home/chenqi/code/Router/models/deepseek-aiDeepSeek-R1-Distill-Qwen-1.5B/",
     "tokenizer_path": null,
@@ -33,20 +33,32 @@
     "gpqa_diamond": "data/gpqa_diamond.jsonl"
   },
   "generation": {
-    "max_new_tokens_per_step": 512,
-    "min_new_tokens_per_step": 64,
     "think_token_budget": 12288,
     "answer_token_budget": 4096,
     "step_delimiters": ["\n\n"],
     "final_answer_generator": "slm"
   },
   "controller": {
-    "mode": "ownership_controller",
-    "initial_driver": "slm"
+    "mode": "pdi_step_window_controller",
+    "initial_driver": "slm",
+    "t_min": 32,
+    "lambda0": 3.0,
+    "n_min": 3,
+    "q_high": 0.90,
+    "r_upper": 2,
+    "eta_upper": 0.50,
+    "q_handoff": null,
+    "r_handoff": 1,
+    "m_probation": 2,
+    "q_low": 0.10,
+    "r_low": 2,
+    "max_llm_repair_steps": 5,
+    "prior_distribution": [0.12, 0.19, 0.29, 0.36],
+    "prior_distribution_path": null
   },
   "confidence": {
     "top_k": 20,
-    "capture_topk_entropy": true,
+    "capture_topk_entropy": false,
     "capture_token_logprobs": true
   },
   "risk": {

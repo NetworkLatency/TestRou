@@ -210,13 +210,11 @@ class _StopOnSubstrings:
         stop_strings: list[str],
         *,
         immediate_stop_strings: list[str] | None = None,
-        min_stop_tokens: int = 0,
     ):
         from transformers import StoppingCriteria
 
         self.stop_reason: str | None = None
         self.stop_text: str | None = None
-        self.min_stop_tokens = max(0, int(min_stop_tokens))
         self.immediate_stop_strings = [s for s in (immediate_stop_strings or []) if s]
         outer = self
 
@@ -231,8 +229,6 @@ class _StopOnSubstrings:
                         outer.stop_reason = "immediate_stop"
                         outer.stop_text = stop
                         return True
-                if len(generated) < outer.min_stop_tokens:
-                    return False
                 if any(text.endswith(stop) for stop in stop_strings):
                     outer.stop_reason = "stop"
                     outer.stop_text = next(stop for stop in stop_strings if text.endswith(stop))
@@ -296,9 +292,10 @@ class LocalTransformersSLM:
         capture_token_entropy: bool = False,
         capture_token_logprobs: bool = False,
         topk_entropy: int = 20,
+        topk_logprobs: int | None = None,
         immediate_stop_strings: list[str] | None = None,
-        min_stop_tokens: int = 0,
     ) -> StepOutput:
+        del topk_logprobs
         import torch
         from transformers import StoppingCriteriaList
 
@@ -320,7 +317,6 @@ class LocalTransformersSLM:
                 input_ids.shape[-1],
                 stop_strings,
                 immediate_stop_strings=immediate_stop_strings,
-                min_stop_tokens=min_stop_tokens,
             )
             stopping.append(stop_tracker.criteria)
         elif immediate_stop_strings:
@@ -329,7 +325,6 @@ class LocalTransformersSLM:
                 input_ids.shape[-1],
                 [],
                 immediate_stop_strings=immediate_stop_strings,
-                min_stop_tokens=min_stop_tokens,
             )
             stopping.append(stop_tracker.criteria)
 
@@ -461,6 +456,73 @@ class LocalTransformersSLM:
         except Exception:
             info["top_tokens"] = []
         return confidence, info
+
+    def score_suffix_pdi(
+        self,
+        problem_text: str,
+        prefix_text: str,
+        suffix_text: str,
+    ) -> dict[str, Any]:
+        import torch
+
+        self.load()
+        rendered_prefix = self.render(problem_text, prefix_text)
+        rendered_full = self.render(problem_text, prefix_text + suffix_text)
+        if not rendered_full.startswith(rendered_prefix):
+            raise RuntimeError("Rendered full prompt does not extend the rendered prefix.")
+
+        generation_budget_for_rendered(rendered_full, self, self.runtime, 1)
+        boundary = len(rendered_prefix)
+        start = time.time()
+
+        encoded = None
+        offsets = None
+        try:
+            encoded = self.tokenizer(
+                rendered_full,
+                return_tensors="pt",
+                add_special_tokens=False,
+                return_offsets_mapping=True,
+            )
+            offsets = encoded.pop("offset_mapping")[0].tolist()
+        except Exception:
+            encoded = self.tokenizer(rendered_full, return_tensors="pt", add_special_tokens=False)
+
+        input_ids = encoded["input_ids"].to(self.device)
+        attention_mask = encoded.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.device)
+
+        if offsets is not None:
+            target_positions = [
+                idx
+                for idx, (_start, end) in enumerate(offsets)
+                if idx > 0 and int(end) > boundary
+            ]
+        else:
+            prefix_ids = self.tokenizer(rendered_prefix, add_special_tokens=False)["input_ids"]
+            target_positions = list(range(max(1, len(prefix_ids)), int(input_ids.shape[-1])))
+
+        with torch.inference_mode():
+            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+
+        logits = outputs.logits[0]
+        logprobs: list[float] = []
+        for pos in target_positions:
+            token_id = int(input_ids[0, pos].detach().cpu())
+            values = logits[pos - 1].float()
+            logprob = values[token_id] - torch.logsumexp(values, dim=-1)
+            logprobs.append(float(logprob.detach().cpu()))
+
+        wall_time = time.time() - start
+        pdi = -sum(logprobs) / len(logprobs) if logprobs else float("inf")
+        return {
+            "pdi": float(pdi),
+            "token_count": len(logprobs),
+            "logprobs": logprobs,
+            "prompt_tokens": int(input_ids.shape[-1]),
+            "wall_time": wall_time,
+        }
 
     def clear_runtime_cache(self) -> bool:
         try:
@@ -743,5 +805,7 @@ def build_slm(cfg: ModelRuntimeConfig, runtime: RuntimeConfig) -> LocalTransform
     return LocalTransformersSLM(cfg=cfg, runtime=runtime)
 
 
-def build_llm(cfg: ModelRuntimeConfig, runtime: RuntimeConfig) -> CompletionEngine:
+def build_llm(cfg: ModelRuntimeConfig, runtime: RuntimeConfig) -> CompletionEngine | LocalTransformersSLM:
+    if cfg.backend == "transformers":
+        return LocalTransformersSLM(cfg=cfg, runtime=runtime)
     return CompletionEngine(cfg=cfg, runtime=runtime, name="llm")

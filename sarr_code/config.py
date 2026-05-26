@@ -28,8 +28,6 @@ class ModelRuntimeConfig:
 
 @dataclass
 class GenerationConfig:
-    max_new_tokens_per_step: int = 512
-    min_new_tokens_per_step: int = 64
     think_token_budget: int = 8192
     answer_token_budget: int = 2048
     step_delimiters: list[str] = field(default_factory=lambda: ["\n\n"])
@@ -37,12 +35,6 @@ class GenerationConfig:
     force_close_think_text: str = "\n</think>\n\n"
 
     def __post_init__(self) -> None:
-        if self.max_new_tokens_per_step < 1:
-            raise ValueError("generation.max_new_tokens_per_step must be >= 1")
-        if self.min_new_tokens_per_step < 1:
-            raise ValueError("generation.min_new_tokens_per_step must be >= 1")
-        if self.min_new_tokens_per_step > self.max_new_tokens_per_step:
-            raise ValueError("generation.min_new_tokens_per_step must be <= max_new_tokens_per_step")
         if self.think_token_budget < 1:
             raise ValueError("generation.think_token_budget must be >= 1")
         if self.answer_token_budget < 1:
@@ -53,14 +45,50 @@ class GenerationConfig:
 
 @dataclass
 class ControllerConfig:
-    mode: str = "ownership_controller"
+    mode: str = "pdi_step_window_controller"
     initial_driver: str = "slm"
+    t_min: int = 32
+    lambda0: float = 3.0
+    n_min: int = 3
+    q_high: float = 0.90
+    r_upper: int = 2
+    eta_upper: float = 0.50
+    q_handoff: float | None = None
+    r_handoff: int = 1
+    m_probation: int = 2
+    q_low: float = 0.10
+    r_low: int = 2
+    max_llm_repair_steps: int = 5
+    prior_distribution: list[float] = field(default_factory=lambda: [0.12, 0.19, 0.29, 0.36])
+    prior_distribution_path: str | None = None
 
     def __post_init__(self) -> None:
-        if self.mode != "ownership_controller":
-            raise ValueError("controller.mode must be 'ownership_controller'")
+        if self.mode not in {"pdi_step_window_controller", "ownership_controller"}:
+            raise ValueError("controller.mode must be 'pdi_step_window_controller'")
         if self.initial_driver != "slm":
             raise ValueError("controller.initial_driver must be 'slm'")
+        if self.t_min < 1:
+            raise ValueError("controller.t_min must be >= 1")
+        if self.lambda0 < 0:
+            raise ValueError("controller.lambda0 must be >= 0")
+        if self.n_min < 1:
+            raise ValueError("controller.n_min must be >= 1")
+        for name in ("q_high", "q_low"):
+            value = getattr(self, name)
+            if not 0.0 < float(value) < 1.0:
+                raise ValueError(f"controller.{name} must be in (0, 1)")
+        if self.q_handoff is not None and not 0.0 < float(self.q_handoff) < 1.0:
+            raise ValueError("controller.q_handoff must be in (0, 1)")
+        if self.r_upper < 1:
+            raise ValueError("controller.r_upper must be >= 1")
+        if self.r_handoff < 1:
+            raise ValueError("controller.r_handoff must be >= 1")
+        if self.m_probation < 1:
+            raise ValueError("controller.m_probation must be >= 1")
+        if self.r_low < 1:
+            raise ValueError("controller.r_low must be >= 1")
+        if self.max_llm_repair_steps < 1:
+            raise ValueError("controller.max_llm_repair_steps must be >= 1")
 
 
 @dataclass
@@ -120,7 +148,7 @@ class RuntimeConfig:
 
 @dataclass
 class SARRConfig:
-    method: str = "sarr_code_v5_ownership_controller"
+    method: str = "pdi_step_window_controller_v0"
     metadata: dict[str, Any] = field(default_factory=dict)
     slm: ModelRuntimeConfig = field(default_factory=lambda: ModelRuntimeConfig(model_path=""))
     llm: ModelRuntimeConfig = field(default_factory=lambda: ModelRuntimeConfig(model_path="", backend="openai"))
@@ -163,8 +191,8 @@ class SARRConfig:
         cfg = cls(**kwargs)
         if cfg.slm.backend != "transformers":
             raise ValueError("SARR-CoDE requires slm.backend='transformers' for local logits.")
-        if cfg.llm.backend == "transformers":
-            raise ValueError("Use llm.backend='openai' or 'vllm'. SLM is the local transformers model.")
+        if cfg.llm.backend == "transformers" and not cfg.llm.model_path:
+            raise ValueError("llm.model_path is required when llm.backend='transformers'.")
         return cfg
 
     def to_dict(self) -> dict[str, Any]:

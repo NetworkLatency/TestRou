@@ -78,7 +78,7 @@ hybrid   = wait risk.handoff_probe_warmup_steps, then probe every interval
 
 `LLM_REPAIR_OWNERSHIP` is entered after a prefix-contamination rollback. The rollback interval is sealed, and `repair_horizon` is logged as the removed-step replacement target, but it no longer blocks SLM handoff probes.
 
-`HANDOFF_PROBE` generates an SLM probe step without committing it. The probe is accepted only when it looks closer to local stable memory or the LLM continuation than to failure memory or rejected probe memory, does not repeat sealed content, and does not immediately return to self-check/repetition. Failed probes are recorded as `probe_discarded` and do not affect the active prefix.
+`HANDOFF_PROBE` generates an SLM probe step without committing it. If the probe emits `</think>`, the controller treats that as an explicit SLM termination intent, commits the probe, and closes thinking. Otherwise, the probe is accepted only when it looks closer to local stable memory or the LLM continuation than to failure memory or rejected probe memory, does not repeat sealed content, and does not immediately return to self-check/repetition. Failed probes are recorded as `probe_discarded` and do not affect the active prefix.
 
 ## Online Regime Logic
 
@@ -93,7 +93,7 @@ rejected SLM handoff probes
 
 Distances are computed only against signals observed inside the same problem. A handoff probe is requested by the configured probe schedule, then accepted when the SLM continuation is closer to stable/LLM-continuation memory than to failure/rejected-probe memory. LLM step quality is logged with a recent-window diagnostic, but it no longer gates whether the SLM is allowed to try taking ownership back.
 
-`CLOSE_OR_FINALIZE` closes thinking and generates the final answer with `generation.final_answer_generator`, which defaults to `slm`. If no close marker appeared naturally, the controller appends a uniform `</think>` marker before the final-answer call.
+`CLOSE_OR_FINALIZE` closes thinking and generates the final answer with `generation.final_answer_generator`, which defaults to `slm`. If no close marker appeared naturally, the controller appends a uniform `</think>` marker before the final-answer call. The final-answer call stops at any newly generated `</think>` marker so post-answer text is not treated as part of the answer.
 
 ## Signals
 

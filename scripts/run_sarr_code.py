@@ -23,7 +23,7 @@ from sarr_code import SARRConfig, run_sarr_code
 
 
 MATH_DATASETS = {"math500", "aime24", "aime25"}
-DEFAULT_VARIANT = "sarr_code_v5_ownership_controller"
+DEFAULT_VARIANT = "pdi_step_window_controller_v0"
 
 
 def _summary_path(output_root: Path, dataset: str, variant: str) -> Path:
@@ -130,77 +130,52 @@ def _sarr_summary_from_trace(result) -> dict[str, Any]:
 def _problem_sarr_metrics(result, step_rows: list[dict[str, Any]], controller_rows: list[dict[str, Any]]) -> dict[str, Any]:
     summary = _sarr_summary_from_trace(result)
     active_steps = [row for row in step_rows if _truthy(row.get("active"))]
-    discarded_probes = [row for row in step_rows if row.get("status") == "probe_discarded"]
     active_slm_tokens = sum(int(_num(row.get("token_count"))) for row in active_steps if row.get("source") == "SLM")
     active_llm_tokens = sum(int(_num(row.get("token_count"))) for row in active_steps if row.get("source") == "LLM")
-    discarded_probe_tokens = sum(int(_num(row.get("token_count"))) for row in discarded_probes)
-    slm_discarded_probe_tokens = sum(
-        int(_num(row.get("token_count"))) for row in discarded_probes if row.get("source") == "SLM"
-    )
-    llm_discarded_probe_tokens = sum(
-        int(_num(row.get("token_count"))) for row in discarded_probes if row.get("source") == "LLM"
-    )
     if not summary:
         summary = {
             "driver_switch_count": sum(1 for row in controller_rows if row.get("event") == "driver_switch"),
-            "handoff_probe_count": len(discarded_probes),
-            "handoff_success_count": 0,
-            "handoff_failure_count": len(discarded_probes),
-            "handoff_probe_skipped_count": sum(1 for row in controller_rows if row.get("event") == "handoff_probe_skipped"),
-            "rollback_count": sum(1 for row in controller_rows if row.get("event") == "prefix_contamination_rollback"),
-            "sealed_interval_count": sum(1 for row in controller_rows if row.get("event") == "prefix_contamination_rollback"),
-            "probe_discarded_tokens": discarded_probe_tokens,
-            "slm_probe_discarded_tokens": slm_discarded_probe_tokens,
-            "llm_probe_discarded_tokens": llm_discarded_probe_tokens,
-            "probe_discarded_step_count": len(discarded_probes),
-            "slm_generated_thinking_tokens": active_slm_tokens + slm_discarded_probe_tokens,
-            "llm_generated_thinking_tokens": active_llm_tokens + llm_discarded_probe_tokens,
-            "total_generated_thinking_tokens": active_slm_tokens + active_llm_tokens + discarded_probe_tokens,
-            "lookahead_count": 0,
+            "rollback_count": sum(1 for row in controller_rows if row.get("event") == "rollback"),
+            "slm_thinking_tokens": active_slm_tokens,
+            "llm_thinking_tokens": active_llm_tokens,
+            "total_thinking_tokens": active_slm_tokens + active_llm_tokens,
         }
     return {
         "active_thinking_step_count": len(active_steps),
         "generated_thinking_attempt_count": len(step_rows),
-        "probe_discarded_count": len(discarded_probes),
-        "probe_discarded_tokens": int(_num(summary.get("probe_discarded_tokens") or discarded_probe_tokens)),
-        "slm_probe_discarded_tokens": int(_num(summary.get("slm_probe_discarded_tokens") or slm_discarded_probe_tokens)),
-        "llm_probe_discarded_tokens": int(_num(summary.get("llm_probe_discarded_tokens") or llm_discarded_probe_tokens)),
-        "probe_discarded_step_count": int(_num(summary.get("probe_discarded_step_count") or len(discarded_probes))),
-        "slm_generated_thinking_tokens": int(
-            _num(summary.get("slm_generated_thinking_tokens") or active_slm_tokens + slm_discarded_probe_tokens)
-        ),
-        "llm_generated_thinking_tokens": int(
-            _num(summary.get("llm_generated_thinking_tokens") or active_llm_tokens + llm_discarded_probe_tokens)
-        ),
+        "slm_generated_thinking_tokens": int(_num(summary.get("slm_thinking_tokens") or active_slm_tokens)),
+        "llm_generated_thinking_tokens": int(_num(summary.get("llm_thinking_tokens") or active_llm_tokens)),
         "total_generated_thinking_tokens": int(
-            _num(summary.get("total_generated_thinking_tokens") or active_slm_tokens + active_llm_tokens + discarded_probe_tokens)
+            _num(summary.get("total_thinking_tokens") or active_slm_tokens + active_llm_tokens)
         ),
-        "handoff_probe_strategy": summary.get("handoff_probe_strategy") or "",
-        "handoff_probe_interval": int(_num(summary.get("handoff_probe_interval"))),
-        "handoff_probe_warmup_steps": int(_num(summary.get("handoff_probe_warmup_steps"))),
+        "controller_mode": summary.get("controller_mode") or "pdi_step_window",
         "driver_switch_count": int(_num(summary.get("driver_switch_count"))),
         "llm_ownership_episodes": int(_num(summary.get("llm_ownership_episodes"))),
-        "llm_forward_episodes": int(_num(summary.get("llm_forward_episodes"))),
         "llm_repair_episodes": int(_num(summary.get("llm_repair_episodes"))),
-        "handoff_probe_count": int(_num(summary.get("handoff_probe_count"))),
-        "handoff_success_count": int(_num(summary.get("handoff_success_count"))),
-        "handoff_failure_count": int(_num(summary.get("handoff_failure_count"))),
-        "local_difficulty_count": int(_num(summary.get("local_difficulty_count"))),
-        "prefix_contamination_count": int(_num(summary.get("prefix_contamination_count"))),
-        "degenerative_loop_count": int(_num(summary.get("degenerative_loop_count"))),
         "rollback_count": int(_num(summary.get("rollback_count"))),
         "has_rollback": int(_num(summary.get("rollback_count"))) > 0,
-        "sealed_interval_count": int(_num(summary.get("sealed_interval_count"))),
-        "repeated_rollback_blocked_count": int(_num(summary.get("repeated_rollback_blocked_count"))),
-        "handoff_probe_skipped_count": int(_num(summary.get("handoff_probe_skipped_count"))),
+        "handoff_attempt_count": int(_num(summary.get("handoff_attempt_count"))),
+        "handoff_success_count": int(_num(summary.get("handoff_success_count"))),
+        "handoff_failure_count": int(_num(summary.get("handoff_failure_count"))),
+        "handoff_success_rate": float(_num(summary.get("handoff_success_rate"))),
+        "probation_failure_count": int(_num(summary.get("probation_failure_count"))),
+        "probation_failure_rate": float(_num(summary.get("probation_failure_rate"))),
+        "early_stop_trigger_count": int(_num(summary.get("early_stop_trigger_count"))),
+        "pdi_decision_count": int(_num(summary.get("pdi_decision_count"))),
+        "no_valid_pdi_window_count": int(_num(summary.get("no_valid_pdi_window_count"))),
+        "pdi_window_count": int(_num(summary.get("pdi_window_count"))),
+        "trusted_buffer_size": int(_num(summary.get("trusted_buffer_size"))),
+        "failure_buffer_size": int(_num(summary.get("failure_buffer_size"))),
+        "prior_size": int(_num(summary.get("prior_size"))),
+        "prior_weight": float(_num(summary.get("prior_weight"))),
+        "llm_participation_rate": float(_num(summary.get("llm_participation_rate"))),
+        "slm_scoring_overhead": float(_num(summary.get("slm_scoring_overhead"))),
+        "slm_scoring_count": int(_num(summary.get("slm_scoring_count"))),
         "slm_thinking_tokens": int(_num(summary.get("slm_thinking_tokens"))),
         "llm_thinking_tokens": int(_num(summary.get("llm_thinking_tokens"))),
         "total_thinking_tokens": int(_num(summary.get("total_thinking_tokens"))),
         "slm_step_count": int(_num(summary.get("slm_step_count"))),
         "llm_step_count": int(_num(summary.get("llm_step_count"))),
-        "confidence_forward_count": int(_num(summary.get("confidence_forward_count"))),
-        "handoff_probe_forward_count": int(_num(summary.get("handoff_probe_forward_count"))),
-        "lookahead_count": int(_num(summary.get("lookahead_count"))),
         "slm_prefill_count": int(_num(summary.get("slm_prefill_count"))),
         "llm_prefill_count": int(_num(summary.get("llm_prefill_count"))),
         "final_answer_generator": summary.get("final_answer_generator"),
@@ -220,38 +195,28 @@ def _extra_sarr_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "avg_driver_switch_count": avg("driver_switch_count"),
         "avg_llm_ownership_episodes": avg("llm_ownership_episodes"),
-        "avg_handoff_probe_count": avg("handoff_probe_count"),
+        "avg_handoff_attempt_count": avg("handoff_attempt_count"),
         "handoff_success_rate": (
-            total("handoff_success_count") / total("handoff_probe_count")
-            if total("handoff_probe_count")
+            total("handoff_success_count") / total("handoff_attempt_count")
+            if total("handoff_attempt_count")
             else 0.0
         ),
         "handoff_failure_rate": (
-            total("handoff_failure_count") / total("handoff_probe_count")
-            if total("handoff_probe_count")
+            total("handoff_failure_count") / total("handoff_attempt_count")
+            if total("handoff_attempt_count")
             else 0.0
         ),
-        "degenerative_loop_rate": (
-            sum(1 for row in rows if int(_num(row.get("degenerative_loop_count"))) > 0) / n
-            if n
-            else 0.0
-        ),
-        "prefix_contamination_rate": (
-            sum(1 for row in rows if int(_num(row.get("prefix_contamination_count"))) > 0) / n
-            if n
-            else 0.0
-        ),
+        "probation_failure_rate": avg("probation_failure_rate"),
+        "llm_participation_rate": avg("llm_participation_rate"),
         "rollback_rate": (sum(1 for row in rows if _truthy(row.get("has_rollback"))) / n) if n else 0.0,
         "total_rollback_count": total("rollback_count"),
-        "total_sealed_interval_count": total("sealed_interval_count"),
-        "total_repeated_rollback_blocked_count": total("repeated_rollback_blocked_count"),
-        "total_handoff_probe_skipped_count": total("handoff_probe_skipped_count"),
-        "total_probe_discarded_tokens": total("probe_discarded_tokens"),
-        "total_slm_probe_discarded_tokens": total("slm_probe_discarded_tokens"),
-        "total_llm_probe_discarded_tokens": total("llm_probe_discarded_tokens"),
-        "avg_probe_discarded_tokens": avg("probe_discarded_tokens"),
-        "avg_confidence_forward_count": avg("confidence_forward_count"),
-        "avg_lookahead_count": avg("lookahead_count"),
+        "total_early_stop_trigger_count": total("early_stop_trigger_count"),
+        "avg_pdi_decision_count": avg("pdi_decision_count"),
+        "avg_no_valid_pdi_window_count": avg("no_valid_pdi_window_count"),
+        "total_no_valid_pdi_window_count": total("no_valid_pdi_window_count"),
+        "avg_pdi_window_count": avg("pdi_window_count"),
+        "total_slm_scoring_count": total("slm_scoring_count"),
+        "avg_slm_scoring_overhead": avg("slm_scoring_overhead"),
     }
 
 
@@ -298,10 +263,11 @@ def run_experiment(args: argparse.Namespace, cfg: SARRConfig) -> None:
 
     _validate_ownership_config(cfg)
     print(
-        "[sarr] controller=ownership "
-        f"handoff_probe_strategy={cfg.risk.handoff_probe_strategy} "
-        f"interval={cfg.risk.handoff_probe_interval} "
-        f"warmup={cfg.risk.handoff_probe_warmup_steps} "
+        "[sarr] controller=pdi_step_window "
+        f"t_min={cfg.controller.t_min} "
+        f"q_high={cfg.controller.q_high} "
+        f"eta_upper={cfg.controller.eta_upper} "
+        f"q_handoff={cfg.controller.q_handoff or cfg.controller.q_high} "
         f"final_answer_generator={cfg.generation.final_answer_generator}",
         flush=True,
     )
