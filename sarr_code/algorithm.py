@@ -16,6 +16,8 @@ from .controller import (
     MODE_LLM_REPAIR,
     MODE_SLM_NORMAL,
     MODE_SLM_PROBATION,
+    MODE_SLM_REENTRY,
+    MODE_SLM_TRANSITION,
     OWNER_LLM,
     OWNER_SLM,
     PDIController,
@@ -63,6 +65,13 @@ def _stop_strings_for_llm(cfg: SARRConfig) -> list[str]:
         if stop and stop not in stops:
             stops.append(stop)
     return stops
+
+
+def _llm_repair_problem_text(problem_text: str, cfg: SARRConfig) -> str:
+    instruction = (cfg.generation.llm_repair_instruction or "").strip()
+    if not instruction:
+        return problem_text
+    return f"{problem_text}\n\nLLM repair instruction:\n{instruction}"
 
 
 def _strict_thinking_stop_reason(generation: StepOutput, step_text: str) -> str | None:
@@ -119,7 +128,7 @@ def _generate_llm_step(
 ) -> StepOutput:
     max_new_tokens = max(1, remaining_think_tokens)
     output = llm.generate_step(
-        state.problem_text,
+        _llm_repair_problem_text(state.problem_text, cfg),
         state.assistant_prefix_text,
         max_new_tokens=max_new_tokens,
         stop_delimiters=_stop_strings_for_llm(cfg),
@@ -340,6 +349,35 @@ def run_sarr_code(
                     break
                 continue
 
+            if mode == MODE_SLM_TRANSITION:
+                output = _generate_slm_step(slm, state, cfg, remaining_think_tokens=remaining)
+                step = controller.append_step(output, owner=OWNER_SLM, action="SLM_TRANSITION_CONTINUE", attempt_id=attempt_id)
+                attempt_id += 1
+                _sync_prefix(state, controller)
+
+                thinking_stop = _strict_thinking_stop_reason(output, output.text)
+                if thinking_stop is not None:
+                    controller.mark_finished(step, reason=thinking_stop)
+                    stop_reason = thinking_stop
+                    break
+
+                if _answer_intent_terminal_peek(
+                    state=state,
+                    cfg=cfg,
+                    controller=controller,
+                    step=step,
+                    engine=slm,
+                    account="slm",
+                ):
+                    stop_reason = "finished"
+                    break
+
+                decision = controller.process_transition_window(step)
+                if step.active:
+                    step.action = decision.action
+                _sync_prefix(state, controller)
+                continue
+
             if mode == MODE_LLM_REPAIR:
                 output = _generate_llm_step(llm, state, cfg, remaining_think_tokens=remaining)
                 step = controller.append_step(output, owner=OWNER_LLM, action="LLM_REPAIR_CONTINUE", attempt_id=attempt_id)
@@ -363,24 +401,32 @@ def run_sarr_code(
                     stop_reason = "finished"
                     break
 
-                handoff_payload = controller.repair_suffix_for_handoff()
+                handoff_payload = controller.repair_step_for_handoff(step)
                 if handoff_payload is not None:
                     prefix_text, suffix_text, _suffix_steps = handoff_payload
                     score = slm.score_suffix_pdi(state.problem_text, prefix_text, suffix_text)
                     slm_scoring_wall_time += float(score.get("wall_time") or 0.0)
                     slm_scoring_count += 1
                     step.extra["slm_side_handoff_score"] = {
+                        "strategy": "latest_llm_step_only",
                         "pdi": score["pdi"],
                         "token_count": score["token_count"],
+                        "logprobs": score.get("logprobs", []),
+                        "token_ids": score.get("token_ids", []),
+                        "tokens": score.get("tokens", []),
+                        "token_offsets": score.get("token_offsets", []),
                         "prompt_tokens": score["prompt_tokens"],
                         "wall_time": score["wall_time"],
+                        "covered_step_ids": [suffix_step.step_id for suffix_step in _suffix_steps],
                     }
                     if int(score.get("token_count") or 0) > 0 and math_is_finite(score.get("pdi")):
                         decision = controller.process_handoff_score(step=step, slm_side_pdi=float(score["pdi"]))
                         step.action = decision.action
-                        if controller.state.mode == MODE_SLM_PROBATION:
+                        if controller.state.mode == MODE_SLM_REENTRY:
                             _sync_prefix(state, controller)
                             continue
+                    else:
+                        controller.reset_handoff_candidate_buffer(step=step, reason="invalid_slm_side_score")
 
                 decision = controller.note_llm_repair_step(step)
                 step.action = decision.action
@@ -389,9 +435,9 @@ def run_sarr_code(
                     break
                 continue
 
-            if mode == MODE_SLM_PROBATION:
+            if mode in {MODE_SLM_REENTRY, MODE_SLM_PROBATION}:
                 output = _generate_slm_step(slm, state, cfg, remaining_think_tokens=remaining)
-                step = controller.append_step(output, owner=OWNER_SLM, action="SLM_PROBATION_CONTINUE", attempt_id=attempt_id)
+                step = controller.append_step(output, owner=OWNER_SLM, action="SLM_REENTRY_CONTINUE", attempt_id=attempt_id)
                 attempt_id += 1
                 _sync_prefix(state, controller)
 
@@ -412,7 +458,7 @@ def run_sarr_code(
                     stop_reason = "finished"
                     break
 
-                decision = controller.process_probation_window(step)
+                decision = controller.process_reentry_window(step)
                 if step.active:
                     step.action = decision.action
                 _sync_prefix(state, controller)

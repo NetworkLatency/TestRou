@@ -6,6 +6,15 @@ from pathlib import Path
 from typing import Any
 
 
+_DEPRECATED_CONTROLLER_KEYS = {
+    "lambda0_cross",
+    "q_handoff",
+    "q_handoff_cross",
+    "cross_prior_distribution",
+    "cross_prior_distribution_path",
+}
+
+
 @dataclass
 class ModelRuntimeConfig:
     model_path: str
@@ -33,6 +42,12 @@ class GenerationConfig:
     step_delimiters: list[str] = field(default_factory=lambda: ["\n\n"])
     final_answer_generator: str = "slm"
     force_close_think_text: str = "\n</think>\n\n"
+    llm_repair_instruction: str = (
+        "Repair the existing reasoning locally and produce a concise continuation "
+        "that a smaller model can continue from. Do not restart the solution. "
+        "Do not perform long self-reflection. End after one or two constructive "
+        "mathematical steps."
+    )
 
     def __post_init__(self) -> None:
         if self.think_token_budget < 1:
@@ -49,18 +64,24 @@ class ControllerConfig:
     initial_driver: str = "slm"
     t_min: int = 32
     lambda0: float = 3.0
+    lambda0_self: float | None = None
     n_min: int = 3
     q_high: float = 0.90
+    q_recover: float = 0.75
+    transition_grace_windows: int = 2
     r_upper: int = 2
     eta_upper: float = 0.50
-    q_handoff: float | None = None
     r_handoff: int = 1
     m_probation: int = 2
+    m_reentry: int = 3
+    reentry_transition_grace: int = 2
     q_low: float = 0.10
     r_low: int = 2
     max_llm_repair_steps: int = 5
     prior_distribution: list[float] = field(default_factory=lambda: [0.12, 0.19, 0.29, 0.36])
     prior_distribution_path: str | None = None
+    self_prior_distribution: list[float] | None = None
+    self_prior_distribution_path: str | None = None
 
     def __post_init__(self) -> None:
         if self.mode not in {"pdi_step_window_controller", "ownership_controller"}:
@@ -71,20 +92,28 @@ class ControllerConfig:
             raise ValueError("controller.t_min must be >= 1")
         if self.lambda0 < 0:
             raise ValueError("controller.lambda0 must be >= 0")
+        if self.lambda0_self is not None and self.lambda0_self < 0:
+            raise ValueError("controller.lambda0_self must be >= 0")
         if self.n_min < 1:
             raise ValueError("controller.n_min must be >= 1")
-        for name in ("q_high", "q_low"):
+        for name in ("q_high", "q_recover", "q_low"):
             value = getattr(self, name)
             if not 0.0 < float(value) < 1.0:
                 raise ValueError(f"controller.{name} must be in (0, 1)")
-        if self.q_handoff is not None and not 0.0 < float(self.q_handoff) < 1.0:
-            raise ValueError("controller.q_handoff must be in (0, 1)")
+        if self.q_recover >= self.q_high:
+            raise ValueError("controller.q_recover must be lower than controller.q_high")
+        if self.transition_grace_windows < 1:
+            raise ValueError("controller.transition_grace_windows must be >= 1")
         if self.r_upper < 1:
             raise ValueError("controller.r_upper must be >= 1")
         if self.r_handoff < 1:
             raise ValueError("controller.r_handoff must be >= 1")
         if self.m_probation < 1:
             raise ValueError("controller.m_probation must be >= 1")
+        if self.m_reentry < 1:
+            raise ValueError("controller.m_reentry must be >= 1")
+        if self.reentry_transition_grace < 1:
+            raise ValueError("controller.reentry_transition_grace must be >= 1")
         if self.r_low < 1:
             raise ValueError("controller.r_low must be >= 1")
         if self.max_llm_repair_steps < 1:
@@ -187,6 +216,12 @@ class SARRConfig:
             ("runtime", RuntimeConfig),
         ]:
             if isinstance(kwargs.get(key), dict):
+                if key == "controller":
+                    kwargs[key] = {
+                        item_key: item_value
+                        for item_key, item_value in kwargs[key].items()
+                        if item_key not in _DEPRECATED_CONTROLLER_KEYS
+                    }
                 kwargs[key] = cls_(**kwargs[key])
         cfg = cls(**kwargs)
         if cfg.slm.backend != "transformers":

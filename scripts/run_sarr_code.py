@@ -160,6 +160,8 @@ def _problem_sarr_metrics(result, step_rows: list[dict[str, Any]], controller_ro
         "handoff_success_rate": float(_num(summary.get("handoff_success_rate"))),
         "probation_failure_count": int(_num(summary.get("probation_failure_count"))),
         "probation_failure_rate": float(_num(summary.get("probation_failure_rate"))),
+        "reentry_failure_count": int(_num(summary.get("reentry_failure_count"))),
+        "reentry_failure_rate": float(_num(summary.get("reentry_failure_rate"))),
         "early_stop_trigger_count": int(_num(summary.get("early_stop_trigger_count"))),
         "pdi_decision_count": int(_num(summary.get("pdi_decision_count"))),
         "no_valid_pdi_window_count": int(_num(summary.get("no_valid_pdi_window_count"))),
@@ -266,8 +268,8 @@ def run_experiment(args: argparse.Namespace, cfg: SARRConfig) -> None:
         "[sarr] controller=pdi_step_window "
         f"t_min={cfg.controller.t_min} "
         f"q_high={cfg.controller.q_high} "
-        f"eta_upper={cfg.controller.eta_upper} "
-        f"q_handoff={cfg.controller.q_handoff or cfg.controller.q_high} "
+        f"q_recover={cfg.controller.q_recover} "
+        "handoff=repair_landing_index "
         f"final_answer_generator={cfg.generation.final_answer_generator}",
         flush=True,
     )

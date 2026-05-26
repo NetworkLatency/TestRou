@@ -17,8 +17,10 @@ OWNER_LLM = "LLM"
 
 MODE_COLD_START = "COLD_START"
 MODE_SLM_NORMAL = "SLM_NORMAL"
+MODE_SLM_TRANSITION = "SLM_TRANSITION"
 MODE_LLM_REPAIR = "LLM_REPAIR"
 MODE_SLM_PROBATION = "SLM_PROBATION"
+MODE_SLM_REENTRY = "SLM_REENTRY"
 MODE_FINALIZE = "FINALIZE"
 MODE_LLM_FINALIZE = "LLM_FINALIZE"
 
@@ -30,6 +32,11 @@ WINDOW_INVALID = "invalid"
 STEP_ACTIVE = "active"
 STEP_REMOVED = "removed"
 STEP_FINAL_ANSWER = "final_answer"
+
+REPAIR_LANDING_ANCHOR_Q = 0.95
+REPAIR_LANDING_HIGH_Q = 0.75
+REPAIR_LANDING_RLI_THRESHOLD = 0.60
+REPAIR_LANDING_EPS = 1e-8
 
 
 _ANSWER_INTENT_PATTERNS = [
@@ -129,8 +136,17 @@ class EpisodeState:
     upper_evidence_history: list[UpperEvidencePoint] = field(default_factory=list)
     lower_tail_history: list[bool] = field(default_factory=list)
     handoff_history: list[float] = field(default_factory=list)
+    handoff_candidate_step_ids: list[int] = field(default_factory=list)
+    handoff_candidate_scores: list[float] = field(default_factory=list)
+    repair_slm_side_scores: list[float] = field(default_factory=list)
+    repair_slm_side_step_ids: list[int] = field(default_factory=list)
     handoff_point_token_idx: int | None = None
     probation_stable_count: int = 0
+    transition_start_window: PDIWindow | None = None
+    transition_windows: list[PDIWindow] = field(default_factory=list)
+    reentry_cached_windows: list[PDIWindow] = field(default_factory=list)
+    reentry_stable_count: int = 0
+    reentry_transition_windows: list[PDIWindow] = field(default_factory=list)
 
 
 @dataclass
@@ -143,6 +159,7 @@ class ControllerDecision:
     upper_evidence: float | None = None
     rollback_start_token_idx: int | None = None
     handoff_q_slm_side: float | None = None
+    repair_landing_index: float | None = None
     probation_status: str | None = None
 
 
@@ -154,6 +171,12 @@ class EmpiricalCDF:
         if not self.values:
             return 0.5
         return bisect_right(self.values, float(value)) / len(self.values)
+
+    def smoothed(self, value: float) -> float:
+        if not self.values:
+            return 0.5
+        count = bisect_right(self.values, float(value))
+        return (count + 0.5) / (len(self.values) + 1.0)
 
     def to_list(self) -> list[float]:
         return list(self.values)
@@ -183,12 +206,20 @@ class EffectiveCDF:
         trusted_part = self.n_trusted * self.trusted(value) if self.n_trusted else 0.0
         return float((prior_part + trusted_part) / denom)
 
+    def smoothed(self, value: float) -> float:
+        denom = self.denominator
+        if denom <= 0:
+            return 0.5
+        prior_part = self.lambda0 * self.prior.smoothed(value)
+        trusted_part = self.n_trusted * self.trusted.smoothed(value) if self.n_trusted else 0.0
+        return float((prior_part + trusted_part) / denom)
 
-def load_prior_distribution(cfg: ControllerConfig) -> list[float]:
-    if cfg.prior_distribution_path:
-        path = Path(cfg.prior_distribution_path)
+
+def _load_distribution_from_config(*, path_value: str | None, inline_values: list[Any] | None, label: str) -> list[float]:
+    if path_value:
+        path = Path(path_value)
         if not path.exists():
-            raise FileNotFoundError(f"controller.prior_distribution_path not found: {path}")
+            raise FileNotFoundError(f"controller.{label} not found: {path}")
         text = path.read_text(encoding="utf-8")
         if path.suffix.lower() == ".json":
             import json
@@ -203,7 +234,17 @@ def load_prior_distribution(cfg: ControllerConfig) -> list[float]:
                 if piece:
                     values.append(float(piece))
         return _clean_floats(values)
-    return _clean_floats(list(cfg.prior_distribution))
+    return _clean_floats(list(inline_values or []))
+
+
+def load_self_prior_distribution(cfg: ControllerConfig) -> list[float]:
+    path_value = cfg.self_prior_distribution_path or cfg.prior_distribution_path
+    inline_values = cfg.self_prior_distribution if cfg.self_prior_distribution is not None else cfg.prior_distribution
+    return _load_distribution_from_config(
+        path_value=path_value,
+        inline_values=inline_values,
+        label="self_prior_distribution_path",
+    )
 
 
 def _clean_floats(values: list[Any]) -> list[float]:
@@ -216,6 +257,21 @@ def _clean_floats(values: list[Any]) -> list[float]:
         if math.isfinite(parsed):
             cleaned.append(parsed)
     return cleaned
+
+
+def _quantile(values: list[float], q: float) -> float | None:
+    cleaned = sorted(float(value) for value in values if math.isfinite(float(value)))
+    if not cleaned:
+        return None
+    if len(cleaned) == 1:
+        return cleaned[0]
+    position = min(max(float(q), 0.0), 1.0) * (len(cleaned) - 1)
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return cleaned[lower]
+    weight = position - lower
+    return cleaned[lower] * (1.0 - weight) + cleaned[upper] * weight
 
 
 def _step_logprobs(output: StepOutput) -> list[float]:
@@ -239,8 +295,8 @@ class PDIController:
     def __init__(self, problem_id: str, cfg: ControllerConfig) -> None:
         self.problem_id = problem_id
         self.cfg = cfg
-        self.prior_distribution = load_prior_distribution(cfg)
-        self.lambda0 = float(cfg.lambda0)
+        self.self_prior_distribution = load_self_prior_distribution(cfg)
+        self.lambda0_self = float(cfg.lambda0_self if cfg.lambda0_self is not None else cfg.lambda0)
         self.state = EpisodeState()
         self.steps: list[Step] = []
         self.windows: list[PDIWindow] = []
@@ -260,15 +316,12 @@ class PDIController:
         self.handoff_success_count = 0
         self.handoff_failure_count = 0
         self.probation_failure_count = 0
+        self.reentry_failure_count = 0
         self.early_stop_trigger_count = 0
         self.pdi_decision_count = 0
         self.no_valid_pdi_window_count = 0
         self.no_valid_pdi_window_reasons: dict[str, int] = {}
         self.answer_intent_seen = False
-
-    @property
-    def q_handoff(self) -> float:
-        return self.cfg.q_handoff if self.cfg.q_handoff is not None else self.cfg.q_high
 
     @property
     def next_step_id(self) -> int:
@@ -277,7 +330,7 @@ class PDIController:
     def validate_state(self) -> None:
         mode = self.state.mode
         owner = self.state.owner
-        if mode in {MODE_COLD_START, MODE_SLM_NORMAL, MODE_SLM_PROBATION} and owner != OWNER_SLM:
+        if mode in {MODE_COLD_START, MODE_SLM_NORMAL, MODE_SLM_TRANSITION, MODE_SLM_REENTRY, MODE_SLM_PROBATION} and owner != OWNER_SLM:
             raise InvalidControllerState(f"Invalid owner/mode pair: owner={owner}, mode={mode}")
         if mode in {MODE_LLM_REPAIR, MODE_LLM_FINALIZE} and owner != OWNER_LLM:
             raise InvalidControllerState(f"Invalid owner/mode pair: owner={owner}, mode={mode}")
@@ -427,16 +480,16 @@ class PDIController:
     def effective_cdf(self, trusted_buffer: list[PDIWindow] | None = None) -> EffectiveCDF:
         windows = self.state.trusted_buffer if trusted_buffer is None else trusted_buffer
         return EffectiveCDF(
-            prior=self.prior_distribution,
+            prior=self.self_prior_distribution,
             trusted=[window.pdi for window in windows if window.status == WINDOW_TRUSTED],
-            lambda0=self.lambda0,
+            lambda0=self.lambda0_self,
         )
 
     def effective_cdf_from_values(self, trusted_values: list[float]) -> EffectiveCDF:
         return EffectiveCDF(
-            prior=self.prior_distribution,
+            prior=self.self_prior_distribution,
             trusted=list(trusted_values),
-            lambda0=self.lambda0,
+            lambda0=self.lambda0_self,
         )
 
     def percentile_rank(self, value: float, cdf: EffectiveCDF) -> float:
@@ -472,6 +525,47 @@ class PDIController:
         positives = [point.window for point in self.state.upper_evidence_history if point.upper_excess > 0]
         return positives[0] if positives else None
 
+    def _annotate_window(self, window: PDIWindow, q_percentile: float) -> float:
+        upper_excess = self.upper_excess(q_percentile)
+        window.q_percentile = q_percentile
+        window.upper_excess = upper_excess
+        window.upper_evidence = None
+        return upper_excess
+
+    def _mode_after_trusted_update(self) -> str:
+        if len(self.state.trusted_buffer) >= self.cfg.n_min:
+            return MODE_SLM_NORMAL
+        return MODE_COLD_START
+
+    def _add_trusted_window(self, window: PDIWindow) -> None:
+        window.status = WINDOW_TRUSTED
+        if window not in self.state.trusted_buffer:
+            self.state.trusted_buffer.append(window)
+
+    def _clear_transition_watch(self) -> None:
+        self.state.transition_start_window = None
+        self.state.transition_windows = []
+
+    def _clear_reentry_watch(self) -> None:
+        self.state.reentry_transition_windows = []
+
+    def _overlaps_any_window(self, window: PDIWindow, others: list[PDIWindow]) -> bool:
+        return any(window.overlaps(other.start_token_idx, other.end_token_idx) for other in others)
+
+    def _enter_transition_watch(self, window: PDIWindow, *, step_id: int) -> None:
+        window.status = WINDOW_SUSPECT
+        self.state.pre_suspect_snapshot = [w.pdi for w in self.state.trusted_buffer]
+        self.state.lower_tail_history = []
+        self.state.transition_start_window = window
+        self.state.transition_windows = [window]
+        self._switch(MODE_SLM_TRANSITION, OWNER_SLM, step_id=step_id, reason="slm_upper_tail_transition")
+
+    def _transition_failed(self) -> bool:
+        windows = self.state.transition_windows
+        if len(windows) < self.cfg.transition_grace_windows:
+            return False
+        return all((window.q_percentile or 0.0) > self.cfg.q_recover for window in windows)
+
     def process_slm_window(self, step: Step) -> ControllerDecision:
         mode_at_decision = self.state.mode
         window = self.build_step_window()
@@ -481,43 +575,27 @@ class PDIController:
 
         cdf = self.effective_cdf()
         q_percentile = self.percentile_rank(window.pdi, cdf)
-        upper_excess, upper_evidence = self.update_upper_evidence(window, q_percentile)
+        upper_excess = self._annotate_window(window, q_percentile)
         self.pdi_decision_count += 1
 
-        if upper_excess == 0:
-            window.status = WINDOW_TRUSTED
-            self.state.trusted_buffer.append(window)
-            action = "TRUST_PDI_WINDOW"
-        else:
-            window.status = WINDOW_SUSPECT
-            action = "SUSPECT_UPPER_TAIL"
-
-        if self.state.mode == MODE_COLD_START and len(self.state.trusted_buffer) >= self.cfg.n_min:
-            self._switch(MODE_SLM_NORMAL, OWNER_SLM, step_id=step.step_id, reason="trusted_buffer_reached_n_min")
-
-        if upper_evidence > self.cfg.eta_upper:
-            alarm = self.alarm_start_window()
-            if alarm is None:
-                raise InvalidControllerState("Upper-tail alarm fired without a positive evidence window.")
-            rollback_start = alarm.start_token_idx
-            self._log_pdi_decision(
-                step=step,
-                window=window,
-                mode=mode_at_decision,
-                action="ROLLBACK_TO_LLM_REPAIR",
-                cdf=cdf,
-                rollback_start_token_idx=rollback_start,
-            )
-            self.rollback_to_window(alarm)
+        if q_percentile > self.cfg.q_high:
+            self._enter_transition_watch(window, step_id=step.step_id)
+            action = "ENTER_SLM_TRANSITION"
+            self._log_pdi_decision(step=step, window=window, mode=mode_at_decision, action=action, cdf=cdf)
             return ControllerDecision(
-                action="ROLLBACK_TO_LLM_REPAIR",
+                action=action,
                 step=step,
                 window=window,
                 q_percentile=q_percentile,
                 upper_excess=upper_excess,
-                upper_evidence=upper_evidence,
-                rollback_start_token_idx=rollback_start,
             )
+
+        self._add_trusted_window(window)
+        action = "TRUST_PDI_WINDOW"
+
+        next_mode = self._mode_after_trusted_update()
+        if self.state.mode != next_mode:
+            self._switch(next_mode, OWNER_SLM, step_id=step.step_id, reason="trusted_buffer_update")
 
         early_stop = False
         if self.state.mode != MODE_COLD_START:
@@ -543,10 +621,9 @@ class PDIController:
             window=window,
             q_percentile=q_percentile,
             upper_excess=upper_excess,
-            upper_evidence=upper_evidence,
         )
 
-    def process_probation_window(self, step: Step) -> ControllerDecision:
+    def process_transition_window(self, step: Step) -> ControllerDecision:
         mode_at_decision = self.state.mode
         window = self.build_step_window()
         if window is None:
@@ -555,56 +632,146 @@ class PDIController:
 
         cdf = self.effective_cdf()
         q_percentile = self.percentile_rank(window.pdi, cdf)
-        upper_excess, upper_evidence = self.update_upper_evidence(window, q_percentile)
+        upper_excess = self._annotate_window(window, q_percentile)
         self.pdi_decision_count += 1
         window.status = WINDOW_SUSPECT
+        self.state.transition_windows.append(window)
 
-        if upper_evidence > self.cfg.eta_upper:
-            self.probation_failure_count += 1
-            rollback_start = self.state.handoff_point_token_idx
-            self._log_pdi_decision(
-                step=step,
-                window=window,
-                mode=mode_at_decision,
-                action="PROBATION_FAILED_ROLLBACK_TO_LLM_REPAIR",
-                cdf=cdf,
-                rollback_start_token_idx=rollback_start,
-                probation_status="failed",
-            )
-            if rollback_start is None:
-                raise InvalidControllerState("Probation failed without a handoff point.")
-            self.rollback_to_token(rollback_start, reason="probation_upper_tail_failure")
-            self.handoff_failure_count += 1
+        if q_percentile <= self.cfg.q_recover:
+            transition_windows = list(self.state.transition_windows)
+            if not self._overlaps_any_window(window, transition_windows[:-1]):
+                self._add_trusted_window(window)
+            self._clear_transition_watch()
+            next_mode = self._mode_after_trusted_update()
+            self._switch(next_mode, OWNER_SLM, step_id=step.step_id, reason="slm_transition_recovered")
+            action = "SLM_TRANSITION_RECOVERED"
+            self._log_pdi_decision(step=step, window=window, mode=mode_at_decision, action=action, cdf=cdf)
             return ControllerDecision(
-                action="PROBATION_FAILED_ROLLBACK_TO_LLM_REPAIR",
+                action=action,
                 step=step,
                 window=window,
                 q_percentile=q_percentile,
                 upper_excess=upper_excess,
-                upper_evidence=upper_evidence,
-                rollback_start_token_idx=rollback_start,
-                probation_status="failed",
             )
 
-        if upper_excess == 0:
-            self.state.probation_stable_count += 1
-            self._probation_windows.append(window)
-            probation_status = "stable"
-        else:
-            self.state.probation_stable_count = 0
-            self._probation_windows = []
-            probation_status = "suspect"
+        if self._transition_failed():
+            alarm = self.state.transition_start_window
+            if alarm is None:
+                raise InvalidControllerState("SLM transition failed without a transition start window.")
+            rollback_start = alarm.start_token_idx
+            action = "SLM_TRANSITION_FAILED_ROLLBACK_TO_LLM_REPAIR"
+            self._log_pdi_decision(
+                step=step,
+                window=window,
+                mode=mode_at_decision,
+                action=action,
+                cdf=cdf,
+                rollback_start_token_idx=rollback_start,
+            )
+            self.rollback_to_token(rollback_start, reason="slm_transition_failed")
+            return ControllerDecision(
+                action=action,
+                step=step,
+                window=window,
+                q_percentile=q_percentile,
+                upper_excess=upper_excess,
+                rollback_start_token_idx=rollback_start,
+            )
 
-        action = "SLM_PROBATION_CONTINUE"
-        if self.state.probation_stable_count >= self.cfg.m_probation:
-            for probation_window in self._probation_windows:
-                probation_window.status = WINDOW_TRUSTED
-                if probation_window not in self.state.trusted_buffer:
-                    self.state.trusted_buffer.append(probation_window)
-            self._probation_windows = []
+        action = "SLM_TRANSITION_CONTINUE"
+        self._log_pdi_decision(step=step, window=window, mode=mode_at_decision, action=action, cdf=cdf)
+        return ControllerDecision(
+            action=action,
+            step=step,
+            window=window,
+            q_percentile=q_percentile,
+            upper_excess=upper_excess,
+        )
+
+    def process_reentry_window(self, step: Step) -> ControllerDecision:
+        mode_at_decision = self.state.mode
+        window = self.build_step_window()
+        if window is None:
+            self._log_no_valid_pdi_window(step=step, mode=mode_at_decision)
+            return ControllerDecision(action="NO_VALID_PDI_WINDOW", step=step)
+
+        cdf = self.effective_cdf()
+        q_percentile = self.percentile_rank(window.pdi, cdf)
+        upper_excess = self._annotate_window(window, q_percentile)
+        self.pdi_decision_count += 1
+        window.status = WINDOW_SUSPECT
+
+        if q_percentile > self.cfg.q_high:
+            if not self.state.reentry_transition_windows:
+                self.state.reentry_cached_windows = []
+                self.state.reentry_stable_count = 0
+            self.state.reentry_transition_windows.append(window)
+            action = "SLM_REENTRY_TRANSITION_CONTINUE"
+            if len(self.state.reentry_transition_windows) >= self.cfg.reentry_transition_grace:
+                self.reentry_failure_count += 1
+                self.probation_failure_count += 1
+                rollback_start = self.state.handoff_point_token_idx
+                action = "SLM_REENTRY_FAILED_ROLLBACK_TO_LLM_REPAIR"
+                self._log_pdi_decision(
+                    step=step,
+                    window=window,
+                    mode=mode_at_decision,
+                    action=action,
+                    cdf=cdf,
+                    rollback_start_token_idx=rollback_start,
+                    probation_status="failed",
+                )
+                if rollback_start is None:
+                    raise InvalidControllerState("SLM re-entry failed without a handoff point.")
+                self.rollback_to_token(rollback_start, reason="reentry_transition_failure")
+                self.handoff_failure_count += 1
+                return ControllerDecision(
+                    action=action,
+                    step=step,
+                    window=window,
+                    q_percentile=q_percentile,
+                    upper_excess=upper_excess,
+                    rollback_start_token_idx=rollback_start,
+                    probation_status="failed",
+                )
+
+            self._log_pdi_decision(
+                step=step,
+                window=window,
+                mode=mode_at_decision,
+                action=action,
+                cdf=cdf,
+                probation_status="transition",
+            )
+            return ControllerDecision(
+                action=action,
+                step=step,
+                window=window,
+                q_percentile=q_percentile,
+                upper_excess=upper_excess,
+                probation_status="transition",
+            )
+
+        transition_windows = list(self.state.reentry_transition_windows)
+        self._clear_reentry_watch()
+        if self._overlaps_any_window(window, transition_windows):
+            action = "SLM_REENTRY_RECOVERED"
+            probation_status = "recovered"
+        else:
+            self.state.reentry_cached_windows.append(window)
+            self.state.reentry_stable_count += 1
+            action = "SLM_REENTRY_CONTINUE"
+            probation_status = "stable"
+
+        if self.state.reentry_stable_count >= self.cfg.m_reentry:
+            for reentry_window in self.state.reentry_cached_windows:
+                self._add_trusted_window(reentry_window)
+            self.state.reentry_cached_windows = []
+            self.state.reentry_stable_count = 0
+            self._clear_reentry_watch()
             self._reset_evidence_histories()
-            self._switch(MODE_SLM_NORMAL, OWNER_SLM, step_id=step.step_id, reason="probation_passed")
-            action = "SLM_PROBATION_PASSED"
+            self._switch(MODE_SLM_NORMAL, OWNER_SLM, step_id=step.step_id, reason="slm_reentry_stable")
+            action = "SLM_REENTRY_STABLE"
             probation_status = "passed"
 
         self._log_pdi_decision(
@@ -621,56 +788,104 @@ class PDIController:
             window=window,
             q_percentile=q_percentile,
             upper_excess=upper_excess,
-            upper_evidence=upper_evidence,
             probation_status=probation_status,
         )
 
-    def repair_suffix_for_handoff(self) -> tuple[str, str, list[Step]] | None:
-        repair_steps = [
-            step
-            for step in self.active_steps()
-            if step.owner == OWNER_LLM and step.episode_id == self._episode_id
-        ]
-        if not repair_steps:
+    def process_probation_window(self, step: Step) -> ControllerDecision:
+        return self.process_reentry_window(step)
+
+    def repair_step_for_handoff(self, step: Step) -> tuple[str, str, list[Step]] | None:
+        if not step.active or step.owner != OWNER_LLM or step.episode_id != self._episode_id:
             return None
-        suffix: list[Step] = []
-        token_count = 0
-        for step in reversed(repair_steps):
-            suffix.append(step)
-            token_count += max(1, step.token_count)
-            if token_count >= self.cfg.t_min:
-                break
-        if token_count < self.cfg.t_min:
-            return None
-        suffix.reverse()
-        first_step_id = suffix[0].step_id
-        prefix_text = "".join(step.text for step in self.active_steps() if step.step_id < first_step_id)
-        suffix_text = "".join(step.text for step in suffix)
-        return prefix_text, suffix_text, suffix
+        prefix_text = "".join(active.text for active in self.active_steps() if active.step_id < step.step_id)
+        return prefix_text, step.text, [step]
+
+    def _repair_landing_anchor(self, reference_values: list[float], prior_values: list[float]) -> float | None:
+        values = reference_values if reference_values else prior_values
+        return _quantile(values, REPAIR_LANDING_ANCHOR_Q)
+
+    def _repair_high_reference(self, previous_scores: list[float]) -> float | None:
+        return _quantile(previous_scores, REPAIR_LANDING_HIGH_Q)
 
     def process_handoff_score(self, *, step: Step, slm_side_pdi: float) -> ControllerDecision:
         self.handoff_attempt_count += 1
-        cdf = self.effective_cdf_from_values(self.state.pre_suspect_snapshot)
-        q_slm_side = self.percentile_rank(slm_side_pdi, cdf)
-        self.state.handoff_history.append(q_slm_side)
-        self.state.handoff_history = self.state.handoff_history[-self.cfg.r_handoff :]
-        ready = (
-            len(self.state.handoff_history) >= self.cfg.r_handoff
-            and all(q <= self.q_handoff for q in self.state.handoff_history[-self.cfg.r_handoff :])
+        old_cdf = self.effective_cdf_from_values(self.state.pre_suspect_snapshot)
+        q_slm_side = self.percentile_rank(slm_side_pdi, old_cdf)
+        q_slm_side_smoothed = old_cdf.smoothed(slm_side_pdi)
+        reference_values = old_cdf.trusted.to_list()
+        prior_values = old_cdf.prior.to_list()
+        previous_scores = list(self.state.repair_slm_side_scores)
+        repair_anchor = self._repair_landing_anchor(reference_values, prior_values)
+        repair_high = self._repair_high_reference(previous_scores)
+        repair_best_before = min(previous_scores) if previous_scores else None
+        direct_anchor_hit = repair_anchor is not None and slm_side_pdi <= repair_anchor
+        episode_best = repair_best_before is None or slm_side_pdi <= repair_best_before
+        rli_raw: float | None = None
+        rli: float | None = None
+        if repair_high is not None and repair_anchor is not None:
+            denominator = repair_high - repair_anchor
+            if denominator > REPAIR_LANDING_EPS:
+                rli_raw = (repair_high - slm_side_pdi) / denominator
+                rli = max(0.0, min(1.0, rli_raw))
+        acceptable = direct_anchor_hit or (
+            episode_best and rli is not None and rli >= REPAIR_LANDING_RLI_THRESHOLD
         )
+        self.state.repair_slm_side_scores.append(slm_side_pdi)
+        self.state.repair_slm_side_step_ids.append(step.step_id)
+        if acceptable:
+            self.state.handoff_history.append(rli if rli is not None else 1.0)
+            self.state.handoff_candidate_scores.append(slm_side_pdi)
+            self.state.handoff_candidate_step_ids.append(step.step_id)
+        else:
+            self.state.handoff_history = []
+            self.state.handoff_candidate_scores = []
+            self.state.handoff_candidate_step_ids = []
+        ready = acceptable and len(self.state.handoff_candidate_step_ids) >= self.cfg.r_handoff
         event = {
             "problem_id": self.problem_id,
             "event": "handoff_readiness",
             "step_id": step.step_id,
             "owner": self.state.owner,
             "mode": self.state.mode,
+            "handoff_strategy": "repair_landing_index",
             "slm_side_pdi": slm_side_pdi,
+            "slm_side_pdi_raw": slm_side_pdi,
             "handoff_q_slm_side": q_slm_side,
-            "q_handoff": self.q_handoff,
+            "slm_side_q": q_slm_side,
+            "slm_side_q_smoothed": q_slm_side_smoothed,
+            "repair_landing_index": rli,
+            "repair_landing_index_raw": rli_raw,
+            "repair_landing_threshold": REPAIR_LANDING_RLI_THRESHOLD,
+            "repair_landing_anchor_q": REPAIR_LANDING_ANCHOR_Q,
+            "repair_landing_high_q": REPAIR_LANDING_HIGH_Q,
+            "repair_landing_anchor_pdi": repair_anchor,
+            "repair_landing_high_ref": repair_high,
+            "repair_landing_best_pdi_before": repair_best_before,
+            "repair_landing_direct_anchor_hit": direct_anchor_hit,
+            "repair_landing_episode_best": episode_best,
+            "repair_score_count": len(self.state.repair_slm_side_scores),
+            "repair_previous_score_count": len(previous_scores),
+            "repair_previous_p25": _quantile(previous_scores, 0.25),
+            "repair_previous_p50": _quantile(previous_scores, 0.50),
+            "repair_previous_p75": _quantile(previous_scores, 0.75),
+            "repair_previous_min": min(previous_scores) if previous_scores else None,
+            "repair_previous_max": max(previous_scores) if previous_scores else None,
             "r_handoff": self.cfg.r_handoff,
+            "handoff_acceptable": acceptable,
+            "handoff_candidate_step_ids": list(self.state.handoff_candidate_step_ids),
+            "handoff_candidate_scores": list(self.state.handoff_candidate_scores),
+            "handoff_candidate_count": len(self.state.handoff_candidate_step_ids),
             "ready": ready,
             "trusted_buffer_size": len(self.state.trusted_buffer),
-            "prior_weight": cdf.prior_weight,
+            "slm_side_reference_count": len(reference_values),
+            "slm_side_reference_p90": _quantile(reference_values, 0.90),
+            "slm_side_reference_p95": _quantile(reference_values, 0.95),
+            "slm_side_reference_max": max(reference_values) if reference_values else None,
+            "slm_side_prior_count": len(prior_values),
+            "slm_side_prior_p90": _quantile(prior_values, 0.90),
+            "slm_side_prior_p95": _quantile(prior_values, 0.95),
+            "slm_side_prior_max": max(prior_values) if prior_values else None,
+            "prior_weight": old_cdf.prior_weight,
         }
         self.events.append(event)
 
@@ -679,16 +894,41 @@ class PDIController:
             self.state.handoff_point_token_idx = self.visible_token_count()
             self._reset_evidence_histories()
             self.state.probation_stable_count = 0
+            self.state.reentry_stable_count = 0
+            self.state.reentry_cached_windows = []
+            self.state.reentry_transition_windows = []
             self._probation_windows = []
             self._new_episode()
-            self._switch(MODE_SLM_PROBATION, OWNER_SLM, step_id=step.step_id, reason="slm_side_handoff_ready")
+            self._switch(MODE_SLM_REENTRY, OWNER_SLM, step_id=step.step_id, reason="repair_landing_ready")
             return ControllerDecision(
-                action="HANDOFF_TO_SLM_PROBATION",
+                action="HANDOFF_TO_SLM_REENTRY",
                 step=step,
                 handoff_q_slm_side=q_slm_side,
+                repair_landing_index=rli,
             )
 
-        return ControllerDecision(action="LLM_REPAIR_CONTINUE", step=step, handoff_q_slm_side=q_slm_side)
+        return ControllerDecision(
+            action="LLM_REPAIR_CONTINUE",
+            step=step,
+            handoff_q_slm_side=q_slm_side,
+            repair_landing_index=rli,
+        )
+
+    def reset_handoff_candidate_buffer(self, *, step: Step, reason: str) -> None:
+        self.state.handoff_history = []
+        self.state.handoff_candidate_step_ids = []
+        self.state.handoff_candidate_scores = []
+        self.events.append(
+            {
+                "problem_id": self.problem_id,
+                "event": "handoff_candidate_reset",
+                "step_id": step.step_id,
+                "owner": self.state.owner,
+                "mode": self.state.mode,
+                "reason": reason,
+                "ready": False,
+            }
+        )
 
     def note_llm_repair_step(self, step: Step) -> ControllerDecision:
         self._repair_step_count += 1
@@ -728,8 +968,12 @@ class PDIController:
                     self.state.failure_buffer.append(window)
 
         self._reset_evidence_histories()
+        self._clear_transition_watch()
+        self._clear_reentry_watch()
         self._probation_windows = []
         self.state.probation_stable_count = 0
+        self.state.reentry_cached_windows = []
+        self.state.reentry_stable_count = 0
         self.state.handoff_point_token_idx = None
         self._new_episode()
         self.llm_repair_episodes += 1
@@ -800,6 +1044,10 @@ class PDIController:
             "probation_failure_rate": (
                 self.probation_failure_count / self.handoff_success_count if self.handoff_success_count else 0.0
             ),
+            "reentry_failure_count": self.reentry_failure_count,
+            "reentry_failure_rate": (
+                self.reentry_failure_count / self.handoff_success_count if self.handoff_success_count else 0.0
+            ),
             "early_stop_trigger_count": self.early_stop_trigger_count,
             "pdi_decision_count": self.pdi_decision_count,
             "no_valid_pdi_window_count": self.no_valid_pdi_window_count,
@@ -807,7 +1055,8 @@ class PDIController:
             "pdi_window_count": len(self.windows),
             "trusted_buffer_size": len(self.state.trusted_buffer),
             "failure_buffer_size": len(self.state.failure_buffer),
-            "prior_size": len(self.prior_distribution),
+            "prior_size": len(self.self_prior_distribution),
+            "self_prior_size": len(self.self_prior_distribution),
             "prior_weight": self.effective_cdf().prior_weight,
             "slm_thinking_tokens": slm_tokens,
             "llm_thinking_tokens": llm_tokens,
@@ -825,13 +1074,21 @@ class PDIController:
             "config": {
                 "t_min": self.cfg.t_min,
                 "lambda0": self.cfg.lambda0,
+                "lambda0_self": self.lambda0_self,
                 "n_min": self.cfg.n_min,
                 "q_high": self.cfg.q_high,
+                "q_recover": self.cfg.q_recover,
+                "transition_grace_windows": self.cfg.transition_grace_windows,
                 "r_upper": self.cfg.r_upper,
                 "eta_upper": self.cfg.eta_upper,
-                "q_handoff": self.q_handoff,
+                "handoff_strategy": "repair_landing_index",
+                "repair_landing_anchor_q": REPAIR_LANDING_ANCHOR_Q,
+                "repair_landing_high_q": REPAIR_LANDING_HIGH_Q,
+                "repair_landing_rli_threshold": REPAIR_LANDING_RLI_THRESHOLD,
                 "r_handoff": self.cfg.r_handoff,
                 "m_probation": self.cfg.m_probation,
+                "m_reentry": self.cfg.m_reentry,
+                "reentry_transition_grace": self.cfg.reentry_transition_grace,
                 "q_low": self.cfg.q_low,
                 "r_low": self.cfg.r_low,
                 "max_llm_repair_steps": self.cfg.max_llm_repair_steps,
@@ -866,6 +1123,10 @@ class PDIController:
         self.state.upper_evidence_history = []
         self.state.lower_tail_history = []
         self.state.handoff_history = []
+        self.state.handoff_candidate_step_ids = []
+        self.state.handoff_candidate_scores = []
+        self.state.repair_slm_side_scores = []
+        self.state.repair_slm_side_step_ids = []
 
     def _log_pdi_decision(
         self,

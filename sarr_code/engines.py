@@ -508,18 +508,30 @@ class LocalTransformersSLM:
 
         logits = outputs.logits[0]
         logprobs: list[float] = []
+        target_token_ids: list[int] = []
+        target_token_offsets: list[list[int]] = []
         for pos in target_positions:
             token_id = int(input_ids[0, pos].detach().cpu())
+            target_token_ids.append(token_id)
+            if offsets is not None:
+                target_token_offsets.append([int(offsets[pos][0]), int(offsets[pos][1])])
             values = logits[pos - 1].float()
             logprob = values[token_id] - torch.logsumexp(values, dim=-1)
             logprobs.append(float(logprob.detach().cpu()))
 
         wall_time = time.time() - start
         pdi = -sum(logprobs) / len(logprobs) if logprobs else float("inf")
+        try:
+            target_tokens = [self.decode([token_id]) for token_id in target_token_ids]
+        except Exception:
+            target_tokens = []
         return {
             "pdi": float(pdi),
             "token_count": len(logprobs),
             "logprobs": logprobs,
+            "token_ids": target_token_ids,
+            "tokens": target_tokens,
+            "token_offsets": target_token_offsets,
             "prompt_tokens": int(input_ids.shape[-1]),
             "wall_time": wall_time,
         }
