@@ -317,6 +317,13 @@ class PDIController:
         self.handoff_failure_count = 0
         self.probation_failure_count = 0
         self.reentry_failure_count = 0
+        self.self_reentry_attempt_count = 0
+        self.self_reentry_accept_count = 0
+        self.self_reentry_reject_count = 0
+        self._self_reentry_pdi_sum = 0.0
+        self._self_reentry_q_sum = 0.0
+        self._self_reentry_reject_reasons: dict[str, int] = {}
+        self._shadow_old_handoff_ready_count = 0
         self.early_stop_trigger_count = 0
         self.pdi_decision_count = 0
         self.no_valid_pdi_window_count = 0
@@ -914,6 +921,192 @@ class PDIController:
             repair_landing_index=rli,
         )
 
+    def process_self_reentry_candidate(
+        self,
+        *,
+        llm_repair_step: Step,
+        candidate_outputs: list[StepOutput],
+        old_slm_side_pdi: float | None = None,
+        old_slm_side_q: float | None = None,
+    ) -> ControllerDecision:
+        self.self_reentry_attempt_count += 1
+
+        required_scored_tokens = max(
+            self.cfg.t_min,
+            self.cfg.self_reentry_min_scored_tokens or self.cfg.t_min,
+        )
+        candidate_token_counts = [int(output.token_count) for output in candidate_outputs]
+        candidate_scored_counts = [
+            min(len(output.token_ids), len(_step_logprobs(output))) for output in candidate_outputs
+        ]
+        scored_count = sum(candidate_scored_counts)
+        saw_close_think = any("</think>" in (output.text or "") for output in candidate_outputs)
+
+        reject_reason: str | None = None
+        if not candidate_outputs:
+            reject_reason = "empty_self_reentry_candidate"
+        elif saw_close_think:
+            reject_reason = "close_think_in_self_reentry_candidate"
+        elif scored_count < required_scored_tokens:
+            reject_reason = "insufficient_self_reentry_tokens"
+
+        micro_pdi: float | None = None
+        q_self_reentry: float | None = None
+
+        if reject_reason is None:
+            logprob_sum = 0.0
+            for output in candidate_outputs:
+                output_logprobs = _step_logprobs(output)
+                output_scored_count = min(len(output.token_ids), len(output_logprobs))
+                logprob_sum += sum(output_logprobs[:output_scored_count])
+            micro_pdi = -logprob_sum / scored_count
+            ref_values = self.state.pre_suspect_snapshot or [w.pdi for w in self.state.trusted_buffer]
+            cdf = self.effective_cdf_from_values(ref_values)
+            q_self_reentry = cdf(micro_pdi)
+            if q_self_reentry > self.cfg.self_reentry_q_threshold:
+                reject_reason = "q_above_threshold"
+
+        accepted = reject_reason is None
+
+        # shadow old handoff readiness for comparison
+        old_handoff_ready: bool | None = None
+        if old_slm_side_pdi is not None:
+            old_cdf = self.effective_cdf_from_values(
+                self.state.pre_suspect_snapshot or [w.pdi for w in self.state.trusted_buffer]
+            )
+            old_q = old_slm_side_q if old_slm_side_q is not None else old_cdf(old_slm_side_pdi)
+            old_slm_side_q = old_q
+            reference_values = old_cdf.trusted.to_list()
+            prior_values = old_cdf.prior.to_list()
+            previous_scores = list(self.state.repair_slm_side_scores)
+            repair_anchor = self._repair_landing_anchor(reference_values, prior_values)
+            repair_high = self._repair_high_reference(previous_scores)
+            repair_best_before = min(previous_scores) if previous_scores else None
+            direct_anchor_hit = repair_anchor is not None and old_slm_side_pdi <= repair_anchor
+            episode_best = repair_best_before is None or old_slm_side_pdi <= repair_best_before
+            rli: float | None = None
+            if repair_high is not None and repair_anchor is not None:
+                denominator = repair_high - repair_anchor
+                if denominator > REPAIR_LANDING_EPS:
+                    rli_raw = (repair_high - old_slm_side_pdi) / denominator
+                    rli = max(0.0, min(1.0, rli_raw))
+            acceptable = direct_anchor_hit or (
+                episode_best and rli is not None and rli >= REPAIR_LANDING_RLI_THRESHOLD
+            )
+            self.state.repair_slm_side_scores.append(old_slm_side_pdi)
+            self.state.repair_slm_side_step_ids.append(llm_repair_step.step_id)
+            if acceptable:
+                self.state.handoff_candidate_scores.append(old_slm_side_pdi)
+                self.state.handoff_candidate_step_ids.append(llm_repair_step.step_id)
+            else:
+                self.state.handoff_candidate_scores = []
+                self.state.handoff_candidate_step_ids = []
+            old_handoff_ready = acceptable and len(self.state.handoff_candidate_step_ids) >= self.cfg.r_handoff
+            if old_handoff_ready:
+                self._shadow_old_handoff_ready_count += 1
+
+        candidate_step_ids: list[int] = []
+        if accepted and self.cfg.commit_self_reentry_step:
+            handoff_point_token_idx = self.visible_token_count()
+            self.state.handoff_point_token_idx = handoff_point_token_idx
+            self._reset_evidence_histories()
+            self.state.probation_stable_count = 0
+            self.state.reentry_stable_count = 0
+            self.state.reentry_cached_windows = []
+            self.state.reentry_transition_windows = []
+            self._probation_windows = []
+            self._new_episode()
+            self._switch(
+                MODE_SLM_REENTRY,
+                OWNER_SLM,
+                step_id=llm_repair_step.step_id,
+                reason="self_reentry_certification_accepted",
+            )
+            for idx, output in enumerate(candidate_outputs, start=1):
+                token_ids = list(output.token_ids)
+                logprobs = _step_logprobs(output)
+                start = self.visible_token_count()
+                end = start + len(token_ids) - 1
+                micro_step = Step(
+                    step_id=self._next_step_id,
+                    owner=OWNER_SLM,
+                    mode=self.state.mode,
+                    text=output.text,
+                    token_ids=token_ids,
+                    logprobs=logprobs,
+                    start_token_idx=start,
+                    end_token_idx=end,
+                    episode_id=self._episode_id,
+                    action="SELF_REENTRY_ACCEPTED",
+                    finish_reason=output.finish_reason,
+                    prompt_tokens=output.prompt_tokens,
+                    wall_time=output.wall_time,
+                    extra={
+                        **dict(output.extra),
+                        "self_reentry_certification": True,
+                        "self_reentry_candidate_index": idx,
+                    },
+                )
+                self.steps.append(micro_step)
+                self._next_step_id += 1
+                candidate_step_ids.append(micro_step.step_id)
+                if has_answer_intent(micro_step.text):
+                    self.answer_intent_seen = True
+
+        if accepted:
+            self.self_reentry_accept_count += 1
+            if micro_pdi is not None:
+                self._self_reentry_pdi_sum += micro_pdi
+            if q_self_reentry is not None:
+                self._self_reentry_q_sum += q_self_reentry
+            self.handoff_success_count += 1
+            if not self.cfg.commit_self_reentry_step:
+                self.state.handoff_point_token_idx = self.visible_token_count()
+                self._reset_evidence_histories()
+                self.state.probation_stable_count = 0
+                self.state.reentry_stable_count = 0
+                self.state.reentry_cached_windows = []
+                self.state.reentry_transition_windows = []
+                self._probation_windows = []
+                self._new_episode()
+                self._switch(
+                    MODE_SLM_REENTRY,
+                    OWNER_SLM,
+                    step_id=llm_repair_step.step_id,
+                    reason="self_reentry_certification_accepted",
+                )
+        else:
+            self.self_reentry_reject_count += 1
+            self._self_reentry_reject_reasons[reject_reason] = self._self_reentry_reject_reasons.get(reject_reason, 0) + 1
+
+        event: dict[str, Any] = {
+            "problem_id": self.problem_id,
+            "event": "self_reentry_certification",
+            "step_id": llm_repair_step.step_id,
+            "candidate_step_id": candidate_step_ids[0] if candidate_step_ids else None,
+            "candidate_step_ids": list(candidate_step_ids),
+            "candidate_attempt_count": len(candidate_outputs),
+            "candidate_token_counts": candidate_token_counts,
+            "candidate_scored_token_counts": candidate_scored_counts,
+            "micro_token_count": scored_count,
+            "required_scored_tokens": required_scored_tokens,
+            "self_reentry_pdi": micro_pdi,
+            "self_reentry_q": q_self_reentry,
+            "self_reentry_threshold": self.cfg.self_reentry_q_threshold,
+            "accepted": accepted,
+            "reject_reason": reject_reason,
+            "commit": accepted and self.cfg.commit_self_reentry_step,
+            "old_llm_suffix_pdi": old_slm_side_pdi,
+            "old_llm_suffix_q": old_slm_side_q,
+            "old_handoff_ready_shadow": old_handoff_ready,
+        }
+        self.events.append(event)
+        self.handoff_attempt_count += 1
+
+        if accepted:
+            return ControllerDecision(action="HANDOFF_TO_SLM_REENTRY", step=llm_repair_step)
+        return ControllerDecision(action="LLM_REPAIR_CONTINUE", step=llm_repair_step)
+
     def reset_handoff_candidate_buffer(self, *, step: Step, reason: str) -> None:
         self.state.handoff_history = []
         self.state.handoff_candidate_step_ids = []
@@ -1071,6 +1264,23 @@ class PDIController:
             "llm_wall_time": llm_wall_time,
             "slm_scoring_overhead": slm_scoring_wall_time,
             "slm_scoring_count": slm_scoring_count,
+            "self_reentry_attempt_count": self.self_reentry_attempt_count,
+            "self_reentry_accept_count": self.self_reentry_accept_count,
+            "self_reentry_reject_count": self.self_reentry_reject_count,
+            "self_reentry_accept_rate": (
+                self.self_reentry_accept_count / self.self_reentry_attempt_count
+                if self.self_reentry_attempt_count else 0.0
+            ),
+            "avg_self_reentry_pdi": (
+                self._self_reentry_pdi_sum / self.self_reentry_accept_count
+                if self.self_reentry_accept_count else None
+            ),
+            "avg_self_reentry_q": (
+                self._self_reentry_q_sum / self.self_reentry_accept_count
+                if self.self_reentry_accept_count else None
+            ),
+            "self_reentry_reject_reasons": dict(self._self_reentry_reject_reasons),
+            "shadow_old_handoff_ready_count": self._shadow_old_handoff_ready_count,
             "config": {
                 "t_min": self.cfg.t_min,
                 "lambda0": self.cfg.lambda0,
@@ -1081,7 +1291,7 @@ class PDIController:
                 "transition_grace_windows": self.cfg.transition_grace_windows,
                 "r_upper": self.cfg.r_upper,
                 "eta_upper": self.cfg.eta_upper,
-                "handoff_strategy": "repair_landing_index",
+                "handoff_strategy": self.cfg.handoff_strategy,
                 "repair_landing_anchor_q": REPAIR_LANDING_ANCHOR_Q,
                 "repair_landing_high_q": REPAIR_LANDING_HIGH_Q,
                 "repair_landing_rli_threshold": REPAIR_LANDING_RLI_THRESHOLD,
@@ -1092,6 +1302,13 @@ class PDIController:
                 "q_low": self.cfg.q_low,
                 "r_low": self.cfg.r_low,
                 "max_llm_repair_steps": self.cfg.max_llm_repair_steps,
+                "self_reentry_min_scored_tokens": max(
+                    self.cfg.t_min,
+                    self.cfg.self_reentry_min_scored_tokens or self.cfg.t_min,
+                ),
+                "self_reentry_max_attempt_steps": self.cfg.self_reentry_max_attempt_steps,
+                "self_reentry_q_threshold": self.cfg.self_reentry_q_threshold,
+                "commit_self_reentry_step": self.cfg.commit_self_reentry_step,
             },
         }
 

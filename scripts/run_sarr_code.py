@@ -173,6 +173,14 @@ def _problem_sarr_metrics(result, step_rows: list[dict[str, Any]], controller_ro
         "llm_participation_rate": float(_num(summary.get("llm_participation_rate"))),
         "slm_scoring_overhead": float(_num(summary.get("slm_scoring_overhead"))),
         "slm_scoring_count": int(_num(summary.get("slm_scoring_count"))),
+        "self_reentry_attempt_count": int(_num(summary.get("self_reentry_attempt_count"))),
+        "self_reentry_accept_count": int(_num(summary.get("self_reentry_accept_count"))),
+        "self_reentry_reject_count": int(_num(summary.get("self_reentry_reject_count"))),
+        "self_reentry_accept_rate": float(_num(summary.get("self_reentry_accept_rate"))),
+        "avg_self_reentry_pdi": summary.get("avg_self_reentry_pdi"),
+        "avg_self_reentry_q": summary.get("avg_self_reentry_q"),
+        "self_reentry_reject_reasons": summary.get("self_reentry_reject_reasons"),
+        "shadow_old_handoff_ready_count": int(_num(summary.get("shadow_old_handoff_ready_count"))),
         "slm_thinking_tokens": int(_num(summary.get("slm_thinking_tokens"))),
         "llm_thinking_tokens": int(_num(summary.get("llm_thinking_tokens"))),
         "total_thinking_tokens": int(_num(summary.get("total_thinking_tokens"))),
@@ -219,6 +227,16 @@ def _extra_sarr_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_pdi_window_count": avg("pdi_window_count"),
         "total_slm_scoring_count": total("slm_scoring_count"),
         "avg_slm_scoring_overhead": avg("slm_scoring_overhead"),
+        "avg_self_reentry_attempt_count": avg("self_reentry_attempt_count"),
+        "total_self_reentry_attempt_count": total("self_reentry_attempt_count"),
+        "total_self_reentry_accept_count": total("self_reentry_accept_count"),
+        "total_self_reentry_reject_count": total("self_reentry_reject_count"),
+        "self_reentry_accept_rate": (
+            total("self_reentry_accept_count") / total("self_reentry_attempt_count")
+            if total("self_reentry_attempt_count")
+            else 0.0
+        ),
+        "total_shadow_old_handoff_ready_count": total("shadow_old_handoff_ready_count"),
     }
 
 

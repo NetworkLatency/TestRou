@@ -12,6 +12,9 @@ _DEPRECATED_CONTROLLER_KEYS = {
     "q_handoff_cross",
     "cross_prior_distribution",
     "cross_prior_distribution_path",
+    "self_reentry_min_tokens",
+    "self_reentry_max_tokens",
+    "self_reentry_agg_quantile",
 }
 
 
@@ -78,6 +81,11 @@ class ControllerConfig:
     q_low: float = 0.10
     r_low: int = 2
     max_llm_repair_steps: int = 5
+    handoff_strategy: str = "self_reentry_certification"
+    self_reentry_min_scored_tokens: int | None = None
+    self_reentry_max_attempt_steps: int = 3
+    self_reentry_q_threshold: float = 0.80
+    commit_self_reentry_step: bool = True
     prior_distribution: list[float] = field(default_factory=lambda: [0.12, 0.19, 0.29, 0.36])
     prior_distribution_path: str | None = None
     self_prior_distribution: list[float] | None = None
@@ -118,6 +126,14 @@ class ControllerConfig:
             raise ValueError("controller.r_low must be >= 1")
         if self.max_llm_repair_steps < 1:
             raise ValueError("controller.max_llm_repair_steps must be >= 1")
+        if self.handoff_strategy not in {"repair_landing_index", "self_reentry_certification"}:
+            raise ValueError("controller.handoff_strategy must be 'repair_landing_index' or 'self_reentry_certification'")
+        if self.self_reentry_min_scored_tokens is not None and self.self_reentry_min_scored_tokens < 1:
+            raise ValueError("controller.self_reentry_min_scored_tokens must be >= 1")
+        if self.self_reentry_max_attempt_steps < 1:
+            raise ValueError("controller.self_reentry_max_attempt_steps must be >= 1")
+        if not 0.0 < self.self_reentry_q_threshold < 1.0:
+            raise ValueError("controller.self_reentry_q_threshold must be in (0, 1)")
 
 
 @dataclass
