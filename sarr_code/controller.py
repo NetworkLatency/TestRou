@@ -147,6 +147,10 @@ class EpisodeState:
     reentry_cached_windows: list[PDIWindow] = field(default_factory=list)
     reentry_stable_count: int = 0
     reentry_transition_windows: list[PDIWindow] = field(default_factory=list)
+    recent_trusted_pdi: list[float] = field(default_factory=list)
+    monotone_decline_pending: int = 0
+    diagnostic_history: list[dict] = field(default_factory=list)
+    last_diagnostic: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -324,6 +328,9 @@ class PDIController:
         self._self_reentry_q_sum = 0.0
         self._self_reentry_reject_reasons: dict[str, int] = {}
         self._shadow_old_handoff_ready_count = 0
+        self._min_repair_before_cert = 0
+        self.monotone_decline_count = 0
+        self.step_text_repeat_count = 0
         self.early_stop_trigger_count = 0
         self.pdi_decision_count = 0
         self.no_valid_pdi_window_count = 0
@@ -548,6 +555,8 @@ class PDIController:
         window.status = WINDOW_TRUSTED
         if window not in self.state.trusted_buffer:
             self.state.trusted_buffer.append(window)
+            self.state.recent_trusted_pdi.append(window.pdi)
+            self.state.recent_trusted_pdi = self.state.recent_trusted_pdi[-8:]
 
     def _clear_transition_watch(self) -> None:
         self.state.transition_start_window = None
@@ -621,6 +630,12 @@ class PDIController:
             action = "EARLY_STOP_LOWER_TAIL_AFTER_ANSWER_INTENT"
             self._switch(MODE_FINALIZE, self.state.owner, step_id=step.step_id, reason=action)
 
+        if not early_stop and self.state.mode != MODE_COLD_START:
+            if self._check_monotone_decline(step):
+                action = "MONOTONE_PDI_DECLINE_FINALIZE"
+            elif not self.answer_intent_seen and self._check_step_text_repeat(step):
+                action = "STEP_TEXT_REPEAT_FINALIZE"
+
         self._log_pdi_decision(step=step, window=window, mode=mode_at_decision, action=action, cdf=cdf)
         return ControllerDecision(
             action=action,
@@ -630,7 +645,7 @@ class PDIController:
             upper_excess=upper_excess,
         )
 
-    def process_transition_window(self, step: Step) -> ControllerDecision:
+    def process_transition_window(self, step: Step, *, d_llm: float | None = None) -> ControllerDecision:
         mode_at_decision = self.state.mode
         window = self.build_step_window()
         if window is None:
@@ -666,6 +681,21 @@ class PDIController:
             if alarm is None:
                 raise InvalidControllerState("SLM transition failed without a transition start window.")
             rollback_start = alarm.start_token_idx
+
+            if d_llm is not None:
+                zone = self.record_diagnostic(step, q_percentile, d_llm)
+                if zone == "jointly_hard":
+                    action = "JOINTLY_HARD_FINALIZE"
+                    self._log_pdi_decision(step=step, window=window, mode=mode_at_decision, action=action, cdf=cdf)
+                    self._switch(MODE_FINALIZE, self.state.owner, step_id=step.step_id, reason="jointly_hard")
+                    return ControllerDecision(
+                        action=action,
+                        step=step,
+                        window=window,
+                        q_percentile=q_percentile,
+                        upper_excess=upper_excess,
+                    )
+
             action = "SLM_TRANSITION_FAILED_ROLLBACK_TO_LLM_REPAIR"
             self._log_pdi_decision(
                 step=step,
@@ -943,7 +973,9 @@ class PDIController:
         saw_close_think = any("</think>" in (output.text or "") for output in candidate_outputs)
 
         reject_reason: str | None = None
-        if not candidate_outputs:
+        if self._min_repair_before_cert > 0:
+            reject_reason = "insufficient_repair_steps_before_cert"
+        elif not candidate_outputs:
             reject_reason = "empty_self_reentry_candidate"
         elif saw_close_think:
             reject_reason = "close_think_in_self_reentry_candidate"
@@ -1123,8 +1155,101 @@ class PDIController:
             }
         )
 
+    def classify_risk_zone(self, q_slm: float, d_llm: float) -> str:
+        slm_high = q_slm > self.cfg.q_high
+        llm_high = d_llm > self.cfg.jointly_hard_threshold
+        if not slm_high and not llm_high:
+            return "stable"
+        if slm_high and not llm_high:
+            return "llm_beneficial"
+        if slm_high and llm_high:
+            return "jointly_hard"
+        return "reentry_ready"
+
+    def record_diagnostic(self, step: Step, q_slm: float, d_llm: float) -> str:
+        delta = q_slm - d_llm
+        zone = self.classify_risk_zone(q_slm, d_llm)
+        record = {
+            "step_id": step.step_id,
+            "q_slm": q_slm,
+            "d_llm": d_llm,
+            "delta": delta,
+            "zone": zone,
+        }
+        self.state.diagnostic_history.append(record)
+        self.state.last_diagnostic = record
+        self.events.append({"problem_id": self.problem_id, "event": "dual_model_diagnostic", **record})
+        return zone
+
+    def _check_monotone_decline(self, step: Step) -> bool:
+        """Detect persistent monotone PDI decline (degeneration / repetition loop).
+
+        Requires K=6 consecutive strictly-decreasing trusted windows, then 1 confirmation
+        window that is also lower than the last of those 6. Returns True and triggers
+        FINALIZE when confirmed; returns True on the confirmation step.
+        """
+        K = 6
+        hist = self.state.recent_trusted_pdi
+        if self.state.monotone_decline_pending > 0:
+            # confirmation step: current window must still be declining
+            if len(hist) >= 2 and hist[-1] < hist[-2]:
+                self.state.monotone_decline_pending = 0
+                self.monotone_decline_count += 1
+                self.events.append({
+                    "problem_id": self.problem_id,
+                    "event": "monotone_pdi_decline_confirmed",
+                    "step_id": step.step_id,
+                    "recent_pdi": list(hist),
+                })
+                self._switch(MODE_FINALIZE, self.state.owner, step_id=step.step_id, reason="monotone_pdi_decline")
+                return True
+            else:
+                self.state.monotone_decline_pending = 0
+            return False
+
+        if len(hist) < K:
+            return False
+        window_k = hist[-K:]
+        if all(window_k[i] > window_k[i + 1] for i in range(K - 1)):
+            self.state.monotone_decline_pending = 1
+        return False
+
+    def _check_step_text_repeat(self, step: Step) -> bool:
+        pdi_hist = self.state.recent_trusted_pdi
+        # Phase 1: PDI oscillation trigger — need >=6 recent values all below 0.30,
+        # with a repeating sign pattern of period 2 or 3.
+        if len(pdi_hist) < 6:
+            return False
+        tail = pdi_hist[-6:]
+        if max(tail) >= 0.30:
+            return False
+        signs = [1 if tail[i + 1] > tail[i] else -1 for i in range(len(tail) - 1)]
+        period_detected = (
+            signs[:2] == signs[2:4] == signs[4:]  # period-2: 2 full cycles in 5 diffs
+            or signs[:3] == signs[3:]              # period-3: 2 full cycles in 6 diffs
+        )
+        if not period_detected:
+            return False
+        # Phase 2: text repeat confirmation
+        active = self.active_steps()
+        recent_texts = [s.text for s in active[-6:] if s.text]
+        if len(recent_texts) < 4 or len(set(recent_texts)) == len(recent_texts):
+            return False
+        self.step_text_repeat_count += 1
+        self.events.append({
+            "problem_id": self.problem_id,
+            "event": "step_text_repeat_detected",
+            "step_id": step.step_id,
+            "recent_pdi": list(tail),
+            "unique_text_count": len(set(recent_texts)),
+        })
+        self._switch(MODE_FINALIZE, self.state.owner, step_id=step.step_id, reason="step_text_repeat")
+        return True
+
     def note_llm_repair_step(self, step: Step) -> ControllerDecision:
         self._repair_step_count += 1
+        if self._min_repair_before_cert > 0:
+            self._min_repair_before_cert -= 1
         if self._repair_step_count >= self.cfg.max_llm_repair_steps:
             self.handoff_failure_count += 1
             self._switch(MODE_LLM_FINALIZE, OWNER_LLM, step_id=step.step_id, reason="max_llm_repair_steps")
@@ -1171,6 +1296,9 @@ class PDIController:
         self._new_episode()
         self.llm_repair_episodes += 1
         self._repair_step_count = 0
+        self._min_repair_before_cert = 2
+        self.state.recent_trusted_pdi = []
+        self.state.monotone_decline_pending = 0
         self._switch(MODE_LLM_REPAIR, OWNER_LLM, step_id=None, reason=reason)
         self.events.append(
             {
@@ -1242,6 +1370,13 @@ class PDIController:
                 self.reentry_failure_count / self.handoff_success_count if self.handoff_success_count else 0.0
             ),
             "early_stop_trigger_count": self.early_stop_trigger_count,
+            "monotone_decline_count": self.monotone_decline_count,
+            "step_text_repeat_count": self.step_text_repeat_count,
+            "jointly_hard_count": sum(
+                1 for e in self.events
+                if e.get("event") == "dual_model_diagnostic" and e.get("zone") == "jointly_hard"
+            ),
+            "diagnostic_count": sum(1 for e in self.events if e.get("event") == "dual_model_diagnostic"),
             "pdi_decision_count": self.pdi_decision_count,
             "no_valid_pdi_window_count": self.no_valid_pdi_window_count,
             "no_valid_pdi_window_reasons": dict(self.no_valid_pdi_window_reasons),

@@ -692,6 +692,66 @@ class CompletionEngine:
             topk_logprobs=topk_logprobs,
         )
 
+    def score_suffix_pdi(self, problem_text: str, prefix_text: str, suffix_text: str) -> dict[str, Any]:
+        """LLM-side teacher-forcing: compute LLM's PDI on suffix_text."""
+        self.load()
+        rendered_prefix = self.render(problem_text, prefix_text)
+        rendered_full = self.render(problem_text, prefix_text + suffix_text)
+        start = time.time()
+
+        if self.cfg.backend == "vllm":
+            logprobs = self._score_suffix_vllm(rendered_prefix, rendered_full)
+        else:
+            logprobs = self._score_suffix_openai(rendered_prefix, rendered_full)
+
+        wall_time = time.time() - start
+        if not logprobs:
+            return {"pdi": float("inf"), "token_count": 0, "logprobs": [], "wall_time": wall_time}
+        pdi = -sum(logprobs) / len(logprobs)
+        return {"pdi": float(pdi), "token_count": len(logprobs), "logprobs": logprobs, "wall_time": wall_time}
+
+    def _score_suffix_vllm(self, rendered_prefix: str, rendered_full: str) -> list[float]:
+        from vllm import SamplingParams
+
+        prefix_ids = self.encode(rendered_prefix)
+        full_ids = self.encode(rendered_full)
+        suffix_len = len(full_ids) - len(prefix_ids)
+        if suffix_len <= 0:
+            return []
+        params = SamplingParams(prompt_logprobs=1, max_tokens=1, temperature=0.0)
+        results = self.llm.generate(rendered_full, params, use_tqdm=False)
+        prompt_logprobs = results[0].prompt_logprobs or []
+        logprobs: list[float] = []
+        for entry in prompt_logprobs[-suffix_len:]:
+            if entry is None:
+                continue
+            for lp in entry.values():
+                logprobs.append(float(lp.logprob))
+                break
+        return logprobs
+
+    def _score_suffix_openai(self, rendered_prefix: str, rendered_full: str) -> list[float]:
+        prefix_ids = self.encode(rendered_prefix)
+        full_ids = self.encode(rendered_full)
+        suffix_len = len(full_ids) - len(prefix_ids)
+        if suffix_len <= 0:
+            return []
+        response = self._openai_client.completions.create(
+            model=self.cfg.api_model or self.cfg.model_path,
+            prompt=rendered_full,
+            max_tokens=1,
+            temperature=0.0,
+            logprobs=1,
+            echo=True,
+        )
+        choices = list(getattr(response, "choices", []) or [])
+        if not choices:
+            return []
+        logprobs_obj = getattr(choices[0], "logprobs", None)
+        token_logprobs = list(getattr(logprobs_obj, "token_logprobs", None) or []) if logprobs_obj else []
+        valid = [lp for lp in token_logprobs if lp is not None]
+        return valid[len(prefix_ids): len(prefix_ids) + suffix_len]
+
     def _generate_openai(
         self,
         prompt: str,

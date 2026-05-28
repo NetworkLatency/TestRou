@@ -11,6 +11,7 @@ data/lcbv6/
 nohup*.out
 server/vllm_logs
 sarr_results
+self_reentry_results
 <<<<<<< HEAD
 bpa_results
 =======

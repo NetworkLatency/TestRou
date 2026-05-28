@@ -265,7 +265,28 @@ def _answer_intent_terminal_peek(
     if not found_close:
         return False
 
-    controller.mark_finished(step, reason="finished")
+    raw_peek_text = output.text
+    peek_prefix = raw_peek_text.split(CLOSE_THINK_TAG, 1)[0].rstrip()
+    output.text = f"{peek_prefix}\n{CLOSE_THINK_TAG}\n\n"
+    output.token_ids = engine.encode(output.text)
+    output.extra = {
+        **dict(output.extra),
+        "answer_intent_terminal_peek": True,
+        "peek_for_step_id": step.step_id,
+        "raw_peek_text": raw_peek_text,
+        "raw_peek_token_count": payload["peek_token_count"],
+    }
+    peek_step = controller.append_step(
+        output,
+        owner=OWNER_LLM if account == "llm" else OWNER_SLM,
+        action="ANSWER_INTENT_TERMINAL_PEEK_CLOSE",
+        attempt_id=step.attempt_id,
+    )
+    payload["peek_step_id"] = peek_step.step_id
+    payload["committed_text"] = output.text
+    state.trace.append(TraceEvent(peek_step.step_id, "answer_intent_terminal_peek_committed", payload))
+    _sync_prefix(state, controller)
+    controller.mark_finished(peek_step, reason="finished")
     return True
 
 
@@ -427,10 +448,26 @@ def run_sarr_code(
                     stop_reason = "finished"
                     break
 
-                decision = controller.process_transition_window(step)
+                d_llm: float | None = None
+                if cfg.controller.llm_diagnostic_enabled and controller.state.transition_windows:
+                    try:
+                        active_steps = controller.active_steps()
+                        diag_prefix = "".join(s.text for s in active_steps if s.step_id < step.step_id)
+                        diag = llm.score_suffix_pdi(state.problem_text, diag_prefix, step.text)
+                        if diag.get("token_count", 0) > 0:
+                            d_llm = float(diag["pdi"])
+                            step.extra["llm_diagnostic_pdi"] = d_llm
+                            state.llm_scoring_wall_time += float(diag.get("wall_time") or 0.0)
+                    except Exception:
+                        pass
+
+                decision = controller.process_transition_window(step, d_llm=d_llm)
                 if step.active:
                     step.action = decision.action
                 _sync_prefix(state, controller)
+                if controller.state.mode == MODE_FINALIZE:
+                    stop_reason = "early_stop"
+                    break
                 continue
 
             if mode == MODE_LLM_REPAIR:

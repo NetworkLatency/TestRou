@@ -86,6 +86,9 @@ class ControllerConfig:
     self_reentry_max_attempt_steps: int = 3
     self_reentry_q_threshold: float = 0.80
     commit_self_reentry_step: bool = True
+    jointly_hard_threshold: float = 0.75
+    delta_reentry_threshold: float = -0.15
+    llm_diagnostic_enabled: bool = True
     prior_distribution: list[float] = field(default_factory=lambda: [0.12, 0.19, 0.29, 0.36])
     prior_distribution_path: str | None = None
     self_prior_distribution: list[float] | None = None
