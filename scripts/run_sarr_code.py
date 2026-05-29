@@ -45,10 +45,42 @@ def _problem_complete(output_root: Path, dataset: str, variant: str, problem_id:
         root / f"{stem}.problem.json",
         root / f"{stem}.steps.jsonl",
         root / f"{stem}.controller_events.jsonl",
+        root / f"{stem}.msm_decisions.jsonl",
         root / f"{stem}.transitions.jsonl",
         root / f"{stem}.trace.json",
     ]
     return all(path.exists() for path in required)
+
+
+def _msm_decision_rows(controller_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in controller_rows:
+        if row.get("event") != "pdi_decision":
+            continue
+        rows.append(
+            {
+                "problem_id": row.get("problem_id"),
+                "step_id": row.get("step_id"),
+                "window_id": row.get("window_id"),
+                "owner": row.get("owner"),
+                "mode": row.get("mode"),
+                "action": row.get("action"),
+                "pdi": row.get("pdi"),
+                "q_percentile": row.get("q_percentile"),
+                "d_llm": row.get("msm_d_llm"),
+                "diagnostic_used": row.get("msm_diagnostic_used"),
+                "msm_suggested_action": row.get("msm_suggested_action"),
+                "pi_before": row.get("msm_pi_before"),
+                "pi_pred": row.get("msm_pi_pred"),
+                "emission_likelihood": row.get("msm_emission_likelihood"),
+                "pi_after": row.get("msm_pi_after"),
+                "rollback_start_token_idx": row.get("rollback_start_token_idx"),
+                "reentry_status": row.get("reentry_status"),
+                "trusted_buffer_size": row.get("trusted_buffer_size"),
+                "prior_weight": row.get("prior_weight"),
+            }
+        )
+    return rows
 
 
 def _write_problem_outputs(
@@ -94,6 +126,13 @@ def _write_problem_outputs(
         [
             {"problem_id": problem.problem_id, "question_id": problem.question_id, **row}
             for row in controller_rows
+        ],
+    )
+    write_jsonl(
+        root / f"{stem}.msm_decisions.jsonl",
+        [
+            {"problem_id": problem.problem_id, "question_id": problem.question_id, **row}
+            for row in _msm_decision_rows(controller_rows)
         ],
     )
     write_jsonl(
@@ -154,15 +193,15 @@ def _problem_sarr_metrics(result, step_rows: list[dict[str, Any]], controller_ro
         "llm_repair_episodes": int(_num(summary.get("llm_repair_episodes"))),
         "rollback_count": int(_num(summary.get("rollback_count"))),
         "has_rollback": int(_num(summary.get("rollback_count"))) > 0,
-        "handoff_attempt_count": int(_num(summary.get("handoff_attempt_count"))),
+        "handoff_attempt_count": int(_num(summary.get("handoff_success_count"))) + int(_num(summary.get("handoff_failure_count"))),
         "handoff_success_count": int(_num(summary.get("handoff_success_count"))),
         "handoff_failure_count": int(_num(summary.get("handoff_failure_count"))),
         "handoff_success_rate": float(_num(summary.get("handoff_success_rate"))),
-        "probation_failure_count": int(_num(summary.get("probation_failure_count"))),
-        "probation_failure_rate": float(_num(summary.get("probation_failure_rate"))),
         "reentry_failure_count": int(_num(summary.get("reentry_failure_count"))),
         "reentry_failure_rate": float(_num(summary.get("reentry_failure_rate"))),
         "early_stop_trigger_count": int(_num(summary.get("early_stop_trigger_count"))),
+        "msm_update_count": int(_num(summary.get("msm_update_count"))),
+        "msm_final_posterior": summary.get("msm_final_posterior"),
         "pdi_decision_count": int(_num(summary.get("pdi_decision_count"))),
         "no_valid_pdi_window_count": int(_num(summary.get("no_valid_pdi_window_count"))),
         "pdi_window_count": int(_num(summary.get("pdi_window_count"))),
@@ -171,16 +210,8 @@ def _problem_sarr_metrics(result, step_rows: list[dict[str, Any]], controller_ro
         "prior_size": int(_num(summary.get("prior_size"))),
         "prior_weight": float(_num(summary.get("prior_weight"))),
         "llm_participation_rate": float(_num(summary.get("llm_participation_rate"))),
-        "slm_scoring_overhead": float(_num(summary.get("slm_scoring_overhead"))),
-        "slm_scoring_count": int(_num(summary.get("slm_scoring_count"))),
-        "self_reentry_attempt_count": int(_num(summary.get("self_reentry_attempt_count"))),
-        "self_reentry_accept_count": int(_num(summary.get("self_reentry_accept_count"))),
-        "self_reentry_reject_count": int(_num(summary.get("self_reentry_reject_count"))),
-        "self_reentry_accept_rate": float(_num(summary.get("self_reentry_accept_rate"))),
-        "avg_self_reentry_pdi": summary.get("avg_self_reentry_pdi"),
-        "avg_self_reentry_q": summary.get("avg_self_reentry_q"),
-        "self_reentry_reject_reasons": summary.get("self_reentry_reject_reasons"),
-        "shadow_old_handoff_ready_count": int(_num(summary.get("shadow_old_handoff_ready_count"))),
+        "llm_diagnostic_wall_time": float(_num(summary.get("llm_diagnostic_wall_time"))),
+        "llm_diagnostic_count": int(_num(summary.get("llm_diagnostic_count"))),
         "slm_thinking_tokens": int(_num(summary.get("slm_thinking_tokens"))),
         "llm_thinking_tokens": int(_num(summary.get("llm_thinking_tokens"))),
         "total_thinking_tokens": int(_num(summary.get("total_thinking_tokens"))),
@@ -216,27 +247,17 @@ def _extra_sarr_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             if total("handoff_attempt_count")
             else 0.0
         ),
-        "probation_failure_rate": avg("probation_failure_rate"),
         "llm_participation_rate": avg("llm_participation_rate"),
         "rollback_rate": (sum(1 for row in rows if _truthy(row.get("has_rollback"))) / n) if n else 0.0,
         "total_rollback_count": total("rollback_count"),
         "total_early_stop_trigger_count": total("early_stop_trigger_count"),
+        "avg_msm_update_count": avg("msm_update_count"),
         "avg_pdi_decision_count": avg("pdi_decision_count"),
         "avg_no_valid_pdi_window_count": avg("no_valid_pdi_window_count"),
         "total_no_valid_pdi_window_count": total("no_valid_pdi_window_count"),
         "avg_pdi_window_count": avg("pdi_window_count"),
-        "total_slm_scoring_count": total("slm_scoring_count"),
-        "avg_slm_scoring_overhead": avg("slm_scoring_overhead"),
-        "avg_self_reentry_attempt_count": avg("self_reentry_attempt_count"),
-        "total_self_reentry_attempt_count": total("self_reentry_attempt_count"),
-        "total_self_reentry_accept_count": total("self_reentry_accept_count"),
-        "total_self_reentry_reject_count": total("self_reentry_reject_count"),
-        "self_reentry_accept_rate": (
-            total("self_reentry_accept_count") / total("self_reentry_attempt_count")
-            if total("self_reentry_attempt_count")
-            else 0.0
-        ),
-        "total_shadow_old_handoff_ready_count": total("shadow_old_handoff_ready_count"),
+        "total_llm_diagnostic_count": total("llm_diagnostic_count"),
+        "avg_llm_diagnostic_wall_time": avg("llm_diagnostic_wall_time"),
     }
 
 
@@ -285,9 +306,9 @@ def run_experiment(args: argparse.Namespace, cfg: SARRConfig) -> None:
     print(
         "[sarr] controller=pdi_step_window "
         f"t_min={cfg.controller.t_min} "
-        f"q_high={cfg.controller.q_high} "
-        f"q_recover={cfg.controller.q_recover} "
-        "handoff=repair_landing_index "
+        f"slm_high_q={cfg.controller.slm_high_q} "
+        f"slm_recover_q={cfg.controller.slm_recover_q} "
+        "policy=msm_posterior "
         f"final_answer_generator={cfg.generation.final_answer_generator}",
         flush=True,
     )

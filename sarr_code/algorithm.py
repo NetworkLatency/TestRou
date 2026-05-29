@@ -15,7 +15,6 @@ from .controller import (
     MODE_LLM_FINALIZE,
     MODE_LLM_REPAIR,
     MODE_SLM_NORMAL,
-    MODE_SLM_PROBATION,
     MODE_SLM_REENTRY,
     MODE_SLM_TRANSITION,
     OWNER_LLM,
@@ -28,7 +27,7 @@ from .controller import (
 from .records import StepOutput
 
 
-ANSWER_INTENT_TERMINAL_PEEK_TOKENS = 8
+ANSWER_INTENT_TERMINAL_PEEK_TOKENS = 16
 
 
 def _account_generation_cost(
@@ -144,60 +143,6 @@ def _generate_llm_step(
     )
     return output
 
-
-def _generate_self_reentry_candidates(
-    slm,
-    state: GenerationState,
-    cfg: SARRConfig,
-    controller: PDIController,
-) -> list[StepOutput]:
-    outputs: list[StepOutput] = []
-    tentative_prefix = controller.active_text()
-    required_scored_tokens = max(
-        cfg.controller.t_min,
-        cfg.controller.self_reentry_min_scored_tokens or cfg.controller.t_min,
-    )
-    scored_tokens = 0
-
-    for attempt_idx in range(1, cfg.controller.self_reentry_max_attempt_steps + 1):
-        tentative_tokens = sum(_actual_token_count(output) for output in outputs)
-        remaining = cfg.generation.think_token_budget - controller.visible_token_count() - tentative_tokens
-        if remaining <= 0:
-            break
-
-        output = slm.generate_step(
-            state.problem_text,
-            tentative_prefix,
-            max_new_tokens=remaining,
-            stop_delimiters=_stop_strings_for_slm(cfg),
-            capture_token_entropy=False,
-            capture_token_logprobs=True,
-            topk_entropy=cfg.confidence.top_k,
-            immediate_stop_strings=[CLOSE_THINK_TAG],
-        )
-        output.extra["self_reentry_candidate_attempt"] = attempt_idx
-        _account_generation_cost(
-            state,
-            "slm",
-            wall_time=output.wall_time,
-            token_count=_actual_token_count(output),
-            prompt_tokens=output.prompt_tokens,
-        )
-        outputs.append(output)
-
-        generated_logprobs = output.extra.get("generated_token_logprobs")
-        logprob_count = len(generated_logprobs) if isinstance(generated_logprobs, list) else 0
-        scored_tokens += min(output.token_count, logprob_count)
-        tentative_prefix += output.text
-
-        if CLOSE_THINK_TAG in output.text:
-            break
-        if scored_tokens >= required_scored_tokens:
-            break
-        if output.token_count <= 0 or output.finish_reason in {"eos", "length"}:
-            break
-
-    return outputs
 
 
 def _sync_prefix(state: GenerationState, controller: PDIController) -> None:
@@ -374,8 +319,6 @@ def run_sarr_code(
     attempt_id = 1
     stop_reason: str | None = None
     final_answer_row: dict[str, Any] | None = None
-    slm_scoring_wall_time = 0.0
-    slm_scoring_count = 0
 
     try:
         while state.phase != Phase.DONE:
@@ -454,12 +397,19 @@ def run_sarr_code(
                         active_steps = controller.active_steps()
                         diag_prefix = "".join(s.text for s in active_steps if s.step_id < step.step_id)
                         diag = llm.score_suffix_pdi(state.problem_text, diag_prefix, step.text)
+                        state.llm_scoring_wall_time += float(diag.get("wall_time") or 0.0)
+                        state.llm_scoring_calls += 1
+                        state.llm_prefill_tokens += int(diag.get("prompt_tokens") or 0)
                         if diag.get("token_count", 0) > 0:
                             d_llm = float(diag["pdi"])
-                            step.extra["llm_diagnostic_pdi"] = d_llm
-                            state.llm_scoring_wall_time += float(diag.get("wall_time") or 0.0)
-                    except Exception:
-                        pass
+                            step.extra["llm_diagnostic_score"] = {
+                                "pdi": d_llm,
+                                "token_count": diag.get("token_count", 0),
+                                "prompt_tokens": diag.get("prompt_tokens", 0),
+                                "wall_time": diag.get("wall_time", 0.0),
+                            }
+                    except Exception as exc:
+                        step.extra["llm_diagnostic_error"] = str(exc)
 
                 decision = controller.process_transition_window(step, d_llm=d_llm)
                 if step.active:
@@ -493,65 +443,29 @@ def run_sarr_code(
                     stop_reason = "finished"
                     break
 
-                handoff_payload = controller.repair_step_for_handoff(step)
-                if handoff_payload is not None:
-                    prefix_text, suffix_text, _suffix_steps = handoff_payload
-                    handoff_strategy = cfg.controller.handoff_strategy
+                d_llm_repair: float | None = None
+                if cfg.controller.llm_diagnostic_enabled and step.token_count > 0:
+                    try:
+                        active_steps = controller.active_steps()
+                        diag_prefix = "".join(s.text for s in active_steps if s.step_id < step.step_id)
+                        diag = llm.score_suffix_pdi(state.problem_text, diag_prefix, step.text)
+                        state.llm_scoring_wall_time += float(diag.get("wall_time") or 0.0)
+                        state.llm_scoring_calls += 1
+                        state.llm_prefill_tokens += int(diag.get("prompt_tokens") or 0)
+                        if diag.get("token_count", 0) > 0:
+                            d_llm_repair = float(diag["pdi"])
+                            step.extra["llm_repair_self_pdi"] = d_llm_repair
+                    except Exception as exc:
+                        step.extra["llm_repair_self_pdi_error"] = str(exc)
 
-                    # Compute the old suffix score once: the new strategy logs it as a shadow signal,
-                    # while the old strategy still uses it for the handoff decision.
-                    old_slm_side_pdi: float | None = None
-                    old_slm_side_q: float | None = None
-                    if int(step.token_count) > 0:
-                        score = slm.score_suffix_pdi(state.problem_text, prefix_text, suffix_text)
-                        slm_scoring_wall_time += float(score.get("wall_time") or 0.0)
-                        slm_scoring_count += 1
-                        step.extra["slm_side_handoff_score"] = {
-                            "strategy": "latest_llm_step_only",
-                            "pdi": score["pdi"],
-                            "token_count": score["token_count"],
-                            "logprobs": score.get("logprobs", []),
-                            "token_ids": score.get("token_ids", []),
-                            "tokens": score.get("tokens", []),
-                            "token_offsets": score.get("token_offsets", []),
-                            "prompt_tokens": score["prompt_tokens"],
-                            "wall_time": score["wall_time"],
-                            "covered_step_ids": [s.step_id for s in _suffix_steps],
-                        }
-                        if int(score.get("token_count") or 0) > 0 and math_is_finite(score.get("pdi")):
-                            old_slm_side_pdi = float(score["pdi"])
-
-                    if handoff_strategy == "self_reentry_certification":
-                        candidate_outputs = _generate_self_reentry_candidates(slm, state, cfg, controller)
-                        decision = controller.process_self_reentry_candidate(
-                            llm_repair_step=step,
-                            candidate_outputs=candidate_outputs,
-                            old_slm_side_pdi=old_slm_side_pdi,
-                            old_slm_side_q=None,
-                        )
-                        step.action = decision.action
-                        if controller.state.mode == MODE_SLM_REENTRY:
-                            _sync_prefix(state, controller)
-                            continue
-
-                    else:  # repair_landing_index (old method)
-                        if old_slm_side_pdi is not None:
-                            decision = controller.process_handoff_score(step=step, slm_side_pdi=old_slm_side_pdi)
-                            step.action = decision.action
-                            if controller.state.mode == MODE_SLM_REENTRY:
-                                _sync_prefix(state, controller)
-                                continue
-                        else:
-                            controller.reset_handoff_candidate_buffer(step=step, reason="invalid_slm_side_score")
-
-                decision = controller.note_llm_repair_step(step)
+                decision = controller.note_llm_repair_step(step, d_llm=d_llm_repair)
                 step.action = decision.action
                 if controller.state.mode == MODE_LLM_FINALIZE:
                     stop_reason = "llm_finalize"
                     break
                 continue
 
-            if mode in {MODE_SLM_REENTRY, MODE_SLM_PROBATION}:
+            if mode == MODE_SLM_REENTRY:
                 output = _generate_slm_step(slm, state, cfg, remaining_think_tokens=remaining)
                 step = controller.append_step(output, owner=OWNER_SLM, action="SLM_REENTRY_CONTINUE", attempt_id=attempt_id)
                 attempt_id += 1
@@ -632,8 +546,8 @@ def run_sarr_code(
         total_wall_time=total_wall_time,
         slm_wall_time=state.slm_wall_time,
         llm_wall_time=llm_wall_time,
-        slm_scoring_wall_time=slm_scoring_wall_time,
-        slm_scoring_count=slm_scoring_count,
+        llm_diagnostic_wall_time=state.llm_scoring_wall_time,
+        llm_diagnostic_count=state.llm_scoring_calls,
         slm_prefill_count=state.slm_generate_calls,
         llm_prefill_count=state.llm_full_calls,
     )
@@ -646,12 +560,3 @@ def run_sarr_code(
     if final_answer_row is not None:
         step_rows.append(final_answer_row)
     return result, step_rows, controller.events, _step_transition_rows(problem_id, controller.steps)
-
-
-def math_is_finite(value: Any) -> bool:
-    try:
-        import math
-
-        return math.isfinite(float(value))
-    except (TypeError, ValueError):
-        return False

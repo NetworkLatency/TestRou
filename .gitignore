@@ -12,8 +12,5 @@ nohup*.out
 server/vllm_logs
 sarr_results
 self_reentry_results
-<<<<<<< HEAD
 bpa_results
-=======
 router_result
->>>>>>> 3ff25b6bb3eef1bd778e590d2c7a88b46bc8b7d3

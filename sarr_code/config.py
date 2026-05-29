@@ -12,9 +12,24 @@ _DEPRECATED_CONTROLLER_KEYS = {
     "q_handoff_cross",
     "cross_prior_distribution",
     "cross_prior_distribution_path",
+    "q_high",
+    "q_recover",
+    "transition_grace_windows",
+    "r_upper",
+    "eta_upper",
+    "r_handoff",
+    "m_probation",
+    "reentry_transition_grace",
+    "q_low",
+    "r_low",
+    "handoff_strategy",
+    "self_reentry_min_scored_tokens",
     "self_reentry_min_tokens",
+    "self_reentry_max_attempt_steps",
     "self_reentry_max_tokens",
+    "self_reentry_q_threshold",
     "self_reentry_agg_quantile",
+    "commit_self_reentry_step",
 }
 
 
@@ -69,26 +84,45 @@ class ControllerConfig:
     lambda0: float = 3.0
     lambda0_self: float | None = None
     n_min: int = 3
-    q_high: float = 0.90
-    q_recover: float = 0.75
-    transition_grace_windows: int = 2
-    r_upper: int = 2
-    eta_upper: float = 0.50
-    r_handoff: int = 1
-    m_probation: int = 2
+    slm_high_q: float = 0.82
+    slm_recover_q: float = 0.62
     m_reentry: int = 3
-    reentry_transition_grace: int = 2
-    q_low: float = 0.10
-    r_low: int = 2
     max_llm_repair_steps: int = 5
-    handoff_strategy: str = "self_reentry_certification"
-    self_reentry_min_scored_tokens: int | None = None
-    self_reentry_max_attempt_steps: int = 3
-    self_reentry_q_threshold: float = 0.80
-    commit_self_reentry_step: bool = True
+    msm_initial_posterior: dict[str, float] = field(default_factory=lambda: {
+        "stable": 0.82,
+        "transition-risk": 0.12,
+        "llm-beneficial": 0.04,
+        "reentry-ready": 0.02,
+        "jointly-hard": 0.0,
+    })
+    msm_transition_matrix: dict[str, dict[str, float]] = field(default_factory=lambda: {
+        "stable": {"stable": 0.86, "transition-risk": 0.14},
+        "transition-risk": {"stable": 0.18, "llm-beneficial": 0.58, "jointly-hard": 0.24},
+        "llm-beneficial": {"llm-beneficial": 0.72, "reentry-ready": 0.28},
+        "reentry-ready": {"stable": 0.72, "llm-beneficial": 0.28},
+        "jointly-hard": {"jointly-hard": 1.0},
+    })
+    msm_action_thresholds: dict[str, float] = field(default_factory=lambda: {
+        "finalize": 0.55,
+        "llm_repair": 0.45,
+        "transition_watch": 0.40,
+        "handoff_back": 0.45,
+        "slm_continue": 0.45,
+    })
+    msm_emission_floor: float = 0.03
+    msm_jointly_hard_boost: float = 8.0
+    msm_llm_beneficial_boost: float = 8.0
+    msm_reentry_ready_boost: float = 8.0
+    msm_stable_boost: float = 4.0
+    msm_repair_min_steps_before_reentry: int = 2
+    msm_repair_reentry_boost: float = 4.0
+    msm_repair_stable_boost: float = 2.0
     jointly_hard_threshold: float = 0.75
+    delta_llm_beneficial_threshold: float = 0.15
     delta_reentry_threshold: float = -0.15
     llm_diagnostic_enabled: bool = True
+    monotone_finalize_enabled: bool = True
+    repeat_finalize_enabled: bool = True
     prior_distribution: list[float] = field(default_factory=lambda: [0.12, 0.19, 0.29, 0.36])
     prior_distribution_path: str | None = None
     self_prior_distribution: list[float] | None = None
@@ -107,36 +141,58 @@ class ControllerConfig:
             raise ValueError("controller.lambda0_self must be >= 0")
         if self.n_min < 1:
             raise ValueError("controller.n_min must be >= 1")
-        for name in ("q_high", "q_recover", "q_low"):
+        for name in ("slm_high_q", "slm_recover_q"):
             value = getattr(self, name)
             if not 0.0 < float(value) < 1.0:
                 raise ValueError(f"controller.{name} must be in (0, 1)")
-        if self.q_recover >= self.q_high:
-            raise ValueError("controller.q_recover must be lower than controller.q_high")
-        if self.transition_grace_windows < 1:
-            raise ValueError("controller.transition_grace_windows must be >= 1")
-        if self.r_upper < 1:
-            raise ValueError("controller.r_upper must be >= 1")
-        if self.r_handoff < 1:
-            raise ValueError("controller.r_handoff must be >= 1")
-        if self.m_probation < 1:
-            raise ValueError("controller.m_probation must be >= 1")
+        if self.slm_recover_q >= self.slm_high_q:
+            raise ValueError("controller.slm_recover_q must be lower than controller.slm_high_q")
         if self.m_reentry < 1:
             raise ValueError("controller.m_reentry must be >= 1")
-        if self.reentry_transition_grace < 1:
-            raise ValueError("controller.reentry_transition_grace must be >= 1")
-        if self.r_low < 1:
-            raise ValueError("controller.r_low must be >= 1")
         if self.max_llm_repair_steps < 1:
             raise ValueError("controller.max_llm_repair_steps must be >= 1")
-        if self.handoff_strategy not in {"repair_landing_index", "self_reentry_certification"}:
-            raise ValueError("controller.handoff_strategy must be 'repair_landing_index' or 'self_reentry_certification'")
-        if self.self_reentry_min_scored_tokens is not None and self.self_reentry_min_scored_tokens < 1:
-            raise ValueError("controller.self_reentry_min_scored_tokens must be >= 1")
-        if self.self_reentry_max_attempt_steps < 1:
-            raise ValueError("controller.self_reentry_max_attempt_steps must be >= 1")
-        if not 0.0 < self.self_reentry_q_threshold < 1.0:
-            raise ValueError("controller.self_reentry_q_threshold must be in (0, 1)")
+        msm_states = {"stable", "transition-risk", "llm-beneficial", "reentry-ready", "jointly-hard"}
+        if set(self.msm_initial_posterior) != msm_states:
+            raise ValueError("controller.msm_initial_posterior must contain exactly the MSM state keys")
+        if any(float(value) < 0 for value in self.msm_initial_posterior.values()):
+            raise ValueError("controller.msm_initial_posterior values must be non-negative")
+        if sum(float(value) for value in self.msm_initial_posterior.values()) <= 0:
+            raise ValueError("controller.msm_initial_posterior must have positive total mass")
+        if set(self.msm_transition_matrix) != msm_states:
+            raise ValueError("controller.msm_transition_matrix must contain exactly the MSM source state keys")
+        for source, row in self.msm_transition_matrix.items():
+            unknown_targets = set(row) - msm_states
+            if unknown_targets:
+                raise ValueError(f"controller.msm_transition_matrix[{source!r}] has unknown targets: {sorted(unknown_targets)}")
+            if any(float(value) < 0 for value in row.values()):
+                raise ValueError(f"controller.msm_transition_matrix[{source!r}] values must be non-negative")
+            if sum(float(value) for value in row.values()) <= 0:
+                raise ValueError(f"controller.msm_transition_matrix[{source!r}] must have positive total mass")
+        required_actions = {"finalize", "llm_repair", "transition_watch", "handoff_back", "slm_continue"}
+        if set(self.msm_action_thresholds) != required_actions:
+            raise ValueError("controller.msm_action_thresholds must contain finalize, llm_repair, transition_watch, handoff_back, slm_continue")
+        if self.msm_repair_min_steps_before_reentry < 1:
+            raise ValueError("controller.msm_repair_min_steps_before_reentry must be >= 1")
+        for name, value in self.msm_action_thresholds.items():
+            if not 0.0 < float(value) < 1.0:
+                raise ValueError(f"controller.msm_action_thresholds[{name!r}] must be in (0, 1)")
+        for name in (
+            "msm_emission_floor",
+            "msm_jointly_hard_boost",
+            "msm_llm_beneficial_boost",
+            "msm_reentry_ready_boost",
+            "msm_stable_boost",
+            "msm_repair_reentry_boost",
+            "msm_repair_stable_boost",
+        ):
+            if float(getattr(self, name)) <= 0:
+                raise ValueError(f"controller.{name} must be > 0")
+        if self.jointly_hard_threshold <= 0:
+            raise ValueError("controller.jointly_hard_threshold must be > 0")
+        if self.delta_llm_beneficial_threshold < 0:
+            raise ValueError("controller.delta_llm_beneficial_threshold must be >= 0")
+        if self.delta_reentry_threshold > 0:
+            raise ValueError("controller.delta_reentry_threshold must be <= 0")
 
 
 @dataclass

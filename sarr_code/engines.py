@@ -697,6 +697,7 @@ class CompletionEngine:
         self.load()
         rendered_prefix = self.render(problem_text, prefix_text)
         rendered_full = self.render(problem_text, prefix_text + suffix_text)
+        prompt_tokens = len(self.encode(rendered_full))
         start = time.time()
 
         if self.cfg.backend == "vllm":
@@ -706,9 +707,21 @@ class CompletionEngine:
 
         wall_time = time.time() - start
         if not logprobs:
-            return {"pdi": float("inf"), "token_count": 0, "logprobs": [], "wall_time": wall_time}
+            return {
+                "pdi": float("inf"),
+                "token_count": 0,
+                "logprobs": [],
+                "prompt_tokens": prompt_tokens,
+                "wall_time": wall_time,
+            }
         pdi = -sum(logprobs) / len(logprobs)
-        return {"pdi": float(pdi), "token_count": len(logprobs), "logprobs": logprobs, "wall_time": wall_time}
+        return {
+            "pdi": float(pdi),
+            "token_count": len(logprobs),
+            "logprobs": logprobs,
+            "prompt_tokens": prompt_tokens,
+            "wall_time": wall_time,
+        }
 
     def _score_suffix_vllm(self, rendered_prefix: str, rendered_full: str) -> list[float]:
         from vllm import SamplingParams
@@ -736,21 +749,35 @@ class CompletionEngine:
         suffix_len = len(full_ids) - len(prefix_ids)
         if suffix_len <= 0:
             return []
-        response = self._openai_client.completions.create(
-            model=self.cfg.api_model or self.cfg.model_path,
-            prompt=rendered_full,
-            max_tokens=1,
-            temperature=0.0,
-            logprobs=1,
-            echo=True,
-        )
+        kwargs = {
+            "model": self.cfg.api_model or self.cfg.model_path,
+            "prompt": rendered_full,
+            "max_tokens": 0,
+            "temperature": 0.0,
+            "logprobs": 1,
+            "echo": True,
+        }
+        strip_completion_logprob = False
+        try:
+            response = self._openai_client.completions.create(**kwargs)
+        except Exception:
+            kwargs["max_tokens"] = 1
+            strip_completion_logprob = True
+            response = self._openai_client.completions.create(**kwargs)
         choices = list(getattr(response, "choices", []) or [])
         if not choices:
             return []
         logprobs_obj = getattr(choices[0], "logprobs", None)
         token_logprobs = list(getattr(logprobs_obj, "token_logprobs", None) or []) if logprobs_obj else []
-        valid = [lp for lp in token_logprobs if lp is not None]
-        return valid[len(prefix_ids): len(prefix_ids) + suffix_len]
+        if strip_completion_logprob and len(token_logprobs) > len(full_ids):
+            token_logprobs = token_logprobs[: len(full_ids)]
+        target_values = token_logprobs[len(prefix_ids) : len(prefix_ids) + suffix_len]
+        return [
+            parsed
+            for value in target_values
+            for parsed in [_logprob_value(value)]
+            if parsed is not None
+        ]
 
     def _generate_openai(
         self,
