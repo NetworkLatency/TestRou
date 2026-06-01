@@ -89,40 +89,40 @@ class ControllerConfig:
     m_reentry: int = 3
     max_llm_repair_steps: int = 5
     msm_initial_posterior: dict[str, float] = field(default_factory=lambda: {
-        "stable": 0.82,
-        "transition-risk": 0.12,
-        "llm-beneficial": 0.04,
+        "stable": 0.85,
+        "transition-risk": 0.10,
+        "llm-confirmed": 0.03,
         "reentry-ready": 0.02,
-        "jointly-hard": 0.0,
     })
     msm_transition_matrix: dict[str, dict[str, float]] = field(default_factory=lambda: {
         "stable": {"stable": 0.86, "transition-risk": 0.14},
-        "transition-risk": {"stable": 0.18, "llm-beneficial": 0.58, "jointly-hard": 0.24},
-        "llm-beneficial": {"llm-beneficial": 0.72, "reentry-ready": 0.28},
-        "reentry-ready": {"stable": 0.72, "llm-beneficial": 0.28},
-        "jointly-hard": {"jointly-hard": 1.0},
+        "transition-risk": {"stable": 0.76, "llm-confirmed": 0.05, "reentry-ready": 0.19},
+        "llm-confirmed": {"llm-confirmed": 0.72, "reentry-ready": 0.28},
+        "reentry-ready": {"stable": 0.72, "llm-confirmed": 0.28},
     })
     msm_action_thresholds: dict[str, float] = field(default_factory=lambda: {
-        "finalize": 0.55,
         "llm_repair": 0.45,
         "transition_watch": 0.40,
-        "handoff_back": 0.45,
+        "handoff_back": 0.65,
         "slm_continue": 0.45,
     })
     msm_emission_floor: float = 0.03
-    msm_jointly_hard_boost: float = 8.0
     msm_llm_beneficial_boost: float = 8.0
     msm_reentry_ready_boost: float = 8.0
     msm_stable_boost: float = 4.0
+    msm_llm_repair_confirm_steps: int = 1
     msm_repair_min_steps_before_reentry: int = 2
     msm_repair_reentry_boost: float = 4.0
     msm_repair_stable_boost: float = 2.0
-    jointly_hard_threshold: float = 0.75
     delta_llm_beneficial_threshold: float = 0.15
     delta_reentry_threshold: float = -0.15
     llm_diagnostic_enabled: bool = True
-    monotone_finalize_enabled: bool = True
     repeat_finalize_enabled: bool = True
+    step_text_repeat_min_occurrences: int = 3
+    pdi_repeat_window: int = 6
+    msm_trend_alpha: float = 2.0
+    msm_repair_handoff_q_threshold: float = 0.40
+    msm_repair_handoff_decay_factor: float = 0.80
     prior_distribution: list[float] = field(default_factory=lambda: [0.12, 0.19, 0.29, 0.36])
     prior_distribution_path: str | None = None
     self_prior_distribution: list[float] | None = None
@@ -151,7 +151,7 @@ class ControllerConfig:
             raise ValueError("controller.m_reentry must be >= 1")
         if self.max_llm_repair_steps < 1:
             raise ValueError("controller.max_llm_repair_steps must be >= 1")
-        msm_states = {"stable", "transition-risk", "llm-beneficial", "reentry-ready", "jointly-hard"}
+        msm_states = {"stable", "transition-risk", "llm-confirmed", "reentry-ready"}
         if set(self.msm_initial_posterior) != msm_states:
             raise ValueError("controller.msm_initial_posterior must contain exactly the MSM state keys")
         if any(float(value) < 0 for value in self.msm_initial_posterior.values()):
@@ -168,17 +168,18 @@ class ControllerConfig:
                 raise ValueError(f"controller.msm_transition_matrix[{source!r}] values must be non-negative")
             if sum(float(value) for value in row.values()) <= 0:
                 raise ValueError(f"controller.msm_transition_matrix[{source!r}] must have positive total mass")
-        required_actions = {"finalize", "llm_repair", "transition_watch", "handoff_back", "slm_continue"}
+        required_actions = {"llm_repair", "transition_watch", "handoff_back", "slm_continue"}
         if set(self.msm_action_thresholds) != required_actions:
-            raise ValueError("controller.msm_action_thresholds must contain finalize, llm_repair, transition_watch, handoff_back, slm_continue")
+            raise ValueError("controller.msm_action_thresholds must contain llm_repair, transition_watch, handoff_back, slm_continue")
         if self.msm_repair_min_steps_before_reentry < 1:
             raise ValueError("controller.msm_repair_min_steps_before_reentry must be >= 1")
+        if self.step_text_repeat_min_occurrences < 2:
+            raise ValueError("controller.step_text_repeat_min_occurrences must be >= 2")
         for name, value in self.msm_action_thresholds.items():
             if not 0.0 < float(value) < 1.0:
                 raise ValueError(f"controller.msm_action_thresholds[{name!r}] must be in (0, 1)")
         for name in (
             "msm_emission_floor",
-            "msm_jointly_hard_boost",
             "msm_llm_beneficial_boost",
             "msm_reentry_ready_boost",
             "msm_stable_boost",
@@ -187,12 +188,16 @@ class ControllerConfig:
         ):
             if float(getattr(self, name)) <= 0:
                 raise ValueError(f"controller.{name} must be > 0")
-        if self.jointly_hard_threshold <= 0:
-            raise ValueError("controller.jointly_hard_threshold must be > 0")
         if self.delta_llm_beneficial_threshold < 0:
             raise ValueError("controller.delta_llm_beneficial_threshold must be >= 0")
         if self.delta_reentry_threshold > 0:
             raise ValueError("controller.delta_reentry_threshold must be <= 0")
+        if self.msm_trend_alpha < 0:
+            raise ValueError("controller.msm_trend_alpha must be >= 0")
+        if not 0.0 < self.msm_repair_handoff_q_threshold < 1.0:
+            raise ValueError("controller.msm_repair_handoff_q_threshold must be in (0, 1)")
+        if not 0.0 < self.msm_repair_handoff_decay_factor < 1.0:
+            raise ValueError("controller.msm_repair_handoff_decay_factor must be in (0, 1)")
 
 
 @dataclass

@@ -1,20 +1,20 @@
 {
   "method": "pdi_msm_controller_v0",
   "slm": {
-    "model_path": "/home/chenqi/code/Router/models/deepseek-aiDeepSeek-R1-Distill-Qwen-1.5B/",
+    "model_path": "/home/lhyang/Documents/code/reasoning_boundary/models/qwen3-1.7B/",
     "tokenizer_path": null,
-    "chat_template_path": "server/template/deepseekr1.jinja",
-    "device": "cuda:3",
+    "chat_template_path": "server/template/qwen3.jinja",
+    "device": "cuda:1",
     "dtype": "bfloat16",
     "trust_remote_code": true,
     "local_files_only": true,
     "backend": "transformers"
   },
   "llm": {
-    "model_path": "/home/chenqi/code/Router/models/qwen3-4B/",
+    "model_path": "/home/lhyang/Documents/code/reasoning_boundary/models/qwen3-4B/",
     "tokenizer_path": null,
     "chat_template_path": "server/template/qwen3.jinja",
-    "device": "cuda:2",
+    "device": "cuda:0",
     "dtype": "auto",
     "trust_remote_code": true,
     "local_files_only": true,
@@ -28,15 +28,15 @@
   "dataset_paths": {
     "math500": "data/math500.jsonl",
     "aime24": "data/aime24.jsonl",
-    "aime25": "/home/chenqi/code/Router/datasets/aime2025/aime2025.jsonl",
+    "aime25": "/home/lhyang/Documents/code/reasoning_boundary/data/aime2025/aime2025.jsonl",
     "gpqa": "data/gpqa_diamond.jsonl",
     "gpqa_diamond": "data/gpqa_diamond.jsonl"
   },
   "generation": {
-    "think_token_budget": 12288,
-    "answer_token_budget": 4096,
+    "think_token_budget": 8192,
+    "answer_token_budget": 8192,
     "step_delimiters": ["\n\n"],
-    "final_answer_generator": "slm"
+    "final_answer_generator": "llm"
   },
   "controller": {
     "mode": "pdi_step_window_controller",
@@ -44,17 +44,16 @@
     "t_min": 32,
     "lambda0": 3.0,
     "lambda0_self": 3.0,
-    "n_min": 3,
+    "n_min": 1,
     "slm_high_q": 0.82,
     "slm_recover_q": 0.62,
     "m_reentry": 3,
-    "max_llm_repair_steps": 5,
+    "max_llm_repair_steps": 50,
     "msm_initial_posterior": {
-      "stable": 0.82,
-      "transition-risk": 0.12,
-      "llm-beneficial": 0.04,
-      "reentry-ready": 0.02,
-      "jointly-hard": 0.0
+      "stable": 0.85,
+      "transition-risk": 0.1,
+      "llm-confirmed": 0.03,
+      "reentry-ready": 0.02
     },
     "msm_transition_matrix": {
       "stable": {
@@ -62,43 +61,38 @@
         "transition-risk": 0.14
       },
       "transition-risk": {
-        "stable": 0.18,
-        "llm-beneficial": 0.58,
-        "jointly-hard": 0.24
+        "stable": 0.76,
+        "llm-confirmed": 0.05,
+        "reentry-ready": 0.19
       },
-      "llm-beneficial": {
-        "llm-beneficial": 0.72,
+      "llm-confirmed": {
+        "llm-confirmed": 0.72,
         "reentry-ready": 0.28
       },
       "reentry-ready": {
         "stable": 0.72,
-        "llm-beneficial": 0.28
-      },
-      "jointly-hard": {
-        "jointly-hard": 1.0
+        "llm-confirmed": 0.28
       }
     },
     "msm_action_thresholds": {
-      "finalize": 0.55,
       "llm_repair": 0.45,
-      "transition_watch": 0.40,
-      "handoff_back": 0.45,
+      "transition_watch": 0.4,
+      "handoff_back": 0.65,
       "slm_continue": 0.45
     },
     "msm_emission_floor": 0.03,
-    "msm_jointly_hard_boost": 8.0,
     "msm_llm_beneficial_boost": 8.0,
     "msm_reentry_ready_boost": 8.0,
     "msm_stable_boost": 4.0,
-    "msm_repair_min_steps_before_reentry": 2,
+    "msm_repair_min_steps_before_reentry": 1,
     "msm_repair_reentry_boost": 4.0,
     "msm_repair_stable_boost": 2.0,
-    "jointly_hard_threshold": 0.75,
-    "delta_llm_beneficial_threshold": 0.15,
+    "delta_llm_beneficial_threshold": 0.08,
     "delta_reentry_threshold": -0.15,
     "llm_diagnostic_enabled": true,
-    "monotone_finalize_enabled": true,
+
     "repeat_finalize_enabled": true,
+    "step_text_repeat_min_occurrences": 3,
     "prior_distribution": [0.12, 0.19, 0.29, 0.36],
     "prior_distribution_path": null,
     "self_prior_distribution": null,

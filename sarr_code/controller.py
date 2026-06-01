@@ -25,22 +25,19 @@ MODE_LLM_FINALIZE = "LLM_FINALIZE"
 
 MSM_STABLE = "stable"
 MSM_TRANSITION_RISK = "transition-risk"
-MSM_LLM_BENEFICIAL = "llm-beneficial"
+MSM_LLM_CONFIRMED = "llm-confirmed"
 MSM_REENTRY_READY = "reentry-ready"
-MSM_JOINTLY_HARD = "jointly-hard"
 MSM_STATES = (
     MSM_STABLE,
     MSM_TRANSITION_RISK,
-    MSM_LLM_BENEFICIAL,
+    MSM_LLM_CONFIRMED,
     MSM_REENTRY_READY,
-    MSM_JOINTLY_HARD,
 )
 MSM_INITIAL_POSTERIOR = {
     MSM_STABLE: 0.85,
     MSM_TRANSITION_RISK: 0.10,
-    MSM_LLM_BENEFICIAL: 0.03,
+    MSM_LLM_CONFIRMED: 0.03,
     MSM_REENTRY_READY: 0.02,
-    MSM_JOINTLY_HARD: 0.0,
 }
 
 WINDOW_TRUSTED = "trusted"
@@ -142,8 +139,10 @@ class EpisodeState:
     transition_start_window: PDIWindow | None = None
     transition_windows: list[PDIWindow] = field(default_factory=list)
     reentry_stable_count: int = 0
+    reentry_confirm_count: int = 0
     recent_trusted_pdi: list[float] = field(default_factory=list)
-    monotone_decline_pending: int = 0
+    recent_q_percentile: list[float] = field(default_factory=list)
+
     diagnostic_history: list[dict] = field(default_factory=list)
     last_diagnostic: dict = field(default_factory=dict)
     msm_posterior: dict[str, float] = field(default_factory=lambda: dict(MSM_INITIAL_POSTERIOR))
@@ -275,6 +274,10 @@ def has_answer_intent(text: str) -> bool:
     return any(pattern.search(text or "") for pattern in _ANSWER_INTENT_PATTERNS)
 
 
+def _repeat_key(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
 class PDIController:
     def __init__(self, problem_id: str, cfg: ControllerConfig) -> None:
         self.problem_id = problem_id
@@ -290,6 +293,9 @@ class PDIController:
         self._next_window_id = 1
         self._episode_id = 1
         self._repair_step_count = 0
+        self._repair_q_history: list[float] = []
+        self._repair_q_baseline: float | None = None
+        self._transition_llm_repair_count = 0
         self._last_no_valid_pdi_window: dict[str, Any] = {}
         self.state.msm_posterior = self._normalize_msm(self.cfg.msm_initial_posterior)
 
@@ -299,7 +305,6 @@ class PDIController:
         self.handoff_success_count = 0
         self.handoff_failure_count = 0
         self.reentry_failure_count = 0
-        self.monotone_decline_count = 0
         self.step_text_repeat_count = 0
         self.msm_update_count = 0
         self.early_stop_trigger_count = 0
@@ -500,11 +505,12 @@ class PDIController:
         if window not in self.state.trusted_buffer:
             self.state.trusted_buffer.append(window)
             self.state.recent_trusted_pdi.append(window.pdi)
-            self.state.recent_trusted_pdi = self.state.recent_trusted_pdi[-8:]
+            self.state.recent_trusted_pdi = self.state.recent_trusted_pdi[-(2 * self.cfg.pdi_repeat_window):]
 
     def _clear_transition_watch(self) -> None:
         self.state.transition_start_window = None
         self.state.transition_windows = []
+        self._transition_llm_repair_count = 0
 
     def _overlaps_any_window(self, window: PDIWindow, others: list[PDIWindow]) -> bool:
         return any(window.overlaps(other.start_token_idx, other.end_token_idx) for other in others)
@@ -527,8 +533,8 @@ class PDIController:
         q_percentile = self.percentile_rank(window.pdi, cdf)
         upper_excess = self._annotate_window(window, q_percentile)
         self.pdi_decision_count += 1
-
-        pi_after = self._msm_update(step=step, window=window, q_percentile=q_percentile)
+        q_eff = self._compute_q_eff(q_percentile)
+        pi_after = self._msm_update(step=step, window=window, q_percentile=q_eff)
         msm_action = self._msm_suggest_action(pi_after, diagnostic_used=False)
 
         if msm_action in {"llm-repair", "llm-diagnose", "watch"}:
@@ -553,9 +559,11 @@ class PDIController:
             self._switch(next_mode, OWNER_SLM, step_id=step.step_id, reason="trusted_buffer_update")
 
         if self.state.mode != MODE_COLD_START:
-            if self.cfg.monotone_finalize_enabled and self._check_monotone_decline(step):
-                action = "MONOTONE_PDI_DECLINE_FINALIZE"
-            elif self.cfg.repeat_finalize_enabled and not self.answer_intent_seen and self._check_step_text_repeat(step):
+            if (
+                self.cfg.repeat_finalize_enabled
+                and not self.answer_intent_seen
+                and self._check_step_text_repeat(step)
+            ):
                 action = "STEP_TEXT_REPEAT_FINALIZE"
 
         self._log_pdi_decision(step=step, window=window, mode=mode_at_decision, action=action, cdf=cdf)
@@ -578,10 +586,12 @@ class PDIController:
         if d_llm is not None:
             self.record_diagnostic(step, window.pdi, q_percentile, d_llm)
 
-        pi_after = self._msm_update(step=step, window=window, q_percentile=q_percentile, d_llm=d_llm)
+        q_eff = self._compute_q_eff(q_percentile)
+        pi_after = self._msm_update(step=step, window=window, q_percentile=q_eff, d_llm=d_llm)
         msm_action = self._msm_suggest_action(pi_after, diagnostic_used=d_llm is not None)
 
         if msm_action == "slm-continue" or msm_action == "handoff-back":
+            self._transition_llm_repair_count = 0
             if not self._overlaps_any_window(window, self.state.transition_windows[:-1]):
                 self._add_trusted_window(window)
             self._clear_transition_watch()
@@ -591,15 +601,8 @@ class PDIController:
             self._log_pdi_decision(step=step, window=window, mode=mode_at_decision, action=action, cdf=cdf)
             return ControllerDecision(action=action, step=step, window=window, q_percentile=q_percentile, upper_excess=upper_excess)
 
-        if msm_action == "finalize":
-            alarm = self.state.transition_start_window
-            rollback_start = alarm.start_token_idx if alarm is not None else window.start_token_idx
-            action = "JOINTLY_HARD_FINALIZE"
-            self._log_pdi_decision(step=step, window=window, mode=mode_at_decision, action=action, cdf=cdf, rollback_start_token_idx=rollback_start)
-            self._switch(MODE_FINALIZE, self.state.owner, step_id=step.step_id, reason="jointly_hard")
-            return ControllerDecision(action=action, step=step, window=window, q_percentile=q_percentile, upper_excess=upper_excess)
-
         if msm_action == "llm-repair":
+            self._transition_llm_repair_count = 0
             alarm = self.state.transition_start_window
             if alarm is None:
                 raise InvalidControllerState("SLM transition failed without a transition start window.")
@@ -640,12 +643,6 @@ class PDIController:
             self.handoff_failure_count += 1
             return ControllerDecision(action=action, step=step, window=window, q_percentile=q_percentile, upper_excess=upper_excess, rollback_start_token_idx=rollback_start, reentry_status="failed")
 
-        if msm_action == "finalize":
-            action = "JOINTLY_HARD_FINALIZE"
-            self._switch(MODE_FINALIZE, self.state.owner, step_id=step.step_id, reason="jointly_hard_reentry")
-            self._log_pdi_decision(step=step, window=window, mode=mode_at_decision, action=action, cdf=cdf)
-            return ControllerDecision(action=action, step=step, window=window, q_percentile=q_percentile, upper_excess=upper_excess)
-
         self.state.reentry_stable_count += 1
         self._add_trusted_window(window)
         action = "SLM_REENTRY_CONTINUE"
@@ -680,6 +677,18 @@ class PDIController:
                 predicted[target] += source_prob * transition_prob
         return self._normalize_msm(predicted)
 
+    def _compute_q_eff(self, q_percentile: float) -> float:
+        k = 4
+        hist = self.state.recent_q_percentile
+        hist.append(q_percentile)
+        self.state.recent_q_percentile = hist[-k:]
+        if len(self.state.recent_q_percentile) < k:
+            return q_percentile
+        vals = self.state.recent_q_percentile
+        mean_q = sum(vals) / k
+        trend_q = (vals[-1] - vals[0]) / (k - 1)
+        return min(1.0, max(0.0, mean_q + float(self.cfg.msm_trend_alpha) * max(0.0, trend_q)))
+
     def _msm_emission_likelihood(
         self,
         *,
@@ -692,9 +701,8 @@ class PDIController:
         likelihood = {
             MSM_STABLE: max(floor, 1.0 - q),
             MSM_TRANSITION_RISK: max(floor, q),
-            MSM_LLM_BENEFICIAL: max(floor, q),
+            MSM_LLM_CONFIRMED: floor,
             MSM_REENTRY_READY: max(floor, 1.0 - q),
-            MSM_JOINTLY_HARD: max(floor, 0.20 * q),
         }
         if d_llm is None:
             return likelihood
@@ -708,38 +716,23 @@ class PDIController:
 
         delta = d_slm_value - d_llm_value
         slm_high = q > self.cfg.slm_high_q
-        llm_high = d_llm_value > self.cfg.jointly_hard_threshold
-        if slm_high and llm_high:
-            likelihood[MSM_JOINTLY_HARD] *= self.cfg.msm_jointly_hard_boost
-            likelihood[MSM_TRANSITION_RISK] *= 0.70
-            likelihood[MSM_LLM_BENEFICIAL] *= 0.50
-            likelihood[MSM_STABLE] *= 0.15
-            likelihood[MSM_REENTRY_READY] *= 0.20
-        elif slm_high and delta > self.cfg.delta_llm_beneficial_threshold:
-            likelihood[MSM_LLM_BENEFICIAL] *= self.cfg.msm_llm_beneficial_boost
+        if slm_high:
+            likelihood[MSM_LLM_CONFIRMED] = max(floor, q) * self.cfg.msm_llm_beneficial_boost
             likelihood[MSM_TRANSITION_RISK] *= 1.50
             likelihood[MSM_STABLE] *= 0.20
             likelihood[MSM_REENTRY_READY] *= 0.20
-            likelihood[MSM_JOINTLY_HARD] *= 0.40
         elif delta < self.cfg.delta_reentry_threshold:
             likelihood[MSM_REENTRY_READY] *= self.cfg.msm_reentry_ready_boost
             likelihood[MSM_STABLE] *= 1.50
             likelihood[MSM_TRANSITION_RISK] *= 0.40
-            likelihood[MSM_LLM_BENEFICIAL] *= 0.20
-            likelihood[MSM_JOINTLY_HARD] *= 0.20
-        elif not slm_high and not llm_high:
-            likelihood[MSM_STABLE] *= self.cfg.msm_stable_boost
-            likelihood[MSM_TRANSITION_RISK] *= 0.50
         return likelihood
 
     def _msm_suggest_action(self, posterior: dict[str, float], *, diagnostic_used: bool) -> str:
         thresholds = self.cfg.msm_action_thresholds
-        if posterior[MSM_JOINTLY_HARD] >= thresholds["finalize"]:
-            return "finalize"
-        if posterior[MSM_LLM_BENEFICIAL] >= thresholds["llm_repair"]:
+        if posterior[MSM_LLM_CONFIRMED] >= thresholds["llm_repair"]:
             return "llm-repair"
         if posterior[MSM_TRANSITION_RISK] >= thresholds["transition_watch"]:
-            return "watch" if diagnostic_used or not self.cfg.llm_diagnostic_enabled else "llm-diagnose"
+            return "watch"
         if posterior[MSM_REENTRY_READY] >= thresholds["handoff_back"]:
             return "handoff-back"
         if posterior[MSM_STABLE] >= thresholds["slm_continue"]:
@@ -777,11 +770,8 @@ class PDIController:
         delta = d_slm - d_llm
         slm_high = q_slm > self.cfg.slm_high_q
         slm_recovered = q_slm <= self.cfg.slm_recover_q
-        llm_high = d_llm > self.cfg.jointly_hard_threshold
-        if slm_high and llm_high:
-            return "jointly_hard"
         if slm_high and delta > self.cfg.delta_llm_beneficial_threshold:
-            return "llm_beneficial"
+            return "llm_confirmed"
         if (slm_recovered or not slm_high) and delta < self.cfg.delta_reentry_threshold:
             return "reentry_ready"
         if slm_high:
@@ -798,7 +788,6 @@ class PDIController:
             "d_llm": d_llm,
             "delta": delta,
             "zone": zone,
-            "jointly_hard_threshold": self.cfg.jointly_hard_threshold,
             "delta_llm_beneficial_threshold": self.cfg.delta_llm_beneficial_threshold,
             "delta_reentry_threshold": self.cfg.delta_reentry_threshold,
         }
@@ -807,67 +796,61 @@ class PDIController:
         self.events.append({"problem_id": self.problem_id, "event": "dual_model_diagnostic", **record})
         return zone
 
-    def _check_monotone_decline(self, step: Step) -> bool:
-        """Detect persistent monotone PDI decline (degeneration / repetition loop).
-
-        Requires K=6 consecutive strictly-decreasing trusted windows, then 1 confirmation
-        window that is also lower than the last of those 6. Returns True and triggers
-        FINALIZE when confirmed; returns True on the confirmation step.
-        """
-        K = 6
+    def _check_pdi_repeat_candidate(self, step: Step) -> bool:
+        K = self.cfg.pdi_repeat_window
         hist = self.state.recent_trusted_pdi
-        if self.state.monotone_decline_pending > 0:
-            # confirmation step: current window must still be declining
-            if len(hist) >= 2 and hist[-1] < hist[-2]:
-                self.state.monotone_decline_pending = 0
-                self.monotone_decline_count += 1
-                self.events.append({
-                    "problem_id": self.problem_id,
-                    "event": "monotone_pdi_decline_confirmed",
-                    "step_id": step.step_id,
-                    "recent_pdi": list(hist),
-                })
-                self._switch(MODE_FINALIZE, self.state.owner, step_id=step.step_id, reason="monotone_pdi_decline")
-                return True
-            else:
-                self.state.monotone_decline_pending = 0
+        if len(hist) < 2 * K:
             return False
-
-        if len(hist) < K:
-            return False
-        window_k = hist[-K:]
-        if all(window_k[i] > window_k[i + 1] for i in range(K - 1)):
-            self.state.monotone_decline_pending = 1
+        first = hist[-2 * K:-K]
+        second = hist[-K:]
+        std = (sum((v - sum(hist[-2*K:]) / (2*K)) ** 2 for v in hist[-2*K:]) / (2*K)) ** 0.5
+        eps = max(1e-6, std * 0.5)
+        if all(abs(a - b) < eps for a, b in zip(first, second)):
+            self.events.append({
+                "problem_id": self.problem_id,
+                "event": "pdi_repeat_candidate",
+                "step_id": step.step_id,
+                "recent_pdi": list(hist[-2 * K:]),
+            })
+            return True
         return False
 
     def _check_step_text_repeat(self, step: Step) -> bool:
-        pdi_hist = self.state.recent_trusted_pdi
-        # Phase 1: PDI oscillation trigger — need >=6 recent values all below 0.30,
-        # with a repeating sign pattern of period 2 or 3.
-        if len(pdi_hist) < 6:
+        current_key = _repeat_key(step.text)
+        if not current_key:
             return False
-        tail = pdi_hist[-6:]
-        if max(tail) >= 0.30:
-            return False
-        signs = [1 if tail[i + 1] > tail[i] else -1 for i in range(len(tail) - 1)]
-        period_detected = (
-            signs[:2] == signs[2:4] == signs[4:]  # period-2: 2 full cycles in 5 diffs
-            or signs[:3] == signs[3:]              # period-3: 2 full cycles in 6 diffs
-        )
-        if not period_detected:
-            return False
-        # Phase 2: text repeat confirmation
         active = self.active_steps()
-        recent_texts = [s.text for s in active[-6:] if s.text]
-        if len(recent_texts) < 4 or len(set(recent_texts)) == len(recent_texts):
+        previous = [
+            (item.step_id, _repeat_key(item.text))
+            for item in active[-8:]
+            if item.step_id != step.step_id and _repeat_key(item.text)
+        ]
+        repeated_step_ids = [step_id for step_id, text_key in previous if text_key == current_key]
+        if not repeated_step_ids:
+            return False
+        occurrence_count = len(repeated_step_ids) + 1
+        if occurrence_count < self.cfg.step_text_repeat_min_occurrences:
+            self.events.append({
+                "problem_id": self.problem_id,
+                "event": "step_text_repeat_observed",
+                "step_id": step.step_id,
+                "recent_pdi": list(self.state.recent_trusted_pdi),
+                "repeat_key": current_key,
+                "repeated_step_ids": repeated_step_ids,
+                "occurrence_count": occurrence_count,
+                "min_occurrences": self.cfg.step_text_repeat_min_occurrences,
+            })
             return False
         self.step_text_repeat_count += 1
         self.events.append({
             "problem_id": self.problem_id,
             "event": "step_text_repeat_detected",
             "step_id": step.step_id,
-            "recent_pdi": list(tail),
-            "unique_text_count": len(set(recent_texts)),
+            "recent_pdi": list(self.state.recent_trusted_pdi),
+            "repeat_key": current_key,
+            "repeated_step_ids": repeated_step_ids,
+            "occurrence_count": occurrence_count,
+            "min_occurrences": self.cfg.step_text_repeat_min_occurrences,
         })
         self._switch(MODE_FINALIZE, self.state.owner, step_id=step.step_id, reason="step_text_repeat")
         return True
@@ -878,27 +861,46 @@ class PDIController:
         if d_llm is not None and self._repair_step_count >= self.cfg.msm_repair_min_steps_before_reentry:
             ref_cdf = self.effective_cdf()
             q_llm_as_slm = ref_cdf(d_llm)
+            self._repair_q_history.append(q_llm_as_slm)
+            self._repair_q_history = self._repair_q_history[-2:]
+            if self._repair_q_baseline is None and len(self._repair_q_history) >= self.cfg.msm_repair_min_steps_before_reentry:
+                self._repair_q_baseline = sum(self._repair_q_history) / len(self._repair_q_history)
             floor = float(self.cfg.msm_emission_floor)
             likelihood = {
                 MSM_STABLE: max(floor, 1.0 - q_llm_as_slm) * self.cfg.msm_repair_stable_boost,
                 MSM_TRANSITION_RISK: max(floor, q_llm_as_slm) * 0.5,
-                MSM_LLM_BENEFICIAL: max(floor, q_llm_as_slm) * 0.5,
+                MSM_LLM_CONFIRMED: max(floor, q_llm_as_slm) * 0.5,
                 MSM_REENTRY_READY: max(floor, 1.0 - q_llm_as_slm) * self.cfg.msm_repair_reentry_boost,
-                MSM_JOINTLY_HARD: 0.05,
             }
             pi_before = self._normalize_msm(self.state.msm_posterior)
             pi_pred = self._msm_predict(pi_before)
             pi_after = self._normalize_msm({s: pi_pred[s] * likelihood[s] for s in MSM_STATES})
             self.state.msm_posterior = pi_after
+            sorted_q = sorted(self._repair_q_history)
+            n = len(sorted_q)
+            median_q_llm = (sorted_q[n // 2] + sorted_q[(n - 1) // 2]) / 2
+            handoff_threshold = (
+                self._repair_q_baseline * self.cfg.msm_repair_handoff_decay_factor
+                if self._repair_q_baseline is not None
+                else self.cfg.msm_repair_handoff_q_threshold
+            )
             self.events.append({
                 "problem_id": self.problem_id,
                 "event": "msm_llm_repair_update",
                 "step_id": step.step_id,
                 "d_llm": d_llm,
                 "q_llm_as_slm": q_llm_as_slm,
+                "median_q_llm": median_q_llm,
+                "repair_q_baseline": self._repair_q_baseline,
+                "handoff_threshold": handoff_threshold,
                 "pi_after": pi_after,
             })
-            if pi_after[MSM_REENTRY_READY] >= self.cfg.msm_action_thresholds["handoff_back"]:
+            if median_q_llm <= handoff_threshold:
+                self.state.reentry_confirm_count += 1
+            else:
+                self.state.reentry_confirm_count = 0
+            if self.state.reentry_confirm_count >= 1:
+                self.state.reentry_confirm_count = 0
                 self.handoff_success_count += 1
                 self.state.handoff_point_token_idx = self.visible_token_count()
                 self._reset_evidence_histories()
@@ -949,8 +951,10 @@ class PDIController:
         self._new_episode()
         self.llm_repair_episodes += 1
         self._repair_step_count = 0
+        self._repair_q_history = []
+        self._repair_q_baseline = None
         self.state.recent_trusted_pdi = []
-        self.state.monotone_decline_pending = 0
+        self.state.recent_q_percentile = []
         self._switch(MODE_LLM_REPAIR, OWNER_LLM, step_id=None, reason=reason)
         self.events.append(
             {
@@ -1018,12 +1022,7 @@ class PDIController:
                 self.reentry_failure_count / self.handoff_success_count if self.handoff_success_count else 0.0
             ),
             "early_stop_trigger_count": self.early_stop_trigger_count,
-            "monotone_decline_count": self.monotone_decline_count,
             "step_text_repeat_count": self.step_text_repeat_count,
-            "jointly_hard_count": sum(
-                1 for e in self.events
-                if e.get("event") == "dual_model_diagnostic" and e.get("zone") == "jointly_hard"
-            ),
             "diagnostic_count": sum(1 for e in self.events if e.get("event") == "dual_model_diagnostic"),
             "msm_update_count": self.msm_update_count,
             "msm_final_posterior": dict(self.state.msm_posterior),
@@ -1062,19 +1061,18 @@ class PDIController:
                 "msm_transition_matrix": self.cfg.msm_transition_matrix,
                 "msm_action_thresholds": self.cfg.msm_action_thresholds,
                 "msm_emission_floor": self.cfg.msm_emission_floor,
-                "msm_jointly_hard_boost": self.cfg.msm_jointly_hard_boost,
                 "msm_llm_beneficial_boost": self.cfg.msm_llm_beneficial_boost,
                 "msm_reentry_ready_boost": self.cfg.msm_reentry_ready_boost,
                 "msm_stable_boost": self.cfg.msm_stable_boost,
                 "msm_repair_min_steps_before_reentry": self.cfg.msm_repair_min_steps_before_reentry,
                 "msm_repair_reentry_boost": self.cfg.msm_repair_reentry_boost,
                 "msm_repair_stable_boost": self.cfg.msm_repair_stable_boost,
-                "jointly_hard_threshold": self.cfg.jointly_hard_threshold,
                 "delta_llm_beneficial_threshold": self.cfg.delta_llm_beneficial_threshold,
                 "delta_reentry_threshold": self.cfg.delta_reentry_threshold,
                 "llm_diagnostic_enabled": self.cfg.llm_diagnostic_enabled,
-                "monotone_finalize_enabled": self.cfg.monotone_finalize_enabled,
                 "repeat_finalize_enabled": self.cfg.repeat_finalize_enabled,
+                "step_text_repeat_min_occurrences": self.cfg.step_text_repeat_min_occurrences,
+                "pdi_repeat_window": self.cfg.pdi_repeat_window,
             },
         }
 

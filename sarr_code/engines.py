@@ -339,9 +339,9 @@ class LocalTransformersSLM:
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=max_tokens,
-                do_sample=False,
-                temperature=None,
-                top_p=None,
+                do_sample=True,
+                temperature=0.6,
+                top_p=0.95,
                 pad_token_id=pad_token_id,
                 eos_token_id=eos_token_id,
                 stopping_criteria=stopping,
@@ -841,7 +841,8 @@ class CompletionEngine:
     ) -> StepOutput:
         sampling_kwargs: dict[str, Any] = {
             "max_tokens": max_tokens,
-            "temperature": 0.0,
+            "temperature": 0.6,
+            "top_p": 0.95,
             "stop": stop,
             "include_stop_str_in_output": include_stop_str_in_output,
         }

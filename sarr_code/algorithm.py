@@ -518,7 +518,9 @@ def run_sarr_code(
     answer = None
     final_answer_generator = None
     if stop_reason != "context_budget":
-        final_generator = "llm" if controller.state.mode == MODE_LLM_FINALIZE else cfg.generation.final_answer_generator
+        final_generator = "llm" if controller.state.mode == MODE_LLM_FINALIZE else (
+            "slm" if controller.answer_intent_seen else "llm"
+        )
         try:
             answer, final_answer_generator, final_answer_row = _append_final_answer(
                 problem_id=problem_id,
