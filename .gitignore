@@ -3,8 +3,18 @@
 .vscode
 .ssh
 .DS_Store
+
+# Python generated files
 *.pyc
+*.pyo
+*.pyd
 __pycache__/
+**/__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 data/lcbv5/
 data/lcbv6/
@@ -12,6 +22,5 @@ nohup*.out
 server/vllm_logs
 sarr_results
 self_reentry_results
-bpa_results
 router_result
 sarr_results_smoke_35/

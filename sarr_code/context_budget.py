@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from bpa.config import BPAConfig
-
 
 CONTEXT_LENGTH_SAFETY_MARGIN = 8
 
@@ -28,11 +26,12 @@ class ContextBudgetExceeded(RuntimeError):
 def generation_budget_for_rendered(
     rendered_prompt: str,
     engine: Any,
-    config: BPAConfig,
+    runtime: Any,
     requested_max_tokens: int,
 ) -> tuple[int, int]:
     prompt_tokens = len(engine.encode(rendered_prompt))
-    available_tokens = config.max_model_len - prompt_tokens - CONTEXT_LENGTH_SAFETY_MARGIN
+    max_model_len = int(runtime.max_model_len)
+    available_tokens = max_model_len - prompt_tokens - CONTEXT_LENGTH_SAFETY_MARGIN
     if available_tokens <= 0:
-        raise ContextBudgetExceeded(prompt_tokens=prompt_tokens, max_model_len=config.max_model_len)
+        raise ContextBudgetExceeded(prompt_tokens=prompt_tokens, max_model_len=max_model_len)
     return min(int(requested_max_tokens), available_tokens), prompt_tokens

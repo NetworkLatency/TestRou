@@ -39,7 +39,7 @@ def build_problem_text(problem: dict, dataset_name: str) -> str:
         prompt = problem.get("prompt") or problem.get("problem") or ""
         return (
             "Write Python code to solve the following programming task. "
-            "HumanEval execution evaluation is not implemented in BPA v2.1 first pass.\n\n"
+            "HumanEval execution evaluation is not implemented for this SARR runner.\n\n"
             f"{prompt}"
         )
     raise ValueError(f"Unsupported dataset: {dataset_name}")

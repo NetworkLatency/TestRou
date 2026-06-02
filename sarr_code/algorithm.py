@@ -3,12 +3,8 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from bpa.context_budget import ContextBudgetExceeded
-from bpa.safety import CLOSE_THINK_TAG, extract_answer_from_final_step, has_close_think_tag
-from bpa.state import GenerationState, Phase, TraceEvent
-from bpa.trace import BPAResult
-
 from .config import SARRConfig
+from .context_budget import ContextBudgetExceeded
 from .controller import (
     MODE_COLD_START,
     MODE_FINALIZE,
@@ -25,6 +21,9 @@ from .controller import (
     has_answer_intent,
 )
 from .records import StepOutput
+from .safety import CLOSE_THINK_TAG, extract_answer_from_final_step, has_close_think_tag
+from .state import GenerationState, Phase, TraceEvent
+from .trace import SARRResult
 
 
 ANSWER_INTENT_TERMINAL_PEEK_TOKENS = 16
@@ -312,7 +311,7 @@ def run_sarr_code(
     slm,
     llm,
     cfg: SARRConfig,
-) -> tuple[BPAResult, list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[SARRResult, list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     state = GenerationState(problem_text=problem_text, generation_protocol=cfg.method)
     start_time = time.time()
     controller = PDIController(problem_id, cfg.controller)
@@ -557,7 +556,7 @@ def run_sarr_code(
     state.trace.append(TraceEvent(state.step_count, "pdi_windows", {"windows": controller.serialize_windows()}))
     state.trace.append(TraceEvent(state.step_count, "controller_events", {"events": controller.events}))
 
-    result = BPAResult(answer=answer, state=state, total_wall_time=total_wall_time)
+    result = SARRResult(answer=answer, state=state, total_wall_time=total_wall_time)
     step_rows = controller.serialize_steps()
     if final_answer_row is not None:
         step_rows.append(final_answer_row)

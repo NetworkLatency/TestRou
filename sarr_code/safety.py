@@ -1,97 +1,15 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
-from typing import Any, Optional
-
-from .state import RepetitionState
+from typing import Optional
 
 
 CLOSE_THINK_TAG = "</think>"
 OPEN_THINK_TAG = "<think>"
 
 
-def captured_close_think_prefix(text: str) -> str:
-    idx = text.find(CLOSE_THINK_TAG)
-    if idx < 0:
-        return ""
-    return text[: idx + len(CLOSE_THINK_TAG)]
-
-
 def has_close_think_tag(text: str) -> bool:
     return CLOSE_THINK_TAG in text
-
-
-def ensure_step_terminator(step_text: str, finish_reason: str) -> str:
-    if finish_reason == "eos":
-        return step_text
-    if not step_text.endswith("\n\n"):
-        return step_text + "\n\n"
-    return step_text
-
-
-def update_repetition(
-    rep: RepetitionState,
-    new_step_text: str,
-    ngram_size: int = 8,
-    ngram_threshold: int = 4,
-) -> str | None:
-    normalized = new_step_text.rstrip("\n").rstrip()
-    if len(normalized) < 10:
-        rep.recent_steps.append(normalized)
-        return None
-
-    if rep.recent_steps and rep.recent_steps[-1] == normalized:
-        rep.triggered = True
-        rep.trigger_reason = "duplicate_step"
-        return "duplicate_step"
-
-    if len(rep.recent_steps) >= 2 and rep.recent_steps[-2] == normalized:
-        rep.triggered = True
-        rep.trigger_reason = "alternating_step"
-        return "alternating_step"
-
-    rep.recent_steps.append(normalized)
-
-    if len(normalized) >= ngram_size:
-        for i in range(len(normalized) - ngram_size + 1):
-            ng = normalized[i : i + ngram_size]
-            rep.ngram_counter[ng] += 1
-            if rep.ngram_counter[ng] >= ngram_threshold:
-                rep.triggered = True
-                rep.trigger_reason = "ngram_repeat"
-                return "ngram_repeat"
-    return None
-
-
-def update_strict_step_repetition(rep: RepetitionState, new_step_text: str, min_chars: int = 10) -> str | None:
-    normalized = new_step_text.rstrip("\n").rstrip()
-    if len(normalized) < min_chars:
-        rep.recent_steps.append(normalized)
-        return None
-
-    if rep.recent_steps and rep.recent_steps[-1] == normalized:
-        rep.triggered = True
-        rep.trigger_reason = "duplicate_step"
-        return "duplicate_step"
-
-    if len(rep.recent_steps) >= 2 and rep.recent_steps[-2] == normalized:
-        rep.triggered = True
-        rep.trigger_reason = "alternating_step"
-        return "alternating_step"
-
-    rep.recent_steps.append(normalized)
-    return None
-
-
-def normalize_step_skeleton(step_text: str, *, max_chars: int = 180) -> str:
-    text = str(step_text or "").lower()
-    text = re.sub(r"</?think>", " ", text)
-    text = re.sub(r"\\[a-zA-Z]+", " ", text)
-    text = re.sub(r"[-+]?\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?", "#", text)
-    text = re.sub(r"[^a-z0-9#]+", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text[:max_chars].strip()
 
 
 def extract_last_boxed(text: Optional[str]) -> Optional[str]:
@@ -304,22 +222,3 @@ def extract_answer_from_final_step(final_step_text: Optional[str]) -> str | None
     if labeled is not None:
         return labeled
     return clean_latex_answer(final_step_text)
-
-
-def extract_answer_from_steps(
-    step_logs: Iterable[dict[str, Any]],
-    assistant_text: Optional[str] = None,
-) -> str | None:
-    steps = list(step_logs)
-    if steps:
-        return extract_answer_from_final_step(steps[-1].get("step_text"))
-    return extract_answer_from_final_step(assistant_text)
-
-
-def extract_answer(assistant_text: str) -> str | None:
-    boxed = extract_last_boxed(assistant_text)
-    if boxed is not None:
-        return clean_latex_answer(boxed)
-    if CLOSE_THINK_TAG in assistant_text:
-        return clean_latex_answer(assistant_text.split(CLOSE_THINK_TAG, 1)[1])
-    return clean_latex_answer(assistant_text)

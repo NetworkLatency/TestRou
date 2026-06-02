@@ -502,9 +502,9 @@ def compute_full_vocab_checkpoints(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     import torch
 
-    from bpa.render import render_for_continuation
     from sarr_code import SARRConfig
     from sarr_code.engines import LocalTransformersSLM
+    from sarr_code.render import render_for_continuation
 
     cfg = SARRConfig.from_json(config_path)
     slm = LocalTransformersSLM(cfg.slm, cfg.runtime).load()

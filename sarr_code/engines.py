@@ -5,16 +5,15 @@ import os
 import sys
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from bpa.context_budget import generation_budget_for_rendered
-from bpa.render import render_for_continuation
-
 from .config import ModelRuntimeConfig, RuntimeConfig
+from .context_budget import generation_budget_for_rendered
 from .records import StepOutput
+from .render import render_for_continuation
 
 
 def _hf_source(path: str) -> str:

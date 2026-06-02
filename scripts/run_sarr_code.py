@@ -15,11 +15,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from bpa.eval.benchmark_eval import benchmark_eval_match
-from bpa.eval.datasets import load_eval_dataset
-from bpa.eval.main_benchmark import build_summary_metrics, load_summary_rows, write_summary_files
-from bpa.trace import result_summary, write_json, write_jsonl
 from sarr_code import SARRConfig, run_sarr_code
+from sarr_code.eval import benchmark_eval_match, build_summary_metrics, load_eval_dataset, load_summary_rows, write_summary_files
+from sarr_code.trace import result_summary, write_json, write_jsonl
 
 
 MATH_DATASETS = {"math500", "aime24", "aime25"}
@@ -268,10 +266,6 @@ def _write_summary(summary_path: Path, dataset: str, variant: str, rows: list[di
     write_summary_files(summary_path, rows, metrics)
 
 
-def _validate_ownership_config(_cfg: SARRConfig) -> None:
-    pass
-
-
 def run_experiment(args: argparse.Namespace, cfg: SARRConfig) -> None:
     variant = args.variant or DEFAULT_VARIANT
     output_root = Path(args.output_root) if args.output_root else Path(cfg.output_dir)
@@ -302,7 +296,6 @@ def run_experiment(args: argparse.Namespace, cfg: SARRConfig) -> None:
             if str(problem.problem_id) in rows_by_problem_id
         ]
 
-    _validate_ownership_config(cfg)
     print(
         "[sarr] controller=pdi_step_window "
         f"t_min={cfg.controller.t_min} "
