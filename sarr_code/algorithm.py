@@ -443,19 +443,16 @@ def run_sarr_code(
                     break
 
                 d_llm_repair: float | None = None
-                if cfg.controller.llm_diagnostic_enabled and step.token_count > 0:
+                if step.token_count > 0:
                     try:
                         active_steps = controller.active_steps()
                         diag_prefix = "".join(s.text for s in active_steps if s.step_id < step.step_id)
-                        diag = llm.score_suffix_pdi(state.problem_text, diag_prefix, step.text)
-                        state.llm_scoring_wall_time += float(diag.get("wall_time") or 0.0)
-                        state.llm_scoring_calls += 1
-                        state.llm_prefill_tokens += int(diag.get("prompt_tokens") or 0)
+                        diag = slm.score_suffix_pdi(state.problem_text, diag_prefix, step.text)
                         if diag.get("token_count", 0) > 0:
                             d_llm_repair = float(diag["pdi"])
-                            step.extra["llm_repair_self_pdi"] = d_llm_repair
+                            step.extra["slm_on_llm_pdi"] = d_llm_repair
                     except Exception as exc:
-                        step.extra["llm_repair_self_pdi_error"] = str(exc)
+                        step.extra["slm_on_llm_pdi_error"] = str(exc)
 
                 decision = controller.note_llm_repair_step(step, d_llm=d_llm_repair)
                 step.action = decision.action

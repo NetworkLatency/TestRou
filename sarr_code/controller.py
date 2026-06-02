@@ -294,7 +294,6 @@ class PDIController:
         self._episode_id = 1
         self._repair_step_count = 0
         self._repair_q_history: list[float] = []
-        self._repair_q_baseline: float | None = None
         self._transition_llm_repair_count = 0
         self._last_no_valid_pdi_window: dict[str, Any] = {}
         self.state.msm_posterior = self._normalize_msm(self.cfg.msm_initial_posterior)
@@ -862,9 +861,7 @@ class PDIController:
             ref_cdf = self.effective_cdf()
             q_llm_as_slm = ref_cdf(d_llm)
             self._repair_q_history.append(q_llm_as_slm)
-            self._repair_q_history = self._repair_q_history[-2:]
-            if self._repair_q_baseline is None and len(self._repair_q_history) >= self.cfg.msm_repair_min_steps_before_reentry:
-                self._repair_q_baseline = sum(self._repair_q_history) / len(self._repair_q_history)
+            self._repair_q_history = self._repair_q_history[-4:]
             floor = float(self.cfg.msm_emission_floor)
             likelihood = {
                 MSM_STABLE: max(floor, 1.0 - q_llm_as_slm) * self.cfg.msm_repair_stable_boost,
@@ -879,11 +876,7 @@ class PDIController:
             sorted_q = sorted(self._repair_q_history)
             n = len(sorted_q)
             median_q_llm = (sorted_q[n // 2] + sorted_q[(n - 1) // 2]) / 2
-            handoff_threshold = (
-                self._repair_q_baseline * self.cfg.msm_repair_handoff_decay_factor
-                if self._repair_q_baseline is not None
-                else self.cfg.msm_repair_handoff_q_threshold
-            )
+            handoff_threshold = self.cfg.msm_repair_handoff_q_threshold
             self.events.append({
                 "problem_id": self.problem_id,
                 "event": "msm_llm_repair_update",
@@ -891,7 +884,6 @@ class PDIController:
                 "d_llm": d_llm,
                 "q_llm_as_slm": q_llm_as_slm,
                 "median_q_llm": median_q_llm,
-                "repair_q_baseline": self._repair_q_baseline,
                 "handoff_threshold": handoff_threshold,
                 "pi_after": pi_after,
             })
@@ -952,7 +944,6 @@ class PDIController:
         self.llm_repair_episodes += 1
         self._repair_step_count = 0
         self._repair_q_history = []
-        self._repair_q_baseline = None
         self.state.recent_trusted_pdi = []
         self.state.recent_q_percentile = []
         self._switch(MODE_LLM_REPAIR, OWNER_LLM, step_id=None, reason=reason)

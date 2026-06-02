@@ -30,6 +30,7 @@ _DEPRECATED_CONTROLLER_KEYS = {
     "self_reentry_q_threshold",
     "self_reentry_agg_quantile",
     "commit_self_reentry_step",
+    "msm_repair_handoff_decay_factor",
 }
 
 
@@ -121,8 +122,7 @@ class ControllerConfig:
     step_text_repeat_min_occurrences: int = 3
     pdi_repeat_window: int = 6
     msm_trend_alpha: float = 2.0
-    msm_repair_handoff_q_threshold: float = 0.40
-    msm_repair_handoff_decay_factor: float = 0.80
+    msm_repair_handoff_q_threshold: float = 0.70
     prior_distribution: list[float] = field(default_factory=lambda: [0.12, 0.19, 0.29, 0.36])
     prior_distribution_path: str | None = None
     self_prior_distribution: list[float] | None = None
@@ -196,8 +196,7 @@ class ControllerConfig:
             raise ValueError("controller.msm_trend_alpha must be >= 0")
         if not 0.0 < self.msm_repair_handoff_q_threshold < 1.0:
             raise ValueError("controller.msm_repair_handoff_q_threshold must be in (0, 1)")
-        if not 0.0 < self.msm_repair_handoff_decay_factor < 1.0:
-            raise ValueError("controller.msm_repair_handoff_decay_factor must be in (0, 1)")
+
 
 
 @dataclass
