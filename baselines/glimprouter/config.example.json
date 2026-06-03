@@ -1,0 +1,38 @@
+{
+  "repeat_num": 1,
+  "score_method": "first_token_entropy",
+  "score_threshold": 0.9,
+  "token_budget": 14336,
+  "answer_max_tokens": 2048,
+  "output_dir": "glimprouter_results",
+  "model_pair": "qwen3_1p7b_qwen3_32b",
+  "model_size": "base",
+  "small_model_size": "small",
+  "first_n_steps_base_model": 0,
+  "prompt_style": "upstream",
+  "step_max_tokens": 512,
+  "step_stop_token": "\n\n",
+  "generation_temperature": 0.6,
+  "generation_top_p": 0.95,
+  "score_temperature": 0.0,
+  "top_logprobs": 20,
+  "model_pairs": {
+    "qwen3_1p7b_qwen3_32b": {
+      "small": {"model": "Qwen/Qwen3-1.7B", "base_url": "http://127.0.0.1:30002/v1", "api_key": "EMPTY"},
+      "base": {"model": "Qwen/Qwen3-32B", "base_url": "http://127.0.0.1:30000/v1", "api_key": "EMPTY"}
+    },
+    "qwen3_1p7b_deepseek_qwen_32b": {
+      "small": {"model": "Qwen/Qwen3-1.7B", "base_url": "http://127.0.0.1:30002/v1", "api_key": "EMPTY"},
+      "base": {"model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B", "base_url": "http://127.0.0.1:30001/v1", "api_key": "EMPTY"}
+    },
+    "deepseek_qwen_1p5b_qwen3_32b": {
+      "small": {"model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B", "base_url": "http://127.0.0.1:30003/v1", "api_key": "EMPTY"},
+      "base": {"model": "Qwen/Qwen3-32B", "base_url": "http://127.0.0.1:30000/v1", "api_key": "EMPTY"}
+    },
+    "deepseek_qwen_1p5b_deepseek_qwen_32b": {
+      "small": {"model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B", "base_url": "http://127.0.0.1:30003/v1", "api_key": "EMPTY"},
+      "base": {"model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B", "base_url": "http://127.0.0.1:30001/v1", "api_key": "EMPTY"}
+    }
+  },
+  "endpoints": {}
+}

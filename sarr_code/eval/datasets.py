@@ -38,6 +38,14 @@ def _gold(row: dict[str, Any], dataset_name: str) -> str | None:
                 if key == "Correct Answer":
                     return "A"
                 return str(row[key]).strip()
+    if dataset_name == "humaneval":
+        payload = {
+            "prompt": row.get("prompt") or "",
+            "test": row.get("test") or "",
+            "entry_point": row.get("entry_point") or "",
+            "task_id": row.get("task_id") or row.get("id"),
+        }
+        return json.dumps(payload, ensure_ascii=False)
     return None
 
 
@@ -127,7 +135,9 @@ def load_eval_dataset(dataset_name: str, config, max_problems: int | None = None
     limit = len(ds) if max_problems is None else min(len(ds), max_problems)
     for idx in range(limit):
         raw = dict(ds[idx])
-        raw_id = raw.get("id", idx)
+        raw_id = raw.get("id", raw.get("task_id", idx))
+        if isinstance(raw_id, str) and raw_id.startswith("HumanEval/"):
+            raw_id = raw_id.rsplit("/", 1)[-1]
         problems.append(
             EvalProblem(
                 problem_id=int(raw_id) if str(raw_id).isdigit() else idx,

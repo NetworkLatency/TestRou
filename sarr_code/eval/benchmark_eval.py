@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import json
+import os
 import re
+import subprocess
+import sys
+import tempfile
 from fractions import Fraction
 from typing import Optional
 
@@ -114,9 +119,81 @@ def gpqa_match(predicted_text: str | None, ground_truth: str | None) -> bool:
     return pred is not None and pred == gold
 
 
+def _extract_python_code(text: str, entry_point: str) -> str:
+    fence = re.search(r"```(?:python|py)?\s*(.*?)```", text, flags=re.S | re.I)
+    if fence:
+        return fence.group(1).strip()
+    if entry_point:
+        pattern = re.compile(rf"(^|\n)(def\s+{re.escape(entry_point)}\s*\()", flags=re.S)
+        match = pattern.search(text)
+        if match:
+            return text[match.start(2) :].strip()
+    generic = re.search(r"(^|\n)(def\s+\w+\s*\()", text, flags=re.S)
+    if generic:
+        return text[generic.start(2) :].strip()
+    return text.strip()
+
+
+def _strip_humaneval_tail(code: str) -> str:
+    markers = [
+        "\nif __name__",
+        "\n# Test",
+        "\n# Example",
+        "\nprint(",
+        "\nassert ",
+    ]
+    cleaned = code.strip().strip("`").strip()
+    for marker in markers:
+        idx = cleaned.find(marker)
+        if idx > 0:
+            cleaned = cleaned[:idx].rstrip()
+    return cleaned
+
+
+def humaneval_match(predicted_text: str | None, ground_truth: str | None, timeout_s: float = 8.0) -> bool:
+    if predicted_text is None or ground_truth is None:
+        return False
+    try:
+        payload = json.loads(ground_truth)
+    except Exception:
+        return False
+    prompt = str(payload.get("prompt") or "")
+    tests = str(payload.get("test") or "")
+    entry_point = str(payload.get("entry_point") or "")
+    if not prompt or not tests or not entry_point:
+        return False
+
+    completion = _strip_humaneval_tail(_extract_python_code(predicted_text, entry_point))
+    if re.search(rf"(^|\n)def\s+{re.escape(entry_point)}\s*\(", completion):
+        program = completion
+    else:
+        separator = "" if prompt.endswith((" ", "\t", "\n")) else "\n"
+        program = prompt + separator + completion.rstrip() + "\n"
+    program = program.rstrip() + "\n\n" + tests.rstrip() + f"\n\ncheck({entry_point})\n"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        script_path = os.path.join(tmpdir, "candidate.py")
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(program)
+        try:
+            completed = subprocess.run(
+                [sys.executable, script_path],
+                cwd=tmpdir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout_s,
+            )
+        except subprocess.TimeoutExpired:
+            return False
+    return completed.returncode == 0
+
+
 def benchmark_eval_match(predicted: str | None, ground_truth: str | None, dataset: str) -> bool:
     if dataset in {"math500", "aime24", "aime25"}:
         return math_match(predicted, ground_truth)
     if dataset in {"gpqa", "gpqa_diamond"}:
         return gpqa_match(predicted, ground_truth)
+    if dataset == "humaneval":
+        return humaneval_match(predicted, ground_truth)
     raise ValueError(f"Evaluator is not implemented for dataset {dataset!r}.")

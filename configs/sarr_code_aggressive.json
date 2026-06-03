@@ -33,8 +33,8 @@
     "gpqa_diamond": "data/gpqa_diamond.jsonl"
   },
   "generation": {
-    "think_token_budget": 8192,
-    "answer_token_budget": 8192,
+    "think_token_budget": 14336,
+    "answer_token_budget": 2048,
     "step_delimiters": ["\n\n"],
     "final_answer_generator": "llm"
   },
